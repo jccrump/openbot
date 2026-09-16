@@ -24,13 +24,35 @@ export function VncView({
     let disposed = false;
     let client: RFB | null = null;
     let retryTimer: number | null = null;
+    let retryAttempt = 0;
+
+    const scheduleReconnect = () => {
+      if (disposed || retryTimer !== null) {
+        return;
+      }
+      const baseDelay = Math.min(1000 * 2 ** retryAttempt, 15_000);
+      const jitter = Math.floor(Math.random() * 500);
+      retryAttempt += 1;
+      retryTimer = window.setTimeout(() => {
+        retryTimer = null;
+        connect();
+      }, baseDelay + jitter);
+    };
 
     const connect = () => {
       if (disposed) {
         return;
       }
       stateRef.current("connecting");
-      const rfb = new RFB(target, url, { shared: true });
+      target.replaceChildren();
+      let rfb: RFB;
+      try {
+        rfb = new RFB(target, url, { shared: true });
+      } catch {
+        stateRef.current("down");
+        scheduleReconnect();
+        return;
+      }
       rfb.viewOnly = false;
       rfb.scaleViewport = true;
       rfb.resizeSession = false;
@@ -38,6 +60,7 @@ export function VncView({
       client = rfb;
       rfb.addEventListener("connect", () => {
         if (!disposed) {
+          retryAttempt = 0;
           stateRef.current("live");
         }
       });
@@ -47,11 +70,13 @@ export function VncView({
         }
         client = null;
         stateRef.current("down");
-        retryTimer = window.setTimeout(connect, 2500);
+        scheduleReconnect();
       });
       rfb.addEventListener("securityfailure", () => {
         if (!disposed) {
           stateRef.current("down");
+          scheduleReconnect();
+          rfb.disconnect();
         }
       });
     };

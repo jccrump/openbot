@@ -1,4 +1,4 @@
-import { execSync, spawn } from "node:child_process";
+import { execFileSync, execSync, spawn, spawnSync } from "node:child_process";
 import {
   createServer,
   request as httpRequest,
@@ -6,25 +6,33 @@ import {
   type ServerResponse,
 } from "node:http";
 import {
+  closeSync,
   existsSync,
   mkdirSync,
   openSync,
+  readFileSync,
+  renameSync,
   rmSync,
+  statfsSync,
+  statSync,
+  writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { connect } from "node:net";
-import { WebSocketServer, type WebSocket } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 
 const FC_BIN = process.env.FIRECRACKER_BIN ?? "/usr/local/bin/firecracker";
 const FC_DIR = process.env.FC_DIR ?? "/var/lib/fc";
 const BASE_ROOTFS = join(FC_DIR, "rootfs.ext4");
+const BASE_VERSION_FILE = join(FC_DIR, "rootfs.version");
 const KERNEL = join(FC_DIR, "vmlinux");
 const VMS_DIR = join(FC_DIR, "vms");
 const PORT = Number(process.env.OPENBOT_HOST_PORT ?? 4171);
 const VSOCK_PORT = 5000;
 const VNC_VSOCK_PORT = 5900;
 const DEFAULT_TIMEOUT_MS = 120_000;
-const BOOT_TIMEOUT_MS = 45_000;
+const BOOT_TIMEOUT_MS = 120_000;
+const VNC_READY_TIMEOUT_MS = 30_000;
 const NETWORK_ENABLED = process.env.OPENBOT_SANDBOX_NETWORK !== "false";
 const BOOT_ARGS =
   "console=ttyS0 reboot=k panic=1 init=/usr/local/bin/openbot-agent.py";
@@ -49,9 +57,11 @@ interface VmRecord {
   error: string | null;
   bootedAt: string | null;
   pid: number | null;
+  pendingUpgrade: RootfsUpgrade | null;
 }
 
 const vms = new Map<string, VmRecord>();
+const ensures = new Map<string, Promise<VmRecord>>();
 let nextCid = 3;
 let nextSlot = 1;
 let uplinkInterface = "eth0";
@@ -154,6 +164,228 @@ function vsockSock(botId: string) {
 
 function serialLog(botId: string) {
   return join(vmDir(botId), "serial.log");
+}
+
+function vmVersionFile(botId: string) {
+  return join(vmDir(botId), "rootfs.version");
+}
+
+function readVersion(path: string): string | null {
+  try {
+    const version = readFileSync(path, "utf8").trim();
+    return version || null;
+  } catch {
+    return null;
+  }
+}
+
+interface RootfsUpgrade {
+  botId: string;
+  oldVersion: string;
+  newVersion: string;
+  rootfs: string;
+  previousRootfs: string;
+}
+
+const PERSISTENT_GUEST_DIRS = [
+  "root",
+  "home",
+  "srv",
+  "workspace",
+  "workspaces",
+] as const;
+
+function safeVersion(version: string) {
+  return version.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 80);
+}
+
+function copySparse(source: string, destination: string) {
+  execFileSync("cp", ["--sparse=always", source, destination]);
+}
+
+function requireImageCapacity(dir: string) {
+  const filesystem = statfsSync(dir);
+  const freeBytes = filesystem.bavail * filesystem.bsize;
+  const baseBlocks = statSync(BASE_ROOTFS).blocks ?? 0;
+  const baseAllocatedBytes = baseBlocks * 512;
+  const requiredBytes = baseAllocatedBytes + 512 * 1024 * 1024;
+  if (freeBytes < requiredBytes) {
+    const gib = (value: number) => (value / 1024 ** 3).toFixed(1);
+    throw new Error(
+      `insufficient disk space for a safe image copy: ${gib(freeBytes)} GiB free, ${gib(requiredBytes)} GiB required; no agent image was deleted`,
+    );
+  }
+}
+
+function checkExt4(path: string, label: string) {
+  const check = spawnSync("e2fsck", ["-pf", path], { encoding: "utf8" });
+  if (check.status !== 0 && check.status !== 1) {
+    throw new Error(
+      `${label} failed e2fsck (${check.status}): ${(check.stderr || check.stdout).slice(0, 300)}`,
+    );
+  }
+}
+
+function unmount(path: string) {
+  try {
+    execFileSync("umount", [path]);
+  } catch {
+    // The mount may already have been released after an earlier failure.
+  }
+}
+
+function copyPersistentGuestData(oldRoot: string, newRoot: string) {
+  const managedTint2 = join(newRoot, "root/.config/tint2/tint2rc");
+  const tint2 = existsSync(managedTint2)
+    ? {
+        contents: readFileSync(managedTint2),
+        mode: statSync(managedTint2).mode,
+      }
+    : null;
+
+  for (const relative of PERSISTENT_GUEST_DIRS) {
+    const source = join(oldRoot, relative);
+    if (!existsSync(source)) continue;
+    const destination = join(newRoot, relative);
+    mkdirSync(destination, { recursive: true });
+    execFileSync("cp", ["-a", `${source}/.`, destination]);
+  }
+
+  // tint2rc is image-owned even though it lives below /root. Restore the
+  // freshly baked copy after migrating the rest of the agent's home.
+  if (tint2) {
+    mkdirSync(join(newRoot, "root/.config/tint2"), { recursive: true });
+    writeFileSync(managedTint2, tint2.contents, { mode: tint2.mode });
+  }
+}
+
+function prepareRootfs(botId: string): RootfsUpgrade | null {
+  const dir = vmDir(botId);
+  const rootfs = join(dir, "rootfs.ext4");
+  const baseVersion = readVersion(BASE_VERSION_FILE);
+  if (!baseVersion) {
+    throw new Error(
+      `base image version is missing at ${BASE_VERSION_FILE}; run pnpm sandbox:setup`,
+    );
+  }
+
+  if (!existsSync(rootfs)) {
+    log(`vm ${botId}: creating rootfs from base image ${baseVersion}`);
+    requireImageCapacity(dir);
+    try {
+      copySparse(BASE_ROOTFS, rootfs);
+      checkExt4(rootfs, "new rootfs");
+      writeFileSync(vmVersionFile(botId), `${baseVersion}\n`);
+    } catch (error) {
+      rmSync(rootfs, { force: true });
+      throw error;
+    }
+    return null;
+  }
+
+  const currentVersion = readVersion(vmVersionFile(botId));
+  if (currentVersion === baseVersion) return null;
+
+  const nextRootfs = join(dir, "rootfs.next.ext4");
+  const mountOld = join(dir, ".mount-old");
+  const mountNew = join(dir, ".mount-new");
+  const oldVersion = currentVersion ?? "legacy-unversioned";
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const previousRootfs = join(
+    dir,
+    `rootfs.backup-${safeVersion(oldVersion)}-${stamp}.ext4`,
+  );
+
+  log(
+    `vm ${botId}: upgrading guest image ${oldVersion} -> ${baseVersion}; preserving agent data`,
+  );
+  rmSync(nextRootfs, { force: true });
+  mkdirSync(mountOld, { recursive: true });
+  mkdirSync(mountNew, { recursive: true });
+
+  let oldMounted = false;
+  let newMounted = false;
+  try {
+    // Firecracker root drives are often stopped without a guest shutdown, so
+    // replay the ext4 journal before attempting a read-only migration mount.
+    checkExt4(rootfs, "existing rootfs");
+    requireImageCapacity(dir);
+    copySparse(BASE_ROOTFS, nextRootfs);
+    execFileSync("mount", ["-o", "loop,ro", rootfs, mountOld]);
+    oldMounted = true;
+    execFileSync("mount", ["-o", "loop", nextRootfs, mountNew]);
+    newMounted = true;
+    copyPersistentGuestData(mountOld, mountNew);
+    execFileSync("sync", ["-f", mountNew]);
+    unmount(mountNew);
+    newMounted = false;
+    unmount(mountOld);
+    oldMounted = false;
+
+    checkExt4(nextRootfs, "new rootfs");
+
+    renameSync(rootfs, previousRootfs);
+    renameSync(nextRootfs, rootfs);
+    writeFileSync(vmVersionFile(botId), `${baseVersion}\n`);
+    return {
+      botId,
+      oldVersion,
+      newVersion: baseVersion,
+      rootfs,
+      previousRootfs,
+    };
+  } catch (error) {
+    if (newMounted) unmount(mountNew);
+    if (oldMounted) unmount(mountOld);
+    rmSync(nextRootfs, { force: true });
+    throw error;
+  } finally {
+    rmSync(mountOld, { recursive: true, force: true });
+    rmSync(mountNew, { recursive: true, force: true });
+  }
+}
+
+function rollbackRootfs(upgrade: RootfsUpgrade) {
+  const failed = `${upgrade.rootfs}.failed-${safeVersion(upgrade.newVersion)}-${Date.now()}`;
+  if (existsSync(upgrade.rootfs)) renameSync(upgrade.rootfs, failed);
+  renameSync(upgrade.previousRootfs, upgrade.rootfs);
+  if (upgrade.oldVersion === "legacy-unversioned") {
+    rmSync(vmVersionFile(upgrade.botId), { force: true });
+  } else {
+    writeFileSync(vmVersionFile(upgrade.botId), `${upgrade.oldVersion}\n`);
+  }
+  let retained = failed;
+  try {
+    execFileSync("gzip", ["-1", failed]);
+    retained = `${failed}.gz`;
+  } catch {
+    // Keep the uncompressed failed image if archiving cannot complete.
+  }
+  log(
+    `vm ${upgrade.botId}: image upgrade rolled back; failed image retained at ${retained}`,
+  );
+}
+
+function archivePreviousRootfs(upgrade: RootfsUpgrade) {
+  const archive = spawn("gzip", ["-1", upgrade.previousRootfs], {
+    stdio: "ignore",
+  });
+  archive.on("exit", (code) => {
+    if (code === 0) {
+      log(
+        `vm ${upgrade.botId}: prior image retained at ${upgrade.previousRootfs}.gz`,
+      );
+      return;
+    }
+    log(
+      `vm ${upgrade.botId}: could not compress prior image (exit ${code}); retained at ${upgrade.previousRootfs}`,
+    );
+  });
+  archive.on("error", (error) => {
+    log(
+      `vm ${upgrade.botId}: could not compress prior image; retained at ${upgrade.previousRootfs}: ${(error as Error).message}`,
+    );
+  });
 }
 
 function statusOf(record: VmRecord) {
@@ -300,7 +532,7 @@ function attachVnc(botId: string, client: WebSocket) {
   let closed = false;
   let resumeTimer: ReturnType<typeof setInterval> | null = null;
 
-  const shutdown = () => {
+  const shutdown = (code = 1011, reason = "vnc stream closed") => {
     if (closed) return;
     closed = true;
     if (resumeTimer) {
@@ -309,7 +541,7 @@ function attachVnc(botId: string, client: WebSocket) {
     }
     socket.destroy();
     try {
-      client.close();
+      client.close(code, reason);
     } catch {
       // already closed
     }
@@ -337,6 +569,7 @@ function attachVnc(botId: string, client: WebSocket) {
   };
 
   socket.on("connect", () => {
+    socket.setTimeout(15_000);
     socket.write(`CONNECT ${VNC_VSOCK_PORT}\n`);
   });
 
@@ -354,25 +587,31 @@ function attachVnc(botId: string, client: WebSocket) {
         return;
       }
       handshake = true;
+      socket.setTimeout(0);
       log(`vnc ${botId}: stream open`);
       if (pending.length === 0) return;
       const rest = pending;
       pending = Buffer.alloc(0);
-      client.send(rest, { binary: true });
+      client.send(rest, { binary: true }, (error) => {
+        if (error) shutdown(1011, "client relay failed");
+      });
       if (client.bufferedAmount > 1_000_000) pauseUntilClientDrains();
       return;
     }
-    client.send(chunk, { binary: true });
+    client.send(chunk, { binary: true }, (error) => {
+      if (error) shutdown(1011, "client relay failed");
+    });
     if (client.bufferedAmount > 1_000_000) pauseUntilClientDrains();
   });
 
   socket.on("drain", () => {
     if (!closed) client.resume();
   });
-  socket.on("error", () => shutdown());
+  socket.on("timeout", () => shutdown(1013, "guest vnc handshake timed out"));
+  socket.on("error", () => shutdown(1011, "guest vnc unavailable"));
   socket.on("close", () => {
     log(`vnc ${botId}: stream closed`);
-    shutdown();
+    shutdown(1011, "guest vnc stream closed");
   });
 
   client.on("message", (data, isBinary) => {
@@ -380,11 +619,11 @@ function attachVnc(botId: string, client: WebSocket) {
     const payload = isBinary ? (data as Buffer) : Buffer.from(String(data));
     if (!socket.write(payload)) client.pause();
   });
-  client.on("close", () => shutdown());
-  client.on("error", () => shutdown());
+  client.on("close", () => shutdown(1000, "client closed"));
+  client.on("error", () => shutdown(1011, "client websocket failed"));
 }
 
-async function ensureVm(botId: string): Promise<VmRecord> {
+async function ensureVmUnlocked(botId: string): Promise<VmRecord> {
   const existing = vms.get(botId);
   if (existing && (existing.state === "running" || existing.state === "booting")) {
     return existing;
@@ -402,6 +641,7 @@ async function ensureVm(botId: string): Promise<VmRecord> {
       error: null,
       bootedAt: null,
       pid: null,
+      pendingUpgrade: null,
     } satisfies VmRecord);
   vms.set(botId, record);
   record.state = "booting";
@@ -417,10 +657,8 @@ async function ensureVm(botId: string): Promise<VmRecord> {
 
   mkdirSync(record.dir, { recursive: true });
   const rootfs = join(record.dir, "rootfs.ext4");
-  if (!existsSync(rootfs)) {
-    log(`vm ${botId}: creating rootfs from base image`);
-    execSync(`cp --sparse=always ${BASE_ROOTFS} ${rootfs}`);
-  }
+  const upgrade = prepareRootfs(botId);
+  record.pendingUpgrade = upgrade;
   rmSync(apiSock(botId), { force: true });
   rmSync(vsockSock(botId), { force: true });
 
@@ -429,8 +667,21 @@ async function ensureVm(botId: string): Promise<VmRecord> {
     detached: true,
     stdio: ["ignore", logFd, logFd],
   });
+  closeSync(logFd);
   child.unref();
   record.pid = child.pid ?? null;
+  child.once("exit", (code, signal) => {
+    if (record.pid !== child.pid) return;
+    record.pid = null;
+    record.bootedAt = null;
+    if (record.state === "running" || record.state === "booting") {
+      record.state = "error";
+      record.error = `firecracker exited (${signal ?? code ?? "unknown"})`;
+      deleteTap(record.network);
+      record.network = null;
+      log(`vm ${botId}: ${record.error}`);
+    }
+  });
 
   const deadline = Date.now() + BOOT_TIMEOUT_MS;
   while (!existsSync(apiSock(botId))) {
@@ -475,41 +726,104 @@ async function ensureVm(botId: string): Promise<VmRecord> {
     try {
       const result = await vsockExec(vsockSock(botId), "true", "/", 5000);
       if (result.exit === 0) {
-        record.state = "running";
-        record.bootedAt = new Date().toISOString();
-        log(`vm ${botId}: running (cid ${record.cid}, pid ${record.pid})`);
-        return record;
+        const vncProbe = await vsockExec(
+          vsockSock(botId),
+          "python3 -c 'import socket; s=socket.create_connection((\"127.0.0.1\",5900),5); greeting=s.recv(12); assert greeting.startswith(b\"RFB \")'",
+          "/",
+          VNC_READY_TIMEOUT_MS,
+        );
+        if (vncProbe.exit === 0) {
+          record.state = "running";
+          record.bootedAt = new Date().toISOString();
+          log(
+            `vm ${botId}: running with desktop ready (cid ${record.cid}, pid ${record.pid})`,
+          );
+          if (upgrade) archivePreviousRootfs(upgrade);
+          record.pendingUpgrade = null;
+          return record;
+        }
       }
     } catch {
-      // agent not up yet
+      // Agent or framebuffer is not up yet.
     }
     await sleep(100);
   }
 
   record.state = "error";
-  record.error = "guest agent did not become ready";
-  throw new Error(record.error);
-}
-
-async function stopVm(record: VmRecord) {
-  try {
-    await fcRequest(apiSock(record.botId), "PUT", "/actions", {
-      action_type: "InstanceStop",
-    });
-  } catch {
-    // instance may already be gone
-  }
-  await sleep(200);
+  record.error = "guest agent and desktop did not become ready";
   if (record.pid) {
     try {
       process.kill(record.pid, "SIGKILL");
     } catch {
-      // already dead
+      // already gone
     }
+    record.pid = null;
   }
+  deleteTap(record.network);
+  record.network = null;
+  if (upgrade) rollbackRootfs(upgrade);
+  record.pendingUpgrade = null;
+  throw new Error(record.error);
+}
+
+function ensureVm(botId: string): Promise<VmRecord> {
+  const active = ensures.get(botId);
+  if (active) return active;
+  const pending = ensureVmUnlocked(botId)
+    .catch((error) => {
+      const record = vms.get(botId);
+      if (record) {
+        if (record.pid) {
+          try {
+            process.kill(record.pid, "SIGKILL");
+          } catch {
+            // already gone
+          }
+        }
+        record.pid = null;
+        record.bootedAt = null;
+        deleteTap(record.network);
+        record.network = null;
+        rmSync(apiSock(botId), { force: true });
+        rmSync(vsockSock(botId), { force: true });
+        if (
+          record.pendingUpgrade &&
+          existsSync(record.pendingUpgrade.previousRootfs)
+        ) {
+          rollbackRootfs(record.pendingUpgrade);
+        }
+        record.pendingUpgrade = null;
+        record.state = "error";
+        record.error = (error as Error).message;
+      }
+      throw error;
+    })
+    .finally(() => {
+      if (ensures.get(botId) === pending) ensures.delete(botId);
+    });
+  ensures.set(botId, pending);
+  return pending;
+}
+
+async function stopVm(record: VmRecord) {
+  const pid = record.pid;
   record.state = "stopped";
   record.pid = null;
   record.bootedAt = null;
+  if (pid) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // already dead
+    }
+    await sleep(300);
+    try {
+      process.kill(pid, 0);
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // exited after SIGTERM
+    }
+  }
   deleteTap(record.network);
   record.network = null;
   rmSync(apiSock(record.botId), { force: true });

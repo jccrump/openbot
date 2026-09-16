@@ -8,6 +8,7 @@ BROWSER_SRC="$REPO_DIR/packages/sandbox/guest/browser.js"
 DESKTOP_SRC="$REPO_DIR/packages/sandbox/guest/desktop.sh"
 WALLPAPER_SRC="$REPO_DIR/packages/sandbox/guest/wallpaper.py"
 TINT2_SRC="$REPO_DIR/packages/sandbox/guest/tint2rc"
+IMAGE_SCHEMA_VERSION="2"
 
 FC_VERSION="${FC_VERSION:-v1.16.0}"
 NODE_VERSION="${NODE_VERSION:-v22.23.2}"
@@ -157,6 +158,15 @@ if [ ! -x /mnt/openbot-rootfs/usr/bin/scrot ]; then
 fi
 
 (/mnt/openbot-rootfs/usr/bin/x11vnc -version 2>&1 | head -1) || true
+
+IMAGE_CONTENT_HASH="$({
+  printf '%s\n' "$IMAGE_SCHEMA_VERSION"
+  sha256sum "$AGENT_SRC" "$BROWSER_SRC" "$DESKTOP_SRC" "$WALLPAPER_SRC" "$TINT2_SRC"
+} | sha256sum | awk '{print $1}')"
+IMAGE_VERSION="v${IMAGE_SCHEMA_VERSION}-${IMAGE_CONTENT_HASH}"
+printf '%s\n' "$IMAGE_VERSION" > /mnt/openbot-rootfs/etc/openbot-image-version
+printf '%s\n' "$IMAGE_VERSION" > "$FC_DIR/rootfs.version"
+echo "guest image version: $IMAGE_VERSION"
 umount /mnt/openbot-rootfs
 
 echo "== sandbox host service =="

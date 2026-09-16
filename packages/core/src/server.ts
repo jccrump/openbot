@@ -332,19 +332,18 @@ export function createDaemon(options: DaemonOptions): Daemon {
     );
     let closed = false;
     let drainTimer: ReturnType<typeof setInterval> | null = null;
+    let connectTimer: ReturnType<typeof setTimeout> | null = null;
 
     const shutdown = (code?: number, reason?: string) => {
       if (closed) return;
       closed = true;
+      if (connectTimer) clearTimeout(connectTimer);
       if (drainTimer) {
         clearInterval(drainTimer);
         drainTimer = null;
       }
-      try {
-        upstream.close();
-      } catch {
-        // already closed
-      }
+      if (upstream.readyState === WebSocket.OPEN) upstream.close();
+      else if (upstream.readyState !== WebSocket.CLOSED) upstream.terminate();
       try {
         client.close(code, reason);
       } catch {
@@ -352,15 +351,25 @@ export function createDaemon(options: DaemonOptions): Daemon {
       }
     };
 
+    connectTimer = setTimeout(() => {
+      shutdown(1013, "sandbox vnc connection timed out");
+    }, 15_000);
+
     const relay = (from: WebSocket, to: WebSocket) => {
       from.on("message", (data, isBinary) => {
         if (to.readyState !== to.OPEN) return;
-        to.send(data, { binary: isBinary });
+        to.send(data, { binary: isBinary }, (error) => {
+          if (error) shutdown(1011, "vnc relay failed");
+        });
         if (to.bufferedAmount > 1_000_000) from.pause();
       });
     };
 
     upstream.on("open", () => {
+      if (connectTimer) {
+        clearTimeout(connectTimer);
+        connectTimer = null;
+      }
       relay(upstream, client);
       relay(client, upstream);
       drainTimer = setInterval(() => {
@@ -410,6 +419,13 @@ export function createDaemon(options: DaemonOptions): Daemon {
       socket.destroy();
     };
     const botId = decodeURIComponent(vncMatch[1] ?? "");
+    if (
+      request.headers.origin &&
+      !SCREEN_ALLOWED_ORIGINS.has(request.headers.origin)
+    ) {
+      reject(403, "Forbidden");
+      return;
+    }
     const bot = options.store.getBot(botId);
     if (!bot) {
       reject(404, "Not Found");
@@ -663,8 +679,12 @@ export function createDaemon(options: DaemonOptions): Daemon {
       for (const socket of wss.clients) {
         socket.close();
       }
+      for (const socket of vncWss.clients) {
+        socket.close(1001, "daemon stopping");
+      }
       await Promise.allSettled([...pending]);
       await new Promise<void>((resolve) => wss.close(() => resolve()));
+      await new Promise<void>((resolve) => vncWss.close(() => resolve()));
       await new Promise<void>((resolve, reject) =>
         httpServer.close((error) => (error ? reject(error) : resolve())),
       );

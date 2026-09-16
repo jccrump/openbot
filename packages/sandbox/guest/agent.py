@@ -122,16 +122,20 @@ def warm_browser():
 
 
 def start_desktop():
-    try:
-        subprocess.Popen(
-            ["/bin/bash", "/usr/local/bin/openbot-desktop.sh"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        log("desktop starting")
-    except Exception as error:
-        log(f"desktop start failed: {error}")
+    while True:
+        try:
+            process = subprocess.Popen(
+                ["/bin/bash", "/usr/local/bin/openbot-desktop.sh"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            log("desktop supervisor started")
+            status = process.wait()
+            log(f"desktop supervisor exited ({status}); restarting")
+        except Exception as error:
+            log(f"desktop start failed: {error}; retrying")
+        time.sleep(2)
 
 
 def pipe(src, dst):
@@ -150,10 +154,29 @@ def pipe(src, dst):
             pass
 
 
+def connect_vnc_upstream(timeout=30):
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            upstream = socket.create_connection(("127.0.0.1", VNC_PORT), timeout=5)
+            greeting = upstream.recv(12)
+            if greeting.startswith(b"RFB "):
+                upstream.settimeout(None)
+                return upstream, greeting
+            upstream.close()
+            last_error = RuntimeError(f"invalid RFB greeting: {greeting[:40]!r}")
+        except OSError as error:
+            last_error = error
+        time.sleep(0.25)
+    raise TimeoutError(f"desktop was not RFB-ready after {timeout}s: {last_error}")
+
+
 def handle_vnc(conn):
     try:
-        upstream = socket.create_connection(("127.0.0.1", VNC_PORT), timeout=10)
-    except OSError as error:
+        upstream, greeting = connect_vnc_upstream()
+        conn.sendall(greeting)
+    except Exception as error:
         log(f"vnc upstream failed: {error}")
         conn.close()
         return

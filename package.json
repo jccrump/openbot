@@ -23,6 +23,7 @@
     "sandbox:deploy": "bash packages/sandbox/host/deploy.sh",
     "sandbox:logs": "limactl shell openbot-fc -- sudo journalctl -u openbot-host -n 50 --no-pager",
     "sandbox:spike": "limactl shell openbot-fc -- sudo bash $PWD/packages/sandbox/host/spike.sh",
+    "vnc:smoke": "node scripts/vnc-smoke.mjs",
     "typecheck": "pnpm -r typecheck",
     "smoke": "node scripts/smoke.mjs"
   }

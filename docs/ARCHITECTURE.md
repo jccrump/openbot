@@ -18,7 +18,9 @@ Single-user, Mac-first. Mobile is a later thin client.
   computer mode. Still missing: snapshots, per-bot egress policy, a polished
   base image.
 - **M2 (in progress):** browser automation with persistent sign-ins and
-  screenshots works. Live screen view and sign-in polish are not started.
+  screenshots works. The live Openbox/tint2 desktop is delivered through
+  x11vnc, vsock, two localhost WebSocket relays, and noVNC; sign-in polish is
+  still incomplete.
 - **M3 (partial):** the optional Codex harness runs in the daemon and the
   Responses-to-Chat-Completions bridge drives non-OpenAI models (verified end
   to end with a real DeepSeek key, including a tool call in the microVM). The
@@ -36,7 +38,7 @@ nothing routes work between agents.
 +------------------------------- Mac ----------------------------------+
 |                                                                      |
 |  OpenBot.app (Tauri v2 + React)                                      |
-|    agent list - chat - tool cards - approvals - latest screen shot    |
+|    agent list - chat - tool cards - approvals - live noVNC desktop    |
 |        |                                                             |
 |        | WebSocket  ws://127.0.0.1:4170/ws                            |
 |        v                                                             |
@@ -48,8 +50,8 @@ nothing routes work between agents.
 |        v                        v                                    |
 |  providers                 Lima VM (Linux, nested virtualization)     |
 |  (OpenAI-compatible,       +-- Firecracker microVM per agent          |
-|   Codex CLI + bridge)           guest agent: exec, files             |
-|                                 browser daemon: Chromium over CDP      |
+|   Codex CLI + bridge)           guest agent: exec, files, VNC bridge  |
+|                                 Chromium over CDP + Openbox desktop    |
 +----------------------------------------------------------------------+
              | optional: Tailscale / Cloudflare Tunnel (planned)
              v
@@ -90,11 +92,11 @@ docs/                      This document and screenshots
   settings menu, and the model picker in the sidebar; chat with streaming text
   and a three-dot typing bubble while the model is thinking (reasoning deltas
   are received but hidden by default); a computer switcher; tool cards with
-  output and screenshots; inline approval cards; a collapsible screen panel
-  (latest screenshot) with a draggable resizer; create-agent modal; and
+  output and screenshots; inline approval cards; a collapsible live noVNC
+  screen panel with screenshot fallback and a draggable resizer; create-agent modal; and
   Settings.
-- Not present: approvals inbox, run log, routines browser, memory browser,
-  group chats, live screen view.
+- Not present: approvals inbox, run log, routines browser, memory browser, and
+  group chats.
 
 **Settings layout.** Four sections in a left nav with search:
 
@@ -287,6 +289,10 @@ Working recipe, validated on an M4 Pro (macOS 27, Lima 2.2.0):
   how production computer-use agents batch actions, combine DOM text with
   screenshots, and budget observations are in
   [research/computer-use.md](research/computer-use.md).
+- The desktop supervisor starts Xvfb at 1280x800, Openbox, tint2, xterm, and
+  x11vnc. x11vnc listens only on guest loopback. The guest agent verifies an
+  `RFB 003.x` greeting before exposing the stream on vsock port 5900 and
+  restarts the complete desktop stack if a long-lived component exits.
 
 **Sandbox host service.** `packages/sandbox/host/service.ts` is bundled with
 esbuild into a single `service.mjs`, installed into the Lima VM at
@@ -294,17 +300,30 @@ esbuild into a single `service.mjs`, installed into the Lima VM at
 `127.0.0.1:4171` (Lima forwards the port to the Mac). It manages per-agent VMs:
 
 - `GET /health`, `GET /vms/:botId/status`
-- `POST /vms/:botId/ensure` boots the VM if needed (copies the base rootfs,
-  spawns Firecracker with its API socket, configures kernel/rootfs/machine/vsock
-  and the network interface through the Firecracker API, then waits for the
-  guest agent)
+- `POST /vms/:botId/ensure` boots the VM if needed, serializes concurrent
+  ensures, configures Firecracker through its API, and does not report
+  `running` until both the exec agent and an RFB framebuffer are reachable
 - `POST /vms/:botId/exec` runs a command through the vsock agent
 - `POST /vms/:botId/stop` and `POST /vms/:botId/destroy`
 
-Per-agent state lives in `/var/lib/fc/vms/<botId>/` (rootfs copy, `api.sock`,
-`vsock.sock`, `serial.log`). Firecracker is driven through its API rather than
-`--config-file` so snapshot/restore is a later addition, not a rewrite.
-Measured: cold `ensure` (rootfs copy plus boot) ~10 s, warm exec 3–40 ms.
+Per-agent state lives in `/var/lib/fc/vms/<botId>/` (rootfs copy and version,
+recovery images, `api.sock`, `vsock.sock`, `serial.log`). `sandbox:setup`
+hashes the managed guest payload into `/var/lib/fc/rootfs.version`. On a version
+mismatch, the host checks and mounts the stopped old image, creates a fresh
+rootfs from the base, copies durable data from `/root`, `/home`, `/srv`, and
+workspace directories, boots and checks the new desktop, then gzip-compresses
+the old rootfs as a recovery artifact. A failed boot rolls back atomically and
+keeps the failed image for diagnosis. Low disk space fails before copying, and
+partial first-boot copies are removed. Recovery artifacts are never pruned
+automatically.
+
+The host exposes RFB only as `ws://127.0.0.1:4171/vms/:id/vnc`; the daemon
+validates the bot and browser origin and relays it as
+`ws://127.0.0.1:4170/bots/:id/vnc`. noVNC uses exponential reconnect backoff
+with jitter and disposes canvases, sockets, and timers when the panel changes.
+`pnpm vnc:smoke` performs an RFB 3.8 handshake, requests Raw encoding, and
+requires actual framebuffer bytes, so an HTTP/WebSocket upgrade alone cannot
+pass.
 
 **Networking.** Each microVM gets a tap device and a static IP
 (`172.16.<slot>.2`) with NAT through the Lima VM's uplink. Set
@@ -312,10 +331,9 @@ Measured: cold `ensure` (rootfs copy plus boot) ~10 s, warm exec 3–40 ms.
 offline. There is **no per-bot egress policy**: every VM shares the same NAT
 and can reach anything the host can.
 
-**One microVM per agent.** Each agent gets its own kernel, persistent rootfs,
-browser profile, and sign-ins. Per-agent snapshots, pause/resume, and rollback
-are not implemented. `SandboxBackend` stays interface-first so the same images
-can run on a Linux host with Firecracker later (true 24/7 when the Mac sleeps).
+**One microVM per agent.** Each agent gets its own kernel, persistent durable
+data, browser profile, and sign-ins. Image-upgrade rollback exists; general
+user snapshots, pause/resume, and point-in-time restore do not.
 
 ### Tools and approvals
 
@@ -410,11 +428,17 @@ Planned additions: `runs` (journal), `routines`, `memory`, `approvals`,
 - Single-user: the daemon binds `127.0.0.1` only. There is no authentication
   layer; anything that can reach the loopback port is trusted. Remote/mobile
   access would go through Tailscale or a Cloudflare Tunnel, never a public port.
+- x11vnc has no password because it is reachable only on guest loopback and
+  through the VM's vsock. The sandbox host and daemon WebSockets are also
+  loopback-only; this is a local-user trust boundary, not multi-user auth.
 - Provider keys live in the SQLite database (`0600` file in a `0700` directory)
   or in environment variables referenced by name. The macOS Keychain is
   planned, not implemented. Keys are never logged.
 - Firecracker microVMs are the isolation boundary for cloud models; agents can
   only touch their own VM.
+- Chromium runs as root with `--no-sandbox` inside that boundary. A browser
+  compromise can own the guest, so the VM and approval boundary remain
+  security-critical.
 - This Mac agents run as the user. The only boundary is the workspace path
   check for file tools plus mandatory approvals for every action.
 - There are no per-bot egress allowlists and no snapshots before risky
@@ -426,7 +450,7 @@ Planned additions: `runs` (journal), `routines`, `memory`, `approvals`,
 | --- | --- | --- |
 | M0 | Monorepo, daemon, gateway, SQLite, WS protocol, chat UI, smoke test | Done |
 | M1 | Lima + Firecracker host, one agent VM, guest agent, shell/file tools, approvals | Done except snapshots and egress policy |
-| M2 | Browser automation, persistent sign-ins, live screen view | Browser automation + screenshots done; live view and sign-in polish pending |
+| M2 | Browser automation, persistent sign-ins, live screen view | Browser automation, screenshots, and live noVNC desktop done; sign-in polish pending |
 | M3 | Codex provider with ChatGPT sign-in | Optional Codex harness + responses bridge implemented; bridge verified end to end with a real non-OpenAI provider; ChatGPT subscription flow not verified end to end; SDK provider planned |
 | M4 | Multi-agent messaging, group chats, handoffs, memory | Planned |
 | M5 | Routines: record, replay, schedule | Planned |
@@ -529,6 +553,8 @@ Checks:
 ```bash
 pnpm typecheck   # all packages
 pnpm smoke       # end-to-end daemon test against an in-process mock provider
+pnpm vnc:smoke -- ws://127.0.0.1:4170/bots/<bot-id>/vnc
+                 # prove RFB negotiation reaches actual framebuffer bytes
 ```
 
 Sandbox host (Lima VM with nested virtualization, one-time setup then reuse):
@@ -557,7 +583,8 @@ pnpm sandbox:stop    # shut the Lima VM down
   is verified against DeepSeek, but Codex release changes to Responses items
   can break the translation and need a live re-check.
 - **VM image size.** A Chrome + Node + Python rootfs is heavy; image build and
-  snapshot sizes need to stay manageable.
+  compressed recovery-image sizes need to stay manageable. Recovery artifacts
+  are intentionally retained and require manual capacity management.
 - **Compaction quality.** Summaries are model-written and can lose detail.
   There is no way to inspect or edit a summary beyond reading the message.
 - **Tauri mobile.** Tauri v2 mobile is younger than React Native; if it

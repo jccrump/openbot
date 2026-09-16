@@ -117,6 +117,11 @@ pnpm sandbox:deploy   # bundle the sandbox host service and start it in the VM
 ```
 
 The first `setup` downloads a kernel and rootfs and takes a few minutes.
+Run `sandbox:setup` again after guest-agent or desktop changes. It stamps the
+base image with a content version; the next cold boot upgrades older agent
+images while preserving `/root` (including the Chromium profile), `/home`,
+`/srv`, and workspace directories. The prior image is kept as a compressed
+recovery artifact instead of being silently deleted.
 `pnpm sandbox:spike` boots a microVM and verifies exec over vsock; `pnpm
 sandbox:logs` shows the host service log; `pnpm sandbox:stop` shuts the VM down.
 
@@ -126,9 +131,10 @@ Ask the agent something that requires its computer — "what OS are you running
 on?" or "open Hacker News and take a screenshot". The agent streams its reply,
 the app shows a tool card, and execution pauses on an **Approval needed** card
 with the exact command and Approve/Deny buttons. Approved browser screenshots
-appear in the chat and in the screen panel on the right, which always shows the
-latest screenshot the agent captured. A toggle in Settings turns the approval
-gate off for trusted work (local-Mac tools always ask).
+appear in the chat, while the screen panel on the right shows the live desktop
+and falls back to the latest captured screenshot if VNC is unavailable. A
+toggle in Settings turns the approval gate off for trusted work (local-Mac
+tools always ask).
 
 ### Codex harness (optional, experimental)
 
@@ -169,16 +175,17 @@ when the Codex CLI is on `PATH`.
   live rebuilds without restarting the daemon.
 - **Agents**: create with name/role/avatar/color/model/computer, switch an
   existing agent between Firecracker and This Mac, single thread per agent.
-- **Firecracker computers**: one microVM per agent with a persistent rootfs,
-  booted on demand (~10 s cold, milliseconds warm), plus `shell`, `read_file`,
+- **Firecracker computers**: one microVM per agent with a versioned rootfs,
+  persistent agent files and Chromium profile, plus `shell`, `read_file`,
   `write_file`, and a `browser` tool (goto, click, type, text, screenshot,
-  back, wait) with persistent cookies and sign-ins.
+  back, wait).
 - **Local-Mac computers**: shell as your user and file tools confined to the
   agent's workspace, always approval-gated.
 - **Approvals** for every tool call, with approve/deny cards and denied actions
   reported back to the model.
-- **Screenshots** captured by the browser tool are persisted as artifacts,
-  rendered in the chat, and shown in the screen panel.
+- **Live desktop** through Xvfb, Openbox/tint2, x11vnc, vsock, and noVNC. The
+  screen panel is interactive, and browser-tool screenshots are still persisted
+  as chat artifacts and used as a fallback.
 - **Two harnesses**: the built-in OpenBot loop (primary, default, any
   OpenAI-compatible model) and the optional Codex harness driving the same VM
   over MCP — with a ChatGPT subscription or a non-OpenAI model through the
@@ -193,8 +200,11 @@ when the Codex CLI is on `PATH`.
 
 Be honest with yourself about the following before filing issues:
 
-- **The screen panel is the latest screenshot, not a live stream.** It updates
-  only when the agent captures a browser screenshot.
+- **Image upgrades preserve the supported durable paths, not arbitrary system
+  mutations.** Files under `/root`, `/home`, `/srv`, and the workspace
+  directories migrate; hand-edited files elsewhere in the guest OS may be
+  replaced by the new base. Compressed recovery images accumulate until you
+  remove them manually.
 - **Routines and the scheduler are not implemented.** The Routines section in
   the right panel is a labeled placeholder.
 - **The Marketplace row is a placeholder** and is disabled.
@@ -216,6 +226,9 @@ Be honest with yourself about the following before filing issues:
   returns a clear error.
 - **No per-bot egress allowlists.** Every microVM shares the host NAT; there is
   no firewall policy per agent.
+- **Chromium runs as root with `--no-sandbox` inside the microVM.** Firecracker
+  is the isolation boundary; do not treat the guest's Chrome process as a
+  second sandbox.
 - **No snapshots, restore, or pause/resume.** VMs are booted fresh and keep
   their rootfs, but there is no snapshotting.
 - **No multi-user support.** The daemon binds `127.0.0.1` and trusts the local
@@ -248,9 +261,8 @@ Be honest with yourself about the following before filing issues:
 6. **Snapshots and restore** for microVMs, plus pause/resume.
 7. **Per-bot egress allowlists** and a real base image with Node, Python, and
    Chrome/Playwright.
-8. **Live screen view** instead of the latest-screenshot panel.
-9. **macOS Keychain** for provider keys.
-10. **Mobile thin client** over Tailscale or a Cloudflare Tunnel.
+8. **macOS Keychain** for provider keys.
+9. **Mobile thin client** over Tailscale or a Cloudflare Tunnel.
 
 The detailed design, protocol, data model, and decision log live in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Research notes on how production
@@ -261,8 +273,10 @@ fast — live in [docs/research/computer-use.md](docs/research/computer-use.md).
 
 ```bash
 pnpm typecheck     # all packages
-pnpm smoke         # end-to-end daemon test with a mock model and mock sandbox
+pnpm smoke         # daemon test, including an RFB framebuffer through the proxy
 pnpm sandbox:spike # boot a microVM and verify exec over vsock
+pnpm vnc:smoke -- ws://127.0.0.1:4170/bots/<bot-id>/vnc
+                   # negotiate RFB and read a real framebuffer rectangle
 ```
 
 Layout:

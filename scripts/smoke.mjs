@@ -2,10 +2,14 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { probeRfbFramebuffer } from "./lib/rfb-probe.mjs";
 
 const root = resolve(import.meta.dirname, "..");
+const requireFromCore = createRequire(join(root, "packages/core/package.json"));
+const { WebSocketServer } = requireFromCore("ws");
 const dataDir = mkdtempSync(join(tmpdir(), "openbot-smoke-"));
 
 function readBody(request) {
@@ -183,6 +187,61 @@ const mockSandboxServer = createServer(async (request, response) => {
 
   response.statusCode = 404;
   response.end("{}");
+});
+
+const mockVnc = new WebSocketServer({ noServer: true });
+mockSandboxServer.on("upgrade", (request, socket, head) => {
+  if (!/^\/vms\/[^/]+\/vnc$/.test(request.url ?? "")) {
+    socket.destroy();
+    return;
+  }
+  mockVnc.handleUpgrade(request, socket, head, (client) => {
+    let phase = "version";
+    client.send(Buffer.from("RFB 003.008\n"));
+    client.on("message", (raw) => {
+      const data = Buffer.from(raw);
+      if (phase === "version") {
+        phase = "security";
+        client.send(Buffer.from([1, 1]));
+        return;
+      }
+      if (phase === "security") {
+        assert.equal(data[0], 1);
+        phase = "client-init";
+        client.send(Buffer.alloc(4));
+        return;
+      }
+      if (phase === "client-init") {
+        phase = "requests";
+        const name = Buffer.from("OpenBot mock framebuffer");
+        const init = Buffer.alloc(24 + name.length);
+        init.writeUInt16BE(1, 0);
+        init.writeUInt16BE(1, 2);
+        init[4] = 32;
+        init[5] = 24;
+        init[7] = 1;
+        init.writeUInt16BE(255, 8);
+        init.writeUInt16BE(255, 10);
+        init.writeUInt16BE(255, 12);
+        init[14] = 16;
+        init[15] = 8;
+        init.writeUInt32BE(name.length, 20);
+        name.copy(init, 24);
+        client.send(init);
+        return;
+      }
+      if (phase === "requests" && data[0] === 3) {
+        const update = Buffer.alloc(20);
+        update[0] = 0;
+        update.writeUInt16BE(1, 2);
+        update.writeUInt16BE(1, 8);
+        update.writeUInt16BE(1, 10);
+        update.writeInt32BE(0, 12);
+        update.writeUInt32BE(0x336699, 16);
+        client.send(update);
+      }
+    });
+  });
 });
 
 const modelPort = await new Promise((resolvePromise) => {
@@ -407,6 +466,14 @@ try {
     "screen endpoint should return the captured PNG bytes",
   );
 
+  const rfb = await probeRfbFramebuffer(
+    `ws://127.0.0.1:${daemonPort}/bots/${botId}/vnc`,
+  );
+  assert.equal(rfb.width, 1);
+  assert.equal(rfb.height, 1);
+  assert.equal(rfb.pixelBytes, 4);
+  assert.equal(rfb.name, "OpenBot mock framebuffer");
+
   const unknownScreen = await fetch(
     `http://127.0.0.1:${daemonPort}/bots/nope/screen`,
   );
@@ -590,13 +657,14 @@ try {
   assert.match(error.message, /unknown provider: nope/);
 
   console.log(
-    `SMOKE OK — text chat, single thread per bot, approved shell tool (${executedCommands[0]}), denied command, persistence, local-computer bot (host exec, forced approvals, bots.update), provider CRUD, settings, error path`,
+    `SMOKE OK — text chat, single thread per bot, approved shell tool (${executedCommands[0]}), denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), provider CRUD, settings, error path`,
   );
 } finally {
   socket?.close();
   daemon.kill("SIGTERM");
   mockModelServer.close();
   mockSandboxServer.close();
+  mockVnc.close();
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 200));
   rmSync(dataDir, { recursive: true, force: true });
 }
