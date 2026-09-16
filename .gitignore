@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+apps/mac/src-tauri/target/
+apps/mac/src-tauri/gen/
+
+# Environment (keep the example)
+.env*
+!.env.example
+
+# Logs
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local data and dev state
+data/
+.openbot-dev/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Tooling artifacts
+.playwright-mcp/

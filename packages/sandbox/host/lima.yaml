@@ -1,0 +1,29 @@
+vmType: vz
+arch: aarch64
+cpus: 4
+memory: 6GiB
+disk: 30GiB
+nestedVirtualization: true
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+mounts:
+  - location: "~"
+    writable: true
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euxo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y ca-certificates curl wget squashfs-tools e2fsprogs iproute2 iptables uuid-runtime
+      groupadd -f kvm
+      for home in /home/*; do
+        user="$(basename "$home")"
+        usermod -aG kvm "$user" || true
+      done
+      echo "nested kvm device: $(test -e /dev/kvm && echo present || echo missing)"

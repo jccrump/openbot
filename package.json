@@ -1,0 +1,29 @@
+{
+  "name": "open-bot",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@11.21.0",
+  "engines": {
+    "node": ">=22.9.0"
+  },
+  "scripts": {
+    "dev": "pnpm -r --parallel dev",
+    "dev:daemon": "pnpm --filter @openbot/core dev",
+    "dev:daemon:mock": "OPENBOT_DATA_DIR=$PWD/.openbot-dev pnpm --filter @openbot/core dev",
+    "dev:app": "pnpm --filter @openbot/mac dev",
+    "dev:mac": "pnpm --filter @openbot/mac tauri dev",
+    "mock:model": "node scripts/mock-openai.mjs",
+    "mcp": "pnpm --filter @openbot/mcp start",
+    "mcp:smoke": "pnpm --filter @openbot/mcp exec tsx src/smoke.ts",
+    "codex:vm": "bash scripts/codex-openbot.sh",
+    "sandbox:start": "limactl start openbot-fc",
+    "sandbox:stop": "limactl stop openbot-fc",
+    "sandbox:setup": "limactl shell openbot-fc -- sudo bash $PWD/packages/sandbox/host/setup.sh",
+    "sandbox:deploy": "bash packages/sandbox/host/deploy.sh",
+    "sandbox:logs": "limactl shell openbot-fc -- sudo journalctl -u openbot-host -n 50 --no-pager",
+    "sandbox:spike": "limactl shell openbot-fc -- sudo bash $PWD/packages/sandbox/host/spike.sh",
+    "typecheck": "pnpm -r typecheck",
+    "smoke": "node scripts/smoke.mjs"
+  }
+}
