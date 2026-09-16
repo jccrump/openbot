@@ -2,8 +2,10 @@
 
 OpenBot is a Grok Bot-style platform: always-on AI teammates ("agents") that
 each get their own computer, act through shell, file, and browser tools, and
-run on any model you connect — an API provider (DeepSeek first), a local model,
-or the Codex harness with ChatGPT subscription auth.
+run on any model you connect — an API provider (DeepSeek first) or a local
+model. The built-in OpenBot harness (our loop + VM tools) is the primary path;
+the optional Codex harness can bring a ChatGPT subscription or drive non-OpenAI
+models through the local responses bridge.
 
 Single-user, Mac-first. Mobile is a later thin client.
 
@@ -17,9 +19,10 @@ Single-user, Mac-first. Mobile is a later thin client.
   base image.
 - **M2 (in progress):** browser automation with persistent sign-ins and
   screenshots works. Live screen view and sign-in polish are not started.
-- **M3 (partial):** the Codex harness runs in the daemon and the
-  Responses-to-Chat-Completions bridge exists. The ChatGPT subscription flow
-  has not been verified end to end from the app.
+- **M3 (partial):** the optional Codex harness runs in the daemon and the
+  Responses-to-Chat-Completions bridge drives non-OpenAI models (verified end
+  to end with a real DeepSeek key, including a tool call in the microVM). The
+  ChatGPT subscription flow has not been verified end to end from the app.
 - **M4+ (planned):** multi-agent messaging, memory, routines, mobile. See
   [Milestones](#milestones).
 
@@ -83,10 +86,13 @@ docs/                      This document and screenshots
   development it also runs in a browser via `pnpm dev:app`.
 - Talks to the daemon exclusively over the WebSocket protocol. Reconnects
   automatically; the daemon can restart underneath it.
-- Surfaces today: agent list with search and last-message previews, chat with
-  streaming text and reasoning, model picker, computer switcher, tool cards
-  with output and screenshots, inline approval cards, a screen panel that shows
-  the latest screenshot, create-agent modal, and Settings.
+- Surfaces today: agent list with search, last-message previews, a per-agent
+  settings menu, and the model picker in the sidebar; chat with streaming text
+  and a three-dot typing bubble while the model is thinking (reasoning deltas
+  are received but hidden by default); a computer switcher; tool cards with
+  output and screenshots; inline approval cards; a collapsible screen panel
+  (latest screenshot) with a draggable resizer; create-agent modal; and
+  Settings.
 - Not present: approvals inbox, run log, routines browser, memory browser,
   group chats, live screen view.
 
@@ -140,13 +146,16 @@ thread; the app has no new-chat affordance. The thread title is set from the
 first user message. Sidebar search filters agents by name/role — it does not
 search message text.
 
-### Harnesses: our loop, or Codex
+### Harnesses: the OpenBot loop (primary) and Codex (optional)
 
-Two ways to drive an agent's computer, both selectable in Settings:
+Two ways to drive an agent's computer, both selectable in Settings. The OpenBot
+loop is the primary path; Codex is an optional, experimental bring-your-own
+mode.
 
 1. **OpenBot loop** (`agent.ts`) — the daemon owns the agent loop and the
    tools. Approvals surface in the app, streaming maps directly onto the
-   protocol, and any OpenAI-compatible model works. This is the default.
+   protocol, reasoning deltas are hidden by the UI (the typing bubble signals
+   thinking), and any OpenAI-compatible model works. This is the default.
 2. **Codex** (`codex.ts`) — the daemon spawns `codex exec --json` with
    `--ignore-user-config --skip-git-repo-check --ephemeral --sandbox
    read-only`, registers `packages/mcp` as the only MCP server, and maps Codex
@@ -154,6 +163,27 @@ Two ways to drive an agent's computer, both selectable in Settings:
    `command_execution`, `turn.completed`, `turn.failed`) onto the OpenBot
    protocol. Codex plans; every action still runs inside the agent's microVM
    through the MCP tools. The daemon refuses Codex runs for This Mac agents.
+
+**Codex with non-OpenAI models.** When the selected provider is not
+OpenAI/ChatGPT, the daemon starts the Responses-to-Chat-Completions bridge
+in-process (`packages/responses-bridge`) and points Codex at it with
+`wire_api = "responses"`. Codex 0.154 sends Responses-API `developer`-role
+messages and reasoning items, so the bridge normalizes the transcript before
+forwarding it upstream:
+
+- `developer` and `system` messages map to `system` (merged with the
+  `instructions` block); `user`, `assistant`, and `tool` pass through; unknown
+  roles fall back to `user`.
+- Reasoning summaries are folded into the assistant tool-call message as
+  `reasoning_content` instead of a separate assistant message, which thinking
+  models such as DeepSeek require when a tool call is passed back. Reasoning
+  that is not followed by a tool call is dropped.
+- Consecutive `function_call` items merge into one assistant message with
+  multiple `tool_calls`, `function_call_output` becomes a `tool` message, and
+  empty message content or tool outputs without a `call_id` are skipped so the
+  transcript stays valid.
+- Tool definitions in a namespace are flattened to `namespace__name` and mapped
+  back on the way out.
 
 **The ChatGPT-quota isolation rule.** Codex can authenticate with a ChatGPT
 subscription, and subscription quota must only ever be spent on OpenAI/ChatGPT
@@ -163,11 +193,9 @@ label, and base URL host (`openai.com`, `chatgpt.com`):
 - **OpenAI/ChatGPT provider:** Codex runs with the user's normal `CODEX_HOME`
   and ChatGPT login. Subscription auth is allowed.
 - **Any other provider:** the daemon deletes `auth.json` in an isolated
-  `CODEX_HOME` under the data dir, starts a local Responses bridge in-process
-  (`packages/responses-bridge`) pointed at that provider, and tells Codex to
-  use the bridge with `wire_api = "responses"`. Codex cannot reach the ChatGPT
-  backend from that home, so subscription quota is never touched and the
-  provider key is only passed to the bridge.
+  `CODEX_HOME` under the data dir and uses the bridge described above. Codex
+  cannot reach the ChatGPT backend from that home, so subscription quota is
+  never touched and the provider key is only passed to the bridge.
 
 `scripts/codex-openbot.sh` implements the same rule for the standalone
 `pnpm codex:vm` path, with the bridge as a background process.
@@ -350,7 +378,8 @@ Server to client:
   approval setting, harness, Codex info
 - `threads`, `thread.messages`, `thread.upserted`
 - `chat.start`, `chat.delta`, `chat.reasoning`, `chat.done`, `chat.error`,
-  `chat.compaction`
+  `chat.compaction` — the app receives reasoning deltas but hides them by
+  default; the typing bubble is the only thinking signal
 - `tool.start`, `tool.result` — live tool activity for the transcript cards
 - `approval.request` — asks the user to approve a tool action
 - `sandbox.state` — agent computer state (stopped, booting, running, error)
@@ -398,7 +427,7 @@ Planned additions: `runs` (journal), `routines`, `memory`, `approvals`,
 | M0 | Monorepo, daemon, gateway, SQLite, WS protocol, chat UI, smoke test | Done |
 | M1 | Lima + Firecracker host, one agent VM, guest agent, shell/file tools, approvals | Done except snapshots and egress policy |
 | M2 | Browser automation, persistent sign-ins, live screen view | Browser automation + screenshots done; live view and sign-in polish pending |
-| M3 | Codex provider with ChatGPT sign-in | Codex harness + responses bridge implemented; ChatGPT flow not verified end to end; SDK provider planned |
+| M3 | Codex provider with ChatGPT sign-in | Optional Codex harness + responses bridge implemented; bridge verified end to end with a real non-OpenAI provider; ChatGPT subscription flow not verified end to end; SDK provider planned |
 | M4 | Multi-agent messaging, group chats, handoffs, memory | Planned |
 | M5 | Routines: record, replay, schedule | Planned |
 | M6 | Mobile thin client over Tailscale | Planned |
@@ -422,9 +451,12 @@ Rejected: running agents on the bare Mac (no isolation), managed sandboxes
 (less control, per-use cost), Apple containers (weaker isolation than KVM).
 
 **ADR-004: Codex for ChatGPT subscription access.** Official OAuth flow, token
-caching and refresh handled by Codex, works with Plus/Pro plans. The tradeoff is
-a coding-agent-shaped harness and plan limits. Unofficial ChatGPT-web reverse
-engineering was rejected (ToS risk, constant breakage).
+caching and refresh handled by Codex, works with Plus/Pro plans. The same
+harness is reused for non-OpenAI models through the responses bridge with an
+isolated `CODEX_HOME`, so subscription quota is never spent on other providers.
+The tradeoffs are a coding-agent-shaped harness, plan limits, and Responses-API
+translation that must track Codex releases (see the harness section). Unofficial
+ChatGPT-web reverse engineering was rejected (ToS risk, constant breakage).
 
 **ADR-005: Host-side harness, VM as the hands.** The agent loop, compaction,
 and policy live in the daemon; the VM exposes tools. Swapping models or
@@ -521,7 +553,9 @@ pnpm sandbox:stop    # shut the Lima VM down
   open.
 - **Codex harness shape.** It is built for coding agents. Using it as a general
   teammate model may need prompt and tool adaptation, and the in-app
-  subscription flow still needs an end-to-end test.
+  subscription flow still needs a real-quota end-to-end test. The bridge path
+  is verified against DeepSeek, but Codex release changes to Responses items
+  can break the translation and need a live re-check.
 - **VM image size.** A Chrome + Node + Python rootfs is heavy; image build and
   snapshot sizes need to stay manageable.
 - **Compaction quality.** Summaries are model-written and can lose detail.

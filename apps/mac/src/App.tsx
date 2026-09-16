@@ -10,6 +10,7 @@ import type {
   ToolCallRecord,
 } from "@openbot/protocol";
 import { Settings } from "./Settings";
+import { PanelResizer } from "./components/PanelResizer";
 import { VncView, type VncState } from "./components/VncView";
 import { DAEMON_HTTP_URL } from "./lib/daemon";
 import { useTheme } from "./lib/useTheme";
@@ -229,37 +230,6 @@ function SearchIcon() {
   );
 }
 
-function GridIcon() {
-  return (
-    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <rect x="2.4" y="2.4" width="4.6" height="4.6" rx="1.4" stroke="currentColor" strokeWidth="1.4" />
-      <rect x="9" y="2.4" width="4.6" height="4.6" rx="1.4" stroke="currentColor" strokeWidth="1.4" />
-      <rect x="2.4" y="9" width="4.6" height="4.6" rx="1.4" stroke="currentColor" strokeWidth="1.4" />
-      <rect x="9" y="9" width="4.6" height="4.6" rx="1.4" stroke="currentColor" strokeWidth="1.4" />
-    </svg>
-  );
-}
-
-function ShareIcon() {
-  return (
-    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <path
-        d="M8 10.5V2.8M8 2.8 5.2 5.6M8 2.8l2.8 2.8"
-        stroke="currentColor"
-        strokeWidth="1.4"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      <path
-        d="M3 8.6v3.2c0 .9.7 1.6 1.6 1.6h6.8c.9 0 1.6-.7 1.6-1.6V8.6"
-        stroke="currentColor"
-        strokeWidth="1.4"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
-}
-
 function MicIcon() {
   return (
     <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -369,7 +339,12 @@ export default function App() {
   const [createOpen, setCreateOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [computerMenuOpen, setComputerMenuOpen] = useState(false);
+  const [computerMenu, setComputerMenu] = useState<{
+    botId: string;
+    top: number;
+    left: number;
+    width: number;
+  } | null>(null);
   const [screenOpen, setScreenOpen] = useState(storedScreenPanelOpen);
   const [screenPlaying, setScreenPlaying] = useState(true);
   const [screenExpanded, setScreenExpanded] = useState(false);
@@ -392,9 +367,6 @@ export default function App() {
       !provider.hasApiKey &&
       provider.apiKeyEnv !== null,
   );
-  const sandboxState: SandboxState = bot
-    ? (daemon.sandboxStates[bot.id] ?? "stopped")
-    : "stopped";
   const screenMessage = (() => {
     if (!bot) {
       return "No agent selected";
@@ -446,10 +418,6 @@ export default function App() {
     }
     return screenMessage;
   })();
-
-  useEffect(() => {
-    setComputerMenuOpen(false);
-  }, [daemon.selectedBotId]);
 
   useEffect(() => {
     if (!screenExpanded) {
@@ -602,7 +570,6 @@ export default function App() {
     activity,
     approvals,
     streaming?.text,
-    streaming?.reasoning,
   ]);
 
   const submit = () => {
@@ -663,13 +630,32 @@ export default function App() {
               "No messages yet";
             const state = daemon.sandboxStates[item.id] ?? "stopped";
             return (
-              <button
+              <div
                 key={item.id}
+                role="button"
+                tabIndex={0}
                 className={`agent-row ${
                   item.id === daemon.selectedBotId ? "agent-row-selected" : ""
                 }`}
                 title={sidebarCollapsed ? item.name : undefined}
                 onClick={() => daemon.selectBot(item.id)}
+                onKeyDown={(event) => {
+                  if (
+                    event.key === "Escape" &&
+                    computerMenu?.botId === item.id
+                  ) {
+                    event.preventDefault();
+                    setComputerMenu(null);
+                    return;
+                  }
+                  if (event.target !== event.currentTarget) {
+                    return;
+                  }
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    daemon.selectBot(item.id);
+                  }
+                }}
               >
                 <AgentAvatar bot={item} />
                 {!sidebarCollapsed && (
@@ -679,6 +665,38 @@ export default function App() {
                   </span>
                 )}
                 {!sidebarCollapsed && (
+                  <button
+                    className="agent-settings-button"
+                    title="Computer settings"
+                    aria-label={`Computer settings for ${item.name}`}
+                    aria-haspopup="menu"
+                    aria-expanded={computerMenu?.botId === item.id}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      if (item.id !== daemon.selectedBotId) {
+                        daemon.selectBot(item.id);
+                      }
+                      const row = event.currentTarget.closest(".agent-row");
+                      if (!row) {
+                        return;
+                      }
+                      const rect = row.getBoundingClientRect();
+                      setComputerMenu((current) =>
+                        current?.botId === item.id
+                          ? null
+                          : {
+                              botId: item.id,
+                              top: rect.bottom + 6,
+                              left: rect.left,
+                              width: rect.width,
+                            },
+                      );
+                    }}
+                  >
+                    <GearIcon />
+                  </button>
+                )}
+                {!sidebarCollapsed && (
                   <span
                     className={`status-dot ${
                       isLocalBot(item) ? "status-local" : `status-${state}`
@@ -686,7 +704,61 @@ export default function App() {
                     title={computerLabel(item, state)}
                   />
                 )}
-              </button>
+                {!sidebarCollapsed && computerMenu?.botId === item.id && (
+                  <>
+                    <div
+                      className="computer-menu-backdrop"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setComputerMenu(null);
+                      }}
+                    />
+                    <div
+                      className="computer-menu"
+                      role="menu"
+                      style={{
+                        top: computerMenu.top,
+                        left: computerMenu.left,
+                        width: computerMenu.width,
+                      }}
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      <button
+                        role="menuitemradio"
+                        aria-checked={!isLocalBot(item)}
+                        className={`computer-menu-item ${
+                          !isLocalBot(item) ? "computer-menu-item-active" : ""
+                        }`}
+                        onClick={() => {
+                          daemon.updateBotComputer(item.id, "firecracker");
+                          setComputerMenu(null);
+                        }}
+                      >
+                        <span>Firecracker microVM</span>
+                        <span className="computer-menu-sub">
+                          Isolated Linux computer
+                        </span>
+                      </button>
+                      <button
+                        role="menuitemradio"
+                        aria-checked={isLocalBot(item)}
+                        className={`computer-menu-item ${
+                          isLocalBot(item) ? "computer-menu-item-active" : ""
+                        }`}
+                        onClick={() => {
+                          daemon.updateBotComputer(item.id, "mac");
+                          setComputerMenu(null);
+                        }}
+                      >
+                        <span>This Mac</span>
+                        <span className="computer-menu-sub">
+                          Runs commands directly on this Mac
+                        </span>
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
             );
           })}
           {!sidebarCollapsed && visibleBots.length === 0 && (
@@ -695,19 +767,33 @@ export default function App() {
         </div>
 
         <div className="sidebar-footer">
-          <button
-            className="sidebar-row sidebar-row-muted"
-            disabled
-            title="Marketplace — coming soon"
-          >
-            <GridIcon />
-            {!sidebarCollapsed && (
-              <>
-                <span className="sidebar-row-label">Marketplace</span>
-                <span className="badge">Soon</span>
-              </>
-            )}
-          </button>
+          {!sidebarCollapsed && (
+            <label className="model-pill model-pill-sidebar" title="Model">
+              <select
+                value={modelValue}
+                aria-label="Model"
+                onChange={(event) => {
+                  const [provider, model] = event.target.value.split("::");
+                  if (provider && model) {
+                    daemon.setSelectedModel({ provider, model });
+                  }
+                }}
+              >
+                {daemon.modelOptions.length === 0 && (
+                  <option value="">No models configured</option>
+                )}
+                {daemon.modelOptions.map((option) => (
+                  <option
+                    key={`${option.provider}::${option.model}`}
+                    value={`${option.provider}::${option.model}`}
+                  >
+                    {option.providerLabel} · {option.model}
+                  </option>
+                ))}
+              </select>
+              <ChevronIcon />
+            </label>
+          )}
           <div className="user-row">
             <span className="avatar user-avatar">JC</span>
             {!sidebarCollapsed && <span className="footer-name">Justin</span>}
@@ -759,103 +845,11 @@ export default function App() {
             >
               <MonitorIcon />
             </button>
-            <button
-              className="icon-button icon-muted"
-              title="Share — coming soon"
-              aria-label="Share agent (coming soon)"
-              disabled
-            >
-              <ShareIcon />
-            </button>
-            <label className="model-pill" title="Model">
-              <select
-                value={modelValue}
-                aria-label="Model"
-                onChange={(event) => {
-                  const [provider, model] = event.target.value.split("::");
-                  if (provider && model) {
-                    daemon.setSelectedModel({ provider, model });
-                  }
-                }}
-              >
-                {daemon.modelOptions.length === 0 && (
-                  <option value="">No models configured</option>
-                )}
-                {daemon.modelOptions.map((option) => (
-                  <option
-                    key={`${option.provider}::${option.model}`}
-                    value={`${option.provider}::${option.model}`}
-                  >
-                    {option.providerLabel} · {option.model}
-                  </option>
-                ))}
-              </select>
-              <ChevronIcon />
-            </label>
             {daemon.harness.default === "codex" && (
               <span className="harness-pill" title="Codex harness">
                 Codex
               </span>
             )}
-            <div className="computer-control">
-              <button
-                className={`computer-pill computer-${
-                  isLocalBot(bot) ? "local" : sandboxState
-                }`}
-                onClick={() => setComputerMenuOpen((value) => !value)}
-                disabled={!bot}
-                title="Change this agent's computer"
-                aria-label="Change this agent's computer"
-                aria-haspopup="menu"
-                aria-expanded={computerMenuOpen}
-              >
-                <MonitorIcon />
-                {computerLabel(bot, sandboxState)}
-                <ChevronIcon />
-              </button>
-              {computerMenuOpen && bot && (
-                <>
-                  <div
-                    className="computer-menu-backdrop"
-                    onClick={() => setComputerMenuOpen(false)}
-                  />
-                  <div className="computer-menu" role="menu">
-                    <button
-                      role="menuitemradio"
-                      aria-checked={!isLocalBot(bot)}
-                      className={`computer-menu-item ${
-                        !isLocalBot(bot) ? "computer-menu-item-active" : ""
-                      }`}
-                      onClick={() => {
-                        daemon.updateBotComputer(bot.id, "firecracker");
-                        setComputerMenuOpen(false);
-                      }}
-                    >
-                      <span>Firecracker microVM</span>
-                      <span className="computer-menu-sub">
-                        Isolated Linux computer
-                      </span>
-                    </button>
-                    <button
-                      role="menuitemradio"
-                      aria-checked={isLocalBot(bot)}
-                      className={`computer-menu-item ${
-                        isLocalBot(bot) ? "computer-menu-item-active" : ""
-                      }`}
-                      onClick={() => {
-                        daemon.updateBotComputer(bot.id, "mac");
-                        setComputerMenuOpen(false);
-                      }}
-                    >
-                      <span>This Mac</span>
-                      <span className="computer-menu-sub">
-                        Runs commands directly on this Mac
-                      </span>
-                    </button>
-                  </div>
-                </>
-              )}
-            </div>
           </div>
         </header>
 
@@ -916,14 +910,7 @@ export default function App() {
               />
             ))}
 
-            {streaming && (
-              <StreamingRow
-                streaming={streaming}
-                color={bot?.color ?? avatarColor(bot?.id ?? "assistant")}
-                botName={botName}
-                avatar={bot?.avatar ?? null}
-              />
-            )}
+            {streaming && <StreamingRow streaming={streaming} />}
           </div>
         </div>
 
@@ -974,8 +961,38 @@ export default function App() {
         </footer>
       </main>
 
+      <PanelResizer active={screenOpen} />
       {screenOpen && (
         <aside className="screen-panel">
+          <div className="screen-panel-bar">
+            <span className="screen-panel-title">Computer</span>
+            <button
+              className="icon-button"
+              title="Collapse computer view"
+              aria-label="Collapse computer view"
+              onClick={() => {
+                setScreenOpen(false);
+                try {
+                  localStorage.setItem(SCREEN_PANEL_KEY, "closed");
+                } catch {}
+              }}
+            >
+              <svg
+                width="15"
+                height="15"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <path d="m6 17 5-5-5-5" />
+                <path d="m13 17 5-5-5-5" />
+              </svg>
+            </button>
+          </div>
           <section className="screen-view">
             <div
               className={`screen-frame ${
@@ -1099,6 +1116,14 @@ export default function App() {
 
 function MessageBubble({ message }: { message: Message }) {
   const calls = message.toolCalls ?? [];
+
+  if (message.id.startsWith("error-")) {
+    return (
+      <div className="entry entry-assistant">
+        <div className="entry-body entry-error">{message.content}</div>
+      </div>
+    );
+  }
 
   if (message.role === "user") {
     return (
@@ -1247,36 +1272,25 @@ function ApprovalCard({
   );
 }
 
-function StreamingRow({
-  streaming,
-  color,
-  botName,
-  avatar,
-}: {
-  streaming: StreamingState;
-  color: string;
-  botName: string;
-  avatar: string | null;
-}) {
-  if (!streaming.text && !streaming.reasoning) {
+function StreamingRow({ streaming }: { streaming: StreamingState }) {
+  if (!streaming.text) {
     return (
-      <div className="pending">
-        <span className="avatar avatar-lg" style={{ background: color }}>
-          {avatar ?? initialOf(botName)}
-        </span>
-        <span className="pending-label">Thinking</span>
+      <div className="entry entry-assistant">
+        <div
+          className="entry-body typing-bubble"
+          role="status"
+          aria-label="Assistant is typing"
+        >
+          <span className="typing-dot" />
+          <span className="typing-dot" />
+          <span className="typing-dot" />
+        </div>
       </div>
     );
   }
 
   return (
     <div className="entry entry-assistant">
-      {streaming.reasoning && (
-        <details className="reasoning">
-          <summary>Reasoning</summary>
-          <div>{streaming.reasoning}</div>
-        </details>
-      )}
       <div className="entry-body">
         <Markdown text={streaming.text} />
         <span className="caret" />

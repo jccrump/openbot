@@ -106,11 +106,9 @@ export function createOpenAICompatibleProvider(
         if (!choice) continue;
         const delta = (choice.delta ?? {}) as Record<string, unknown>;
 
-        if (
-          typeof delta.reasoning_content === "string" &&
-          delta.reasoning_content.length > 0
-        ) {
-          yield { type: "reasoning_delta", text: delta.reasoning_content };
+        const reasoning = extractReasoning(delta);
+        if (reasoning) {
+          yield { type: "reasoning_delta", text: reasoning };
         }
         if (typeof delta.content === "string" && delta.content.length > 0) {
           yield { type: "text_delta", text: delta.content };
@@ -155,6 +153,22 @@ export function createOpenAICompatibleProvider(
       yield { type: "done", finishReason };
     },
   };
+}
+
+function extractReasoning(delta: Record<string, unknown>): string {
+  for (const key of ["reasoning_content", "reasoning", "thinking"]) {
+    const value = delta[key];
+    if (typeof value === "string" && value.length > 0) {
+      return value;
+    }
+    if (value && typeof value === "object") {
+      const text = (value as { text?: unknown }).text;
+      if (typeof text === "string" && text.length > 0) {
+        return text;
+      }
+    }
+  }
+  return "";
 }
 
 function parseUsage(payload: unknown): TokenUsage | null {

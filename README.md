@@ -4,8 +4,10 @@ Open-source Grok Bot-style agents that each own a computer — a Firecracker
 microVM or your Mac. Each agent can run commands, read and write files, drive a
 real browser, and show you its screen, with every action gated behind an
 approval you control. Bring any model: DeepSeek, OpenAI, OpenRouter, Groq, xAI,
-Google, Mistral, or a local model through Ollama or LM Studio — plus an optional
-Codex harness for ChatGPT subscription models.
+Google, Mistral, or a local model through Ollama or LM Studio. The built-in
+OpenBot harness is the primary path; an optional, experimental Codex harness can
+bring your ChatGPT subscription or drive non-OpenAI models through the local
+responses bridge.
 
 > **Status: early alpha.** The core loop works end to end on macOS Apple
 > Silicon, but this is a rough-edged first release. Read
@@ -36,6 +38,14 @@ Codex harness for ChatGPT subscription models.
 | Dark settings | Light settings |
 | --- | --- |
 | ![Dark settings](docs/theme-dark-settings.png) | ![Light settings](docs/theme-light-settings.png) |
+
+| Thinking indicator (light) | Thinking indicator (dark) |
+| --- | --- |
+| ![Typing dots while the model thinks, light theme](docs/typing-light.png) | ![Typing dots while the model thinks, dark theme](docs/typing-dark.png) |
+
+| Agent settings menu |
+| --- |
+| ![Computer switcher menu on a sidebar agent](docs/agent-settings-menu.png) |
 
 ## Quickstart
 
@@ -120,32 +130,39 @@ appear in the chat and in the screen panel on the right, which always shows the
 latest screenshot the agent captured. A toggle in Settings turns the approval
 gate off for trusted work (local-Mac tools always ask).
 
-### Codex harness (optional)
+### Codex harness (optional, experimental)
 
-The agent's computer is also exposed as an MCP server, so the Codex CLI can use
-its own harness — including ChatGPT subscription models:
+The OpenBot loop is the default and the primary way agents run. The Codex
+harness is a bring-your-own alternative: the agent's computer is also exposed as
+an MCP server, so the Codex CLI can use its own harness — including ChatGPT
+subscription models:
 
 ```bash
 pnpm codex:vm "open example.com, screenshot it, and tell me the top headline"
 ```
 
-Any OpenAI-compatible model works through a local Responses-to-Chat-Completions
-bridge, with an isolated `CODEX_HOME` so non-OpenAI providers can never touch a
-ChatGPT login:
+Codex can also drive any OpenAI-compatible model through the local
+Responses-to-Chat-Completions bridge (`packages/responses-bridge`), which maps
+Responses API items onto Chat Completions (`developer` → `system`, reasoning
+summaries → `reasoning_content` for thinking models, tool calls and outputs
+preserved) so DeepSeek and similar providers accept the transcript:
 
 ```bash
 OPENBOT_UPSTREAM_BASE_URL=https://api.deepseek.com/v1 \
 OPENBOT_UPSTREAM_API_KEY=$DEEPSEEK_API_KEY \
-OPENBOT_UPSTREAM_MODEL=deepseek-v4-flash \
+OPENBOT_UPSTREAM_MODEL=deepseek-flash \
 pnpm codex:vm "check what OS you're running on"
 ```
 
-The same harness can be selected as the app's default in **Settings →
-Harness** when the Codex CLI is on `PATH`.
+Non-OpenAI providers always run with an isolated `CODEX_HOME` that has no
+`auth.json`, so a ChatGPT login can never be used (or quota spent) for them. The
+same harness can be selected as the app's default in **Settings → Harness**
+when the Codex CLI is on `PATH`.
 
 ## What works today
 
-- **Chat** with streaming text and reasoning, message copy, per-agent threads
+- **Chat** with streaming text, a three-dot typing bubble while the model is
+  thinking (reasoning is hidden by default), message copy, per-agent threads
   with last-message previews, and agent search in the sidebar.
 - **Providers** as user data: add/edit/remove/enable, presets for nine
   providers, "fetch models" from any OpenAI-compatible `/models` endpoint, and
@@ -162,8 +179,10 @@ Harness** when the Codex CLI is on `PATH`.
   reported back to the model.
 - **Screenshots** captured by the browser tool are persisted as artifacts,
   rendered in the chat, and shown in the screen panel.
-- **Two harnesses**: the built-in OpenBot loop for any OpenAI-compatible model,
-  and Codex driving the same VM over MCP.
+- **Two harnesses**: the built-in OpenBot loop (primary, default, any
+  OpenAI-compatible model) and the optional Codex harness driving the same VM
+  over MCP — with a ChatGPT subscription or a non-OpenAI model through the
+  responses bridge.
 - **Automatic conversation compaction** in the daemon when a thread approaches
   the model's context window, with an overflow retry path.
 - **Themes**: light, dark, and follow-system, persisted per machine.
@@ -183,11 +202,16 @@ Be honest with yourself about the following before filing issues:
   in the composer are disabled/labeled "coming soon".
 - **Sharing is not implemented.** The share button is disabled; there is no URL
   scheme or link handling.
-- **ChatGPT subscription mode is not verified end to end.** The in-app Codex
-  harness path and the `pnpm codex:vm` MCP path exist, but the subscription
-  flow has only been exercised manually. The Responses bridge is verified with
-  the mock provider; tool calling with a real non-OpenAI provider still needs a
-  key and a live test.
+- **The Codex harness is experimental, and its ChatGPT subscription mode is not
+  verified end to end.** The in-app Codex path and the `pnpm codex:vm` MCP path
+  exist, but the subscription flow has only been exercised manually with a real
+  plan. The responses bridge path is verified end to end against a real
+  DeepSeek key, including a tool call executed in the microVM; the ChatGPT
+  quota-isolation rule (isolated `CODEX_HOME` for non-OpenAI providers) is
+  covered by code and by that run, not by an automated test.
+- **Reasoning is hidden.** The daemon still streams `chat.reasoning`, but the UI
+  intentionally renders only a three-dot typing bubble; there is no setting to
+  show thinking yet.
 - **The browser tool only works on the microVM computer.** On This Mac it
   returns a clear error.
 - **No per-bot egress allowlists.** Every microVM shares the host NAT; there is

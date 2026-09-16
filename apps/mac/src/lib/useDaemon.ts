@@ -22,7 +22,6 @@ export interface StreamingState {
   threadId: string;
   messageId: string;
   text: string;
-  reasoning: string;
 }
 
 export interface ToolActivity {
@@ -78,6 +77,23 @@ export interface FetchModelsResult {
 }
 
 const SELECTED_BOT_KEY = "openbot.bot";
+const STREAM_WATCHDOG_MS = 90_000;
+const DISCONNECTED_ERROR = "Daemon disconnected — reconnect";
+
+function progressThreadFor(message: ServerMessage): string | null {
+  switch (message.type) {
+    case "chat.start":
+    case "chat.delta":
+    case "chat.reasoning":
+    case "chat.compaction":
+    case "tool.start":
+    case "tool.result":
+    case "approval.request":
+      return message.threadId;
+    default:
+      return null;
+  }
+}
 
 function storedBotId(): string | null {
   try {
@@ -89,6 +105,10 @@ function storedBotId(): string | null {
 
 function localMessageId(): string {
   return `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function errorMessageId(): string {
+  return `error-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 export function isProviderUsable(provider: ProviderInfo): boolean {
@@ -130,7 +150,9 @@ export function useDaemon() {
   const [selectedModel, setSelectedModel] = useState<ModelRef | null>(null);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
-  const [streaming, setStreaming] = useState<StreamingState | null>(null);
+  const [streamingByThread, setStreamingByThread] = useState<
+    Record<string, StreamingState>
+  >({});
   const [error, setError] = useState<string | null>(null);
   const [toolActivity, setToolActivity] = useState<ToolActivity[]>([]);
   const [approvals, setApprovals] = useState<PendingApproval[]>([]);
@@ -140,8 +162,12 @@ export function useDaemon() {
 
   const activeThreadIdRef = useRef<string | null>(null);
   activeThreadIdRef.current = activeThreadId;
-  const streamingRef = useRef<StreamingState | null>(null);
-  streamingRef.current = streaming;
+  const streamingRef = useRef<Record<string, StreamingState>>({});
+  streamingRef.current = streamingByThread;
+  const watchdogTimers = useRef(
+    new Map<string, ReturnType<typeof setTimeout>>(),
+  );
+  const outageRef = useRef(false);
   const botsRef = useRef<Bot[]>(bots);
   botsRef.current = bots;
   const threadsRef = useRef<Thread[]>(threads);
@@ -190,10 +216,69 @@ export function useDaemon() {
     [client],
   );
 
+  const disarmWatchdog = useCallback((threadId?: string) => {
+    if (threadId === undefined) {
+      for (const timer of watchdogTimers.current.values()) {
+        clearTimeout(timer);
+      }
+      watchdogTimers.current.clear();
+      return;
+    }
+    const timer = watchdogTimers.current.get(threadId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      watchdogTimers.current.delete(threadId);
+    }
+  }, []);
+
+  const armWatchdog = useCallback((threadId: string) => {
+    const existing = watchdogTimers.current.get(threadId);
+    if (existing !== undefined) {
+      clearTimeout(existing);
+    }
+    watchdogTimers.current.set(
+      threadId,
+      setTimeout(() => {
+        watchdogTimers.current.delete(threadId);
+        if (!streamingRef.current[threadId]) {
+          return;
+        }
+        setStreamingByThread((current) => {
+          if (!current[threadId]) {
+            return current;
+          }
+          const next = { ...current };
+          delete next[threadId];
+          return next;
+        });
+        setToolActivity((current) =>
+          current.filter((item) => item.threadId !== threadId),
+        );
+        setError(
+          "No response from the daemon — the turn timed out. Try again.",
+        );
+      }, STREAM_WATCHDOG_MS),
+    );
+  }, []);
+
+  const clearInFlight = useCallback(() => {
+    disarmWatchdog();
+    setStreamingByThread({});
+    setToolActivity([]);
+    setApprovals([]);
+  }, [disarmWatchdog]);
+
   useEffect(() => {
     const handleMessage = (message: ServerMessage) => {
+      const progressThread = progressThreadFor(message);
+      if (progressThread !== null) {
+        armWatchdog(progressThread);
+      }
       switch (message.type) {
         case "hello": {
+          outageRef.current = false;
+          clearInFlight();
+          setError(null);
           setBots(message.bots);
           setThreads(message.threads);
           setProviders(message.providers);
@@ -320,29 +405,31 @@ export function useDaemon() {
           setApprovals((current) =>
             current.filter((item) => item.threadId !== message.threadId),
           );
-          setStreaming({
-            runId: message.runId,
-            threadId: message.threadId,
-            messageId: message.messageId,
-            text: "",
-            reasoning: "",
-          });
+          setStreamingByThread((current) => ({
+            ...current,
+            [message.threadId]: {
+              runId: message.runId,
+              threadId: message.threadId,
+              messageId: message.messageId,
+              text: "",
+            },
+          }));
           break;
         }
         case "chat.delta": {
-          setStreaming((current) =>
-            current && current.messageId === message.messageId
-              ? { ...current, text: current.text + message.text }
-              : current,
-          );
-          break;
-        }
-        case "chat.reasoning": {
-          setStreaming((current) =>
-            current && current.messageId === message.messageId
-              ? { ...current, reasoning: current.reasoning + message.text }
-              : current,
-          );
+          setStreamingByThread((current) => {
+            const entry = current[message.threadId];
+            if (!entry || entry.messageId !== message.messageId) {
+              return current;
+            }
+            return {
+              ...current,
+              [message.threadId]: {
+                ...entry,
+                text: entry.text + message.text,
+              },
+            };
+          });
           break;
         }
         case "tool.start": {
@@ -401,9 +488,15 @@ export function useDaemon() {
           break;
         }
         case "chat.done": {
-          setStreaming((current) =>
-            current && current.messageId === message.message.id ? null : current,
-          );
+          disarmWatchdog(message.threadId);
+          setStreamingByThread((current) => {
+            if (!current[message.threadId]) {
+              return current;
+            }
+            const next = { ...current };
+            delete next[message.threadId];
+            return next;
+          });
           setToolActivity((current) =>
             current.filter((item) => item.threadId !== message.threadId),
           );
@@ -420,14 +513,55 @@ export function useDaemon() {
           break;
         }
         case "chat.error": {
-          setStreaming(null);
-          setError(message.message);
+          disarmWatchdog();
+          setStreamingByThread({});
+          if (message.threadId) {
+            setToolActivity((current) =>
+              current.filter((item) => item.threadId !== message.threadId),
+            );
+            setApprovals((current) =>
+              current.filter((item) => item.threadId !== message.threadId),
+            );
+          } else {
+            setToolActivity([]);
+            setApprovals([]);
+          }
+          const threadId = message.threadId ?? activeThreadIdRef.current;
+          if (threadId !== null && threadId === activeThreadIdRef.current) {
+            setMessages((current) => [
+              ...current,
+              {
+                id: errorMessageId(),
+                threadId,
+                role: "assistant",
+                content: message.message,
+                model: null,
+                toolCalls: null,
+                createdAt: new Date().toISOString(),
+              },
+            ]);
+          } else {
+            setError(message.message);
+          }
           break;
         }
       }
     };
 
-    const offStatus = client.onStatus(setStatus);
+    const offStatus = client.onStatus((next) => {
+      setStatus(next);
+      if (next === "connected") {
+        outageRef.current = false;
+        return;
+      }
+      if (next === "disconnected") {
+        clearInFlight();
+        if (!outageRef.current) {
+          outageRef.current = true;
+          setError(DISCONNECTED_ERROR);
+        }
+      }
+    });
     const offMessage = client.onMessage(handleMessage);
     client.connect();
     return () => {
@@ -435,13 +569,17 @@ export function useDaemon() {
       offMessage();
       client.disconnect();
     };
-  }, [client, activateBot]);
+  }, [client, activateBot, armWatchdog, disarmWatchdog, clearInFlight]);
 
   const sendMessage = useCallback(
     (text: string) => {
       const botId = selectedBotIdRef.current;
       if (!botId) {
         setError("no bot available on the daemon");
+        return;
+      }
+      if (client.status !== "connected") {
+        setError(DISCONNECTED_ERROR);
         return;
       }
       const threadId = activeThreadIdRef.current;
@@ -470,7 +608,8 @@ export function useDaemon() {
   );
 
   const cancel = useCallback(() => {
-    const current = streamingRef.current;
+    const threadId = activeThreadIdRef.current;
+    const current = threadId ? streamingRef.current[threadId] : null;
     if (current) {
       client.send({ type: "chat.cancel", runId: current.runId });
     }
@@ -582,6 +721,11 @@ export function useDaemon() {
   const clearError = useCallback(() => {
     setError(null);
   }, []);
+
+  const streaming =
+    activeThreadId !== null
+      ? (streamingByThread[activeThreadId] ?? null)
+      : null;
 
   const modelOptions: ModelOption[] = providers
     .filter(isProviderUsable)

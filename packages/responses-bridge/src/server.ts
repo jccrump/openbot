@@ -25,10 +25,11 @@ interface ResponsesRequestBody {
 
 interface OutputItem {
   id: string;
-  type: "message" | "function_call";
+  type: "message" | "function_call" | "reasoning";
   role?: string;
   status?: string;
   content?: Array<{ type: string; text: string }>;
+  summary?: Array<{ type: string; text: string }>;
   name?: string;
   namespace?: string;
   arguments?: string;
@@ -75,10 +76,57 @@ function extractText(content: unknown): string {
     .join("");
 }
 
+function extractReasoning(delta: Record<string, unknown>): string {
+  for (const key of ["reasoning_content", "reasoning", "thinking"]) {
+    const value = delta[key];
+    if (typeof value === "string" && value.length > 0) {
+      return value;
+    }
+    if (value && typeof value === "object") {
+      const text = (value as { text?: unknown }).text;
+      if (typeof text === "string" && text.length > 0) {
+        return text;
+      }
+    }
+  }
+  return "";
+}
+
+function toChatRole(role: unknown): string {
+  switch (typeof role === "string" ? role.toLowerCase() : "") {
+    case "developer":
+    case "system":
+      return "system";
+    case "assistant":
+      return "assistant";
+    case "tool":
+      return "tool";
+    case "user":
+      return "user";
+    default:
+      return "user";
+  }
+}
+
 function toChatMessages(body: ResponsesRequestBody): Array<Record<string, unknown>> {
   const messages: Array<Record<string, unknown>> = [];
+  const pushMessage = (message: Record<string, unknown>): void => {
+    const last = messages[messages.length - 1];
+    if (
+      last &&
+      last.role === "system" &&
+      message.role === "system" &&
+      typeof last.content === "string" &&
+      typeof message.content === "string"
+    ) {
+      last.content = `${last.content}\n\n${message.content}`.trim();
+      return;
+    }
+    messages.push(message);
+  };
+
   if (body.instructions) {
-    messages.push({ role: "system", content: body.instructions });
+    pushMessage({ role: "system", content: body.instructions });
   }
 
   const input = Array.isArray(body.input)
@@ -93,16 +141,29 @@ function toChatMessages(body: ResponsesRequestBody): Array<Record<string, unknow
         ]
       : [];
 
+  let pendingReasoning = "";
+  let toolCallMessage: Record<string, unknown> | null = null;
+
   for (const rawItem of input) {
     if (!rawItem || typeof rawItem !== "object") continue;
     const item = rawItem as Record<string, unknown>;
     const type = String(item.type ?? "message");
 
     if (type === "message") {
-      messages.push({
-        role: String(item.role ?? "user"),
-        content: extractText(item.content),
-      });
+      toolCallMessage = null;
+      const role = toChatRole(item.role);
+      const content = extractText(item.content);
+      if (role === "tool") {
+        pushMessage({
+          role,
+          tool_call_id: String(item.tool_call_id ?? ""),
+          content,
+        });
+        continue;
+      }
+      if (!content.trim()) continue;
+      pendingReasoning = "";
+      pushMessage({ role, content });
       continue;
     }
     if (type === "function_call") {
@@ -110,37 +171,51 @@ function toChatMessages(body: ResponsesRequestBody): Array<Record<string, unknow
         typeof item.namespace === "string" && item.namespace
           ? `${item.namespace}__`
           : "";
-      messages.push({
-        role: "assistant",
-        content: null,
-        tool_calls: [
-          {
-            id: String(item.call_id ?? item.id ?? `call_${messages.length}`),
-            type: "function",
-            function: {
-              name: `${namespace}${String(item.name ?? "")}`,
-              arguments:
-                typeof item.arguments === "string"
-                  ? item.arguments
-                  : JSON.stringify(item.arguments ?? {}),
-            },
-          },
-        ],
-      });
+      const callArguments =
+        typeof item.arguments === "string" && item.arguments.trim()
+          ? item.arguments
+          : JSON.stringify(item.arguments ?? {});
+      const call = {
+        id: String(item.call_id ?? item.id ?? `call_${messages.length}`),
+        type: "function",
+        function: {
+          name: `${namespace}${String(item.name ?? "")}`,
+          arguments: callArguments,
+        },
+      };
+      if (toolCallMessage) {
+        (toolCallMessage.tool_calls as unknown[]).push(call);
+      } else {
+        toolCallMessage = {
+          role: "assistant",
+          content: null,
+          ...(pendingReasoning ? { reasoning_content: pendingReasoning } : {}),
+          tool_calls: [call],
+        };
+        pendingReasoning = "";
+        pushMessage(toolCallMessage);
+      }
       continue;
     }
     if (type === "function_call_output") {
-      messages.push({
+      toolCallMessage = null;
+      pendingReasoning = "";
+      const callId = String(item.call_id ?? "");
+      if (!callId) continue;
+      pushMessage({
         role: "tool",
-        tool_call_id: String(item.call_id ?? ""),
+        tool_call_id: callId,
         content: extractText(item.output),
       });
       continue;
     }
     if (type === "reasoning") {
+      toolCallMessage = null;
       const text = extractText(item.summary ?? item.content);
-      if (text) {
-        messages.push({ role: "assistant", content: text });
+      if (text.trim()) {
+        pendingReasoning = pendingReasoning
+          ? `${pendingReasoning}\n\n${text}`
+          : text;
       }
     }
   }
@@ -314,6 +389,9 @@ async function handleResponses(
   const toolCalls = new Map<number, ToolCallState>();
   let messageItem: OutputItem | null = null;
   let messageIndex = -1;
+  let reasoningItem: OutputItem | null = null;
+  let reasoningIndex = -1;
+  let reasoningText = "";
   let finishReason: string | undefined;
   let usage: Record<string, unknown> | null = null;
 
@@ -358,6 +436,36 @@ async function handleResponses(
     const choice = (payload.choices as Array<Record<string, unknown>>)?.[0];
     if (!choice) continue;
     const delta = (choice.delta ?? {}) as Record<string, unknown>;
+
+    const reasoning = extractReasoning(delta);
+    if (reasoning) {
+      if (!reasoningItem) {
+        reasoningItem = {
+          id: `rs_${Date.now().toString(36)}`,
+          type: "reasoning",
+          summary: [],
+        };
+        reasoningIndex = output.length;
+        output.push(reasoningItem);
+        send("response.output_item.added", {
+          output_index: reasoningIndex,
+          item: reasoningItem,
+        });
+        send("response.reasoning_summary_part.added", {
+          item_id: reasoningItem.id,
+          output_index: reasoningIndex,
+          summary_index: 0,
+          part: { type: "summary_text", text: "" },
+        });
+      }
+      reasoningText += reasoning;
+      send("response.reasoning_summary_text.delta", {
+        item_id: reasoningItem.id,
+        output_index: reasoningIndex,
+        summary_index: 0,
+        delta: reasoning,
+      });
+    }
 
     if (typeof delta.content === "string" && delta.content.length > 0) {
       if (!messageItem) {
@@ -441,6 +549,26 @@ async function handleResponses(
     if (typeof choice.finish_reason === "string") {
       finishReason = choice.finish_reason;
     }
+  }
+
+  if (reasoningItem) {
+    reasoningItem.summary = [{ type: "summary_text", text: reasoningText }];
+    send("response.reasoning_summary_text.done", {
+      item_id: reasoningItem.id,
+      output_index: reasoningIndex,
+      summary_index: 0,
+      text: reasoningText,
+    });
+    send("response.reasoning_summary_part.done", {
+      item_id: reasoningItem.id,
+      output_index: reasoningIndex,
+      summary_index: 0,
+      part: { type: "summary_text", text: reasoningText },
+    });
+    send("response.output_item.done", {
+      output_index: reasoningIndex,
+      item: reasoningItem,
+    });
   }
 
   if (messageItem) {
