@@ -10,6 +10,7 @@ import type {
   ToolCallRecord,
 } from "@openbot/protocol";
 import { Settings } from "./Settings";
+import { VncView, type VncState } from "./components/VncView";
 import { DAEMON_HTTP_URL } from "./lib/daemon";
 import { useTheme } from "./lib/useTheme";
 import {
@@ -42,6 +43,19 @@ function isLocalBot(bot: Bot | null | undefined): boolean {
 
 function computerLabel(bot: Bot | null, state: SandboxState): string {
   return isLocalBot(bot) ? "This Mac" : COMPUTER_LABEL[state];
+}
+
+const SCREEN_PANEL_KEY = "openbot.screenPanel";
+const SCREEN_POLL_MS = 1500;
+
+type ScreenStatus = "loading" | "live" | "vm-off" | "error";
+
+function storedScreenPanelOpen(): boolean {
+  try {
+    return localStorage.getItem(SCREEN_PANEL_KEY) !== "closed";
+  } catch {
+    return true;
+  }
 }
 
 const AVATAR_COLORS = [
@@ -133,6 +147,51 @@ function MonitorIcon() {
     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <rect x="2" y="3" width="12" height="8.5" rx="1.6" stroke="currentColor" strokeWidth="1.4" />
       <path d="M6 13.5h4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function PauseIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+      <rect x="2.6" y="2" width="2.4" height="8" rx="1" fill="currentColor" />
+      <rect x="7" y="2" width="2.4" height="8" rx="1" fill="currentColor" />
+    </svg>
+  );
+}
+
+function PlayIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+      <path d="M3.4 2.4 9.6 6l-6.2 3.6V2.4Z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function ExpandIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path
+        d="M9.5 2.8h3.7v3.7M13.2 2.8 9.1 6.9M6.5 13.2H2.8V9.5M2.8 13.2l4.1-4.1"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function CollapseIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path
+        d="M13.2 6.5H9.5V2.8M9.5 6.5l3.7-3.7M2.8 9.5h3.7v3.7M6.5 9.5 2.8 13.2"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
     </svg>
   );
 }
@@ -311,6 +370,15 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [computerMenuOpen, setComputerMenuOpen] = useState(false);
+  const [screenOpen, setScreenOpen] = useState(storedScreenPanelOpen);
+  const [screenPlaying, setScreenPlaying] = useState(true);
+  const [screenExpanded, setScreenExpanded] = useState(false);
+  const [screenImageUrl, setScreenImageUrl] = useState<string | null>(null);
+  const [screenUpdatedAt, setScreenUpdatedAt] = useState<number | null>(null);
+  const [screenStatus, setScreenStatus] = useState<ScreenStatus>("loading");
+  const [screenVmState, setScreenVmState] = useState<string | null>(null);
+  const [screenError, setScreenError] = useState<string | null>(null);
+  const [vncState, setVncState] = useState<VncState>("idle");
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   const bot =
@@ -327,10 +395,82 @@ export default function App() {
   const sandboxState: SandboxState = bot
     ? (daemon.sandboxStates[bot.id] ?? "stopped")
     : "stopped";
+  const screenMessage = (() => {
+    if (!bot) {
+      return "No agent selected";
+    }
+    if (isLocalBot(bot)) {
+      return "Screen view is available for Firecracker microVM computers.";
+    }
+    if (screenStatus === "vm-off") {
+      if (screenVmState === "booting") {
+        return "Agent's VM is starting…";
+      }
+      if (screenVmState === "error") {
+        return "Agent's VM failed to start";
+      }
+      return "Agent's VM is not running";
+    }
+    if (screenStatus === "error" && screenError) {
+      return screenError;
+    }
+    return "No screen yet";
+  })();
+  const vncUrl = bot
+    ? `${DAEMON_HTTP_URL.replace(/^http/, "ws")}/bots/${encodeURIComponent(bot.id)}/vnc`
+    : "";
+  const canStream = Boolean(bot) && !isLocalBot(bot) && screenStatus !== "vm-off";
+  const vncLive = vncState === "live";
+  const vncActive = canStream && screenPlaying && screenOpen;
+  const screenCaption = (() => {
+    if (!bot) {
+      return "No agent selected";
+    }
+    if (isLocalBot(bot)) {
+      return "Screen view is available for Firecracker microVM computers.";
+    }
+    if (!screenPlaying) {
+      return "Paused";
+    }
+    if (vncLive) {
+      return "Live desktop";
+    }
+    if (vncState === "connecting") {
+      return "Connecting to desktop…";
+    }
+    if (vncState === "down" && screenStatus !== "vm-off") {
+      return "Desktop stream unavailable — retrying";
+    }
+    if (screenStatus === "live" && screenUpdatedAt) {
+      return `Updated ${new Date(screenUpdatedAt).toLocaleTimeString()}`;
+    }
+    return screenMessage;
+  })();
 
   useEffect(() => {
     setComputerMenuOpen(false);
   }, [daemon.selectedBotId]);
+
+  useEffect(() => {
+    if (!screenExpanded) {
+      return;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        setScreenExpanded(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [screenExpanded]);
+
+  useEffect(() => {
+    if (!screenOpen && screenExpanded) {
+      setScreenExpanded(false);
+    }
+  }, [screenOpen, screenExpanded]);
 
   const activeThreadId = daemon.activeThreadId;
   const activity = useMemo(
@@ -366,22 +506,91 @@ export default function App() {
       )
     : daemon.bots;
 
-  const screenArtifact = useMemo(() => {
-    let found: ToolArtifact | null = null;
-    for (const message of daemon.messages) {
-      for (const call of message.toolCalls ?? []) {
-        for (const artifact of call.artifacts ?? []) {
-          found = artifact;
+  useEffect(() => {
+    setScreenImageUrl(null);
+    setScreenUpdatedAt(null);
+    setScreenVmState(null);
+    setScreenError(null);
+    setScreenStatus("loading");
+    setVncState("idle");
+  }, [bot?.id]);
+
+  useEffect(() => {
+    return () => {
+      if (screenImageUrl) {
+        URL.revokeObjectURL(screenImageUrl);
+      }
+    };
+  }, [screenImageUrl]);
+
+  useEffect(() => {
+    if (
+      !screenOpen ||
+      !screenPlaying ||
+      !bot ||
+      bot.computer === "mac" ||
+      vncLive
+    ) {
+      return;
+    }
+    let cancelled = false;
+    let inFlight = false;
+    const controller = new AbortController();
+
+    const load = async () => {
+      if (inFlight || document.hidden) {
+        return;
+      }
+      inFlight = true;
+      try {
+        const response = await fetch(
+          `${DAEMON_HTTP_URL}/bots/${encodeURIComponent(bot.id)}/screen?t=${Date.now()}`,
+          { signal: controller.signal },
+        );
+        if (cancelled) {
+          return;
         }
+        if (response.ok) {
+          const blob = await response.blob();
+          const capturedAt = response.headers.get("x-screen-captured-at");
+          if (cancelled) {
+            return;
+          }
+          setScreenImageUrl(URL.createObjectURL(blob));
+          setScreenUpdatedAt(capturedAt ? Date.parse(capturedAt) : Date.now());
+          setScreenVmState("running");
+          setScreenError(null);
+          setScreenStatus("live");
+        } else {
+          const body = (await response.json().catch(() => null)) as {
+            error?: string;
+            state?: string;
+          } | null;
+          if (cancelled) {
+            return;
+          }
+          setScreenVmState(body?.state ?? null);
+          setScreenError(body?.error ?? `screen request failed (${response.status})`);
+          setScreenStatus(response.status === 409 ? "vm-off" : "error");
+        }
+      } catch (error) {
+        if (!cancelled && (error as Error).name !== "AbortError") {
+          setScreenError((error as Error).message);
+          setScreenStatus("error");
+        }
+      } finally {
+        inFlight = false;
       }
-    }
-    for (const item of activity) {
-      for (const artifact of item.artifacts ?? []) {
-        found = artifact;
-      }
-    }
-    return found;
-  }, [daemon.messages, activity]);
+    };
+
+    void load();
+    const timer = setInterval(() => void load(), SCREEN_POLL_MS);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      clearInterval(timer);
+    };
+  }, [screenOpen, screenPlaying, bot, vncLive]);
 
   useEffect(() => {
     const node = scrollRef.current;
@@ -530,6 +739,26 @@ export default function App() {
             {bot?.role && <span className="chat-title-role">{bot.role}</span>}
           </div>
           <div className="chat-actions">
+            <button
+              className="icon-button"
+              title={screenOpen ? "Hide screen panel" : "Show screen panel"}
+              aria-label="Toggle screen panel"
+              aria-pressed={screenOpen}
+              onClick={() => {
+                setScreenOpen((value) => {
+                  const next = !value;
+                  try {
+                    localStorage.setItem(
+                      SCREEN_PANEL_KEY,
+                      next ? "open" : "closed",
+                    );
+                  } catch {}
+                  return next;
+                });
+              }}
+            >
+              <MonitorIcon />
+            </button>
             <button
               className="icon-button icon-muted"
               title="Share — coming soon"
@@ -745,37 +974,89 @@ export default function App() {
         </footer>
       </main>
 
-      <aside className="screen-panel">
-        <section className="screen-view">
-          <div className="screen-frame">
-            {screenArtifact ? (
-              <img
-                className="screen-image"
-                src={`${DAEMON_HTTP_URL}${screenArtifact.url}`}
-                alt={`${botName}'s screen`}
-              />
-            ) : (
-              <div className="screen-empty">
-                <MonitorIcon />
-                <span>No screen activity yet</span>
-              </div>
-            )}
-          </div>
-          <div className="screen-caption">{botName}&rsquo;s screen</div>
-        </section>
-        <section className="routines">
-          <h2>
-            Routines
-            <span className="badge">Soon</span>
-          </h2>
-          <div className="routines-empty">
-            <p className="routines-title">Not implemented yet</p>
-            <p className="routines-sub">
-              Scheduled and replayable routines are planned, not wired up.
-            </p>
-          </div>
-        </section>
-      </aside>
+      {screenOpen && (
+        <aside className="screen-panel">
+          <section className="screen-view">
+            <div
+              className={`screen-frame ${
+                screenExpanded ? "screen-frame-expanded" : ""
+              }`}
+            >
+              {canStream && (
+                <VncView url={vncUrl} active={vncActive} onState={setVncState} />
+              )}
+              {!vncLive && (
+                <div className="screen-fallback">
+                  {!isLocalBot(bot) &&
+                  screenStatus !== "vm-off" &&
+                  screenImageUrl ? (
+                    <img
+                      className="screen-image"
+                      src={screenImageUrl}
+                      alt={`${botName}'s screen`}
+                    />
+                  ) : (
+                    <div className="screen-empty">
+                      <MonitorIcon />
+                      <span>
+                        {vncState === "down" && screenStatus !== "vm-off"
+                          ? "Desktop stream unavailable — retrying"
+                          : screenMessage}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
+              {canStream && (
+                <div className="screen-frame-actions">
+                  <button
+                    className="screen-action"
+                    title={screenExpanded ? "Collapse (Esc)" : "Expand"}
+                    aria-label={
+                      screenExpanded
+                        ? "Collapse desktop view"
+                        : "Expand desktop view"
+                    }
+                    onClick={() => setScreenExpanded((value) => !value)}
+                  >
+                    {screenExpanded ? <CollapseIcon /> : <ExpandIcon />}
+                  </button>
+                </div>
+              )}
+            </div>
+            <div className="screen-caption">
+              <span className="screen-caption-title">
+                {botName}&rsquo;s screen
+              </span>
+              <span className="screen-caption-status">{screenCaption}</span>
+              {!isLocalBot(bot) && (
+                <button
+                  className="icon-button"
+                  title={screenPlaying ? "Pause live view" : "Resume live view"}
+                  aria-label={
+                    screenPlaying ? "Pause live view" : "Resume live view"
+                  }
+                  onClick={() => setScreenPlaying((value) => !value)}
+                >
+                  {screenPlaying ? <PauseIcon /> : <PlayIcon />}
+                </button>
+              )}
+            </div>
+          </section>
+          <section className="routines">
+            <h2>
+              Routines
+              <span className="badge">Soon</span>
+            </h2>
+            <div className="routines-empty">
+              <p className="routines-title">Not implemented yet</p>
+              <p className="routines-sub">
+                Scheduled and replayable routines are planned, not wired up.
+              </p>
+            </div>
+          </section>
+        </aside>
+      )}
 
       {daemon.error && (
         <div className="toast" role="alert">

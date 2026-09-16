@@ -12,9 +12,15 @@ const CDP_URL = `http://127.0.0.1:${CDP_PORT}`;
 const USER_DATA_DIR = "/root/.openbot-chrome";
 const MAX_TEXT = 8000;
 const LOCK_DIR = "/tmp/openbot-chrome.lock";
-const START_DEADLINE_MS = 120_000;
+const CHROME_LOG = "/tmp/openbot-chrome.log";
+const LOCK_DEADLINE_MS = 120_000;
+const DISPLAY_DEADLINE_MS = 120_000;
+const CHROME_START_DEADLINE_MS = 300_000;
+const CDP_PROBE_TIMEOUT_MS = 3_000;
 const PAGE_TIMEOUT_MS = 60_000;
 
+const DISPLAY = ":99";
+const DISPLAY_SOCKET = "/tmp/.X11-unix/X99";
 const MODE = process.argv[2] === "serve" ? "serve" : "action";
 
 function log(message) {
@@ -28,8 +34,11 @@ function sleep(ms) {
 function findChromeBinary() {
   try {
     for (const entry of fs.readdirSync(BROWSERS_ROOT)) {
-      if (entry.startsWith("chromium_headless_shell-")) {
-        const candidate = `${BROWSERS_ROOT}/${entry}/chrome-headless-shell-linux-arm64/chrome-headless-shell`;
+      if (!entry.startsWith("chromium-")) {
+        continue;
+      }
+      for (const platform of ["chrome-linux-arm64", "chrome-linux"]) {
+        const candidate = `${BROWSERS_ROOT}/${entry}/${platform}/chrome`;
         if (fs.existsSync(candidate)) {
           return candidate;
         }
@@ -43,11 +52,22 @@ function findChromeBinary() {
   return chromium.executablePath();
 }
 
+async function waitForDisplay() {
+  const deadline = Date.now() + DISPLAY_DEADLINE_MS;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(DISPLAY_SOCKET)) {
+      return;
+    }
+    await sleep(200);
+  }
+  throw new Error("X display did not become ready");
+}
+
 function cdpAlive() {
   return new Promise((resolve) => {
     const request = http.get(
       `${CDP_URL}/json/version`,
-      { timeout: 1000 },
+      { timeout: CDP_PROBE_TIMEOUT_MS },
       (response) => {
         response.resume();
         resolve(response.statusCode === 200);
@@ -62,7 +82,7 @@ function cdpAlive() {
 }
 
 async function withLock(fn) {
-  const deadline = Date.now() + START_DEADLINE_MS;
+  const deadline = Date.now() + LOCK_DEADLINE_MS;
   while (true) {
     try {
       fs.mkdirSync(LOCK_DIR);
@@ -70,7 +90,7 @@ async function withLock(fn) {
     } catch {
       try {
         const age = Date.now() - fs.statSync(LOCK_DIR).mtimeMs;
-        if (age > START_DEADLINE_MS) {
+        if (age > LOCK_DEADLINE_MS) {
           fs.rmSync(LOCK_DIR, { recursive: true, force: true });
           continue;
         }
@@ -100,6 +120,42 @@ function killStaleChrome() {
   }
 }
 
+function spawnChrome() {
+  const binary = findChromeBinary();
+  const logFd = fs.openSync(CHROME_LOG, "a");
+  const child = spawn(
+    binary,
+    [
+      `--remote-debugging-port=${CDP_PORT}`,
+      `--user-data-dir=${USER_DATA_DIR}`,
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-background-networking",
+      "--disable-component-update",
+      "--disable-sync",
+      "--disable-default-apps",
+      "--disable-backgrounding-occluded-windows",
+      "--password-store=basic",
+      "--use-mock-keychain",
+      "--window-position=0,0",
+      "--window-size=1280,800",
+      "--start-maximized",
+      "about:blank",
+    ],
+    {
+      detached: true,
+      stdio: ["ignore", logFd, logFd],
+      env: { ...process.env, DISPLAY },
+    },
+  );
+  fs.closeSync(logFd);
+  child.unref();
+  return child;
+}
+
 async function ensureChrome() {
   if (await cdpAlive()) {
     return;
@@ -110,28 +166,29 @@ async function ensureChrome() {
     }
     killStaleChrome();
     await sleep(500);
-    const binary = findChromeBinary();
-    const child = spawn(
-      binary,
-      [
-        `--remote-debugging-port=${CDP_PORT}`,
-        `--user-data-dir=${USER_DATA_DIR}`,
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--no-first-run",
-        "--disable-background-networking",
-        "--window-size=1280,800",
-      ],
-      { detached: true, stdio: "ignore" },
-    );
-    child.unref();
-
-    const deadline = Date.now() + START_DEADLINE_MS;
+    await waitForDisplay();
+    const deadline = Date.now() + CHROME_START_DEADLINE_MS;
     while (Date.now() < deadline) {
-      if (await cdpAlive()) {
-        return;
+      const child = spawnChrome();
+      let exited = false;
+      child.on("exit", () => {
+        exited = true;
+      });
+      while (Date.now() < deadline) {
+        if (await cdpAlive()) {
+          return;
+        }
+        if (exited) {
+          break;
+        }
+        await sleep(1000);
       }
-      await sleep(500);
+      if (Date.now() >= deadline) {
+        break;
+      }
+      log("chrome exited during startup; restarting it");
+      killStaleChrome();
+      await sleep(1000);
     }
     throw new Error("chromium did not start");
   });
@@ -205,9 +262,29 @@ async function serve() {
   } catch {
     // ignore
   }
-  await ensureChrome();
-  let session = await connect();
-  log("ready");
+
+  let session = null;
+  let opening = null;
+
+  const openSession = async () => {
+    await ensureChrome();
+    const opened = await connect();
+    session = opened;
+    log("ready");
+    return opened;
+  };
+
+  const getSession = async () => {
+    if (session) {
+      return session;
+    }
+    if (!opening) {
+      opening = openSession().finally(() => {
+        opening = null;
+      });
+    }
+    return opening;
+  };
 
   const server = net.createServer((socket) => {
     let buffer = "";
@@ -227,17 +304,14 @@ async function serve() {
       let response;
       try {
         const action = JSON.parse(line);
-        const result = await performAction(session.page, action);
+        const current = await getSession();
+        const result = await performAction(current.page, action);
         response = { ok: true, ...result };
       } catch (error) {
         const message = error && error.message ? error.message : String(error);
         response = { ok: false, error: message };
-        if (/Target closed|Browser closed|disconnected/i.test(message)) {
-          try {
-            session = await connect();
-          } catch {
-            // next action will retry
-          }
+        if (/Target closed|Browser closed|disconnected|Protocol error/i.test(message)) {
+          session = null;
         }
       }
       busy = false;
@@ -248,9 +322,13 @@ async function serve() {
     });
   });
   server.listen(SOCKET_PATH);
+  log("listening");
+  getSession().catch((error) => {
+    log(`chrome warm-up failed: ${error && error.message ? error.message : error}`);
+  });
 }
 
-function callDaemon(payload, waitMs = 150_000) {
+function callDaemon(payload, waitMs = 30_000) {
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + waitMs;
     const attempt = () => {
@@ -259,7 +337,9 @@ function callDaemon(payload, waitMs = 150_000) {
       let connected = false;
       const timer = setTimeout(() => {
         socket.destroy();
-        reject(new Error("timeout talking to the browser daemon"));
+        const error = new Error("timeout talking to the browser daemon");
+        error.daemonReachable = connected;
+        reject(error);
       }, 200_000);
 
       socket.on("connect", () => {
@@ -283,6 +363,7 @@ function callDaemon(payload, waitMs = 150_000) {
           setTimeout(attempt, 500);
           return;
         }
+        error.daemonReachable = connected;
         reject(error);
       });
     };
@@ -311,8 +392,15 @@ async function main() {
   let response;
   try {
     response = await callDaemon(payload);
-  } catch {
-    response = await runInline(payload);
+  } catch (error) {
+    if (error && error.daemonReachable) {
+      response = {
+        ok: false,
+        error: error.message ? error.message : String(error),
+      };
+    } else {
+      response = await runInline(payload);
+    }
   }
   process.stdout.write(JSON.stringify(response) + "\n", () => {
     process.exit(response.ok ? 0 : 1);

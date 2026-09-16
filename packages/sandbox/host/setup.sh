@@ -5,6 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 AGENT_SRC="$REPO_DIR/packages/sandbox/guest/agent.py"
 BROWSER_SRC="$REPO_DIR/packages/sandbox/guest/browser.js"
+DESKTOP_SRC="$REPO_DIR/packages/sandbox/guest/desktop.sh"
+WALLPAPER_SRC="$REPO_DIR/packages/sandbox/guest/wallpaper.py"
+TINT2_SRC="$REPO_DIR/packages/sandbox/guest/tint2rc"
 
 FC_VERSION="${FC_VERSION:-v1.16.0}"
 NODE_VERSION="${NODE_VERSION:-v22.23.2}"
@@ -75,6 +78,10 @@ fi
 mount -o loop rootfs.ext4 /mnt/openbot-rootfs
 install -m 0755 "$AGENT_SRC" /mnt/openbot-rootfs/usr/local/bin/openbot-agent.py
 install -m 0755 "$BROWSER_SRC" /mnt/openbot-rootfs/usr/local/bin/openbot-browser.js
+install -m 0755 "$DESKTOP_SRC" /mnt/openbot-rootfs/usr/local/bin/openbot-desktop.sh
+install -m 0755 "$WALLPAPER_SRC" /mnt/openbot-rootfs/usr/local/bin/openbot-wallpaper.py
+install -d /mnt/openbot-rootfs/root/.config/tint2
+install -m 0644 "$TINT2_SRC" /mnt/openbot-rootfs/root/.config/tint2/tint2rc
 rm -f /mnt/openbot-rootfs/etc/resolv.conf
 printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /mnt/openbot-rootfs/etc/resolv.conf
 
@@ -97,7 +104,7 @@ if [ ! -d "$BROWSER_DIR/browsers" ]; then
   PLAYWRIGHT_BROWSERS_PATH="$BROWSER_DIR/browsers" node "$BROWSER_DIR/node_modules/playwright-core/cli.js" install chromium
 fi
 
-if [ ! -f "$BROWSER_DIR/.deps-installed" ]; then
+if [ ! -f "$BROWSER_DIR/.deps-installed-v2" ]; then
   echo "== installing chromium system deps into rootfs =="
   mkdir -p /mnt/openbot-rootfs/tmp \
     /mnt/openbot-rootfs/var/cache/apt/archives/partial \
@@ -111,9 +118,11 @@ if [ ! -f "$BROWSER_DIR/.deps-installed" ]; then
   mount -t sysfs sys /mnt/openbot-rootfs/sys
   cp /etc/resolv.conf /mnt/openbot-rootfs/etc/resolv.conf
   chroot /mnt/openbot-rootfs /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; cd /opt/openbot-browser && PLAYWRIGHT_BROWSERS_PATH=/opt/openbot-browser/browsers node node_modules/playwright-core/cli.js install-deps chromium"
-  touch "$BROWSER_DIR/.deps-installed"
+  touch "$BROWSER_DIR/.deps-installed-v2"
   umount /mnt/openbot-rootfs/sys /mnt/openbot-rootfs/proc /mnt/openbot-rootfs/dev
 fi
+
+rm -rf "$BROWSER_DIR"/browsers/chromium_headless_shell-*
 
 if [ ! -x /mnt/openbot-rootfs/usr/bin/python3 ]; then
   echo "== installing python3 into rootfs via chroot =="
@@ -131,6 +140,23 @@ if [ ! -x /mnt/openbot-rootfs/usr/bin/python3 ]; then
 fi
 
 /mnt/openbot-rootfs/usr/bin/python3 --version
+
+if [ ! -x /mnt/openbot-rootfs/usr/bin/scrot ]; then
+  echo "== installing desktop packages into rootfs =="
+  mkdir -p /mnt/openbot-rootfs/tmp \
+    /mnt/openbot-rootfs/var/cache/apt/archives/partial \
+    /mnt/openbot-rootfs/var/lib/apt/lists/partial \
+    /mnt/openbot-rootfs/var/log/apt
+  chmod 1777 /mnt/openbot-rootfs/tmp
+  mount --bind /dev /mnt/openbot-rootfs/dev
+  mount -t proc proc /mnt/openbot-rootfs/proc
+  mount -t sysfs sys /mnt/openbot-rootfs/sys
+  cp /etc/resolv.conf /mnt/openbot-rootfs/etc/resolv.conf
+  chroot /mnt/openbot-rootfs /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install -y -qq xvfb openbox tint2 xterm x11vnc feh scrot x11-xserver-utils fonts-dejavu-core xfonts-base >/dev/null"
+  umount /mnt/openbot-rootfs/sys /mnt/openbot-rootfs/proc /mnt/openbot-rootfs/dev
+fi
+
+(/mnt/openbot-rootfs/usr/bin/x11vnc -version 2>&1 | head -1) || true
 umount /mnt/openbot-rootfs
 
 echo "== sandbox host service =="

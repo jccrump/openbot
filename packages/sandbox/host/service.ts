@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { connect } from "node:net";
+import { WebSocketServer, type WebSocket } from "ws";
 
 const FC_BIN = process.env.FIRECRACKER_BIN ?? "/usr/local/bin/firecracker";
 const FC_DIR = process.env.FC_DIR ?? "/var/lib/fc";
@@ -21,6 +22,7 @@ const KERNEL = join(FC_DIR, "vmlinux");
 const VMS_DIR = join(FC_DIR, "vms");
 const PORT = Number(process.env.OPENBOT_HOST_PORT ?? 4171);
 const VSOCK_PORT = 5000;
+const VNC_VSOCK_PORT = 5900;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const BOOT_TIMEOUT_MS = 45_000;
 const NETWORK_ENABLED = process.env.OPENBOT_SANDBOX_NETWORK !== "false";
@@ -289,6 +291,97 @@ function vsockExec(
 
     socket.on("error", (error) => finish(error));
   });
+}
+
+function attachVnc(botId: string, client: WebSocket) {
+  const socket = connect(vsockSock(botId));
+  let pending = Buffer.alloc(0);
+  let handshake = false;
+  let closed = false;
+  let resumeTimer: ReturnType<typeof setInterval> | null = null;
+
+  const shutdown = () => {
+    if (closed) return;
+    closed = true;
+    if (resumeTimer) {
+      clearInterval(resumeTimer);
+      resumeTimer = null;
+    }
+    socket.destroy();
+    try {
+      client.close();
+    } catch {
+      // already closed
+    }
+  };
+
+  const pauseUntilClientDrains = () => {
+    socket.pause();
+    if (resumeTimer) return;
+    resumeTimer = setInterval(() => {
+      if (closed || client.readyState !== client.OPEN) {
+        if (resumeTimer) {
+          clearInterval(resumeTimer);
+          resumeTimer = null;
+        }
+        return;
+      }
+      if (client.bufferedAmount < 1_000_000) {
+        if (resumeTimer) {
+          clearInterval(resumeTimer);
+          resumeTimer = null;
+        }
+        socket.resume();
+      }
+    }, 25);
+  };
+
+  socket.on("connect", () => {
+    socket.write(`CONNECT ${VNC_VSOCK_PORT}\n`);
+  });
+
+  socket.on("data", (chunk: Buffer) => {
+    if (closed) return;
+    if (!handshake) {
+      pending = Buffer.concat([pending, chunk]);
+      const newline = pending.indexOf(0x0a);
+      if (newline === -1) return;
+      const line = pending.subarray(0, newline).toString("utf8");
+      pending = pending.subarray(newline + 1);
+      if (!line.startsWith("OK")) {
+        log(`vnc ${botId}: vsock handshake failed: ${line.slice(0, 120)}`);
+        shutdown();
+        return;
+      }
+      handshake = true;
+      log(`vnc ${botId}: stream open`);
+      if (pending.length === 0) return;
+      const rest = pending;
+      pending = Buffer.alloc(0);
+      client.send(rest, { binary: true });
+      if (client.bufferedAmount > 1_000_000) pauseUntilClientDrains();
+      return;
+    }
+    client.send(chunk, { binary: true });
+    if (client.bufferedAmount > 1_000_000) pauseUntilClientDrains();
+  });
+
+  socket.on("drain", () => {
+    if (!closed) client.resume();
+  });
+  socket.on("error", () => shutdown());
+  socket.on("close", () => {
+    log(`vnc ${botId}: stream closed`);
+    shutdown();
+  });
+
+  client.on("message", (data, isBinary) => {
+    if (closed || !handshake) return;
+    const payload = isBinary ? (data as Buffer) : Buffer.from(String(data));
+    if (!socket.write(payload)) client.pause();
+  });
+  client.on("close", () => shutdown());
+  client.on("error", () => shutdown());
 }
 
 async function ensureVm(botId: string): Promise<VmRecord> {
@@ -569,6 +662,29 @@ const server = createServer(async (request, response) => {
     log(`request failed: ${(error as Error).message}`);
     sendJson(response, 500, { error: (error as Error).message });
   }
+});
+
+const vncWss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (request, socket, head) => {
+  const url = new URL(request.url ?? "/", "http://localhost");
+  const match = /^\/vms\/([^/]+)\/vnc$/.exec(url.pathname);
+  if (!match) {
+    socket.destroy();
+    return;
+  }
+  const botId = decodeURIComponent(match[1] ?? "");
+  const record = vms.get(botId);
+  if (!record || record.state !== "running") {
+    socket.write(
+      "HTTP/1.1 409 Conflict\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+    );
+    socket.destroy();
+    return;
+  }
+  vncWss.handleUpgrade(request, socket, head, (client) => {
+    attachVnc(botId, client);
+  });
 });
 
 function cleanup() {

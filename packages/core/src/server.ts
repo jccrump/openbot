@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
-import { WebSocketServer, type WebSocket } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import { fetchModels, type ProviderPreset } from "@openbot/gateway";
 import {
   ClientMessageSchema,
@@ -27,6 +27,39 @@ import {
 } from "./harness";
 import type { ProviderRegistry } from "./provider-registry";
 import { systemPromptForBot, type Store } from "./store";
+import { captureScreen } from "./tools";
+
+const SCREEN_CACHE_MS = 1000;
+
+const SCREEN_ALLOWED_ORIGINS = new Set([
+  "http://localhost:1420",
+  "http://127.0.0.1:1420",
+  "tauri://localhost",
+  "http://tauri.localhost",
+  "https://tauri.localhost",
+]);
+
+class ScreenError extends Error {
+  status: number;
+  state: string | null;
+
+  constructor(message: string, status: number, state: string | null = null) {
+    super(message);
+    this.status = status;
+    this.state = state;
+  }
+}
+
+function screenCorsHeaders(origin: string | undefined): Record<string, string> {
+  if (!origin || !SCREEN_ALLOWED_ORIGINS.has(origin)) {
+    return {};
+  }
+  return {
+    "access-control-allow-origin": origin,
+    "access-control-expose-headers": "x-screen-captured-at",
+    vary: "origin",
+  };
+}
 
 export interface DaemonOptions {
   config: OpenBotConfig;
@@ -50,6 +83,44 @@ export function createDaemon(options: DaemonOptions): Daemon {
   const pending = new Set<Promise<void>>();
 
   const artifactsDir = join(options.config.dataDir, "artifacts");
+
+  interface ScreenFrame {
+    png: Buffer;
+    capturedAt: string;
+  }
+
+  const screenCache = new Map<string, ScreenFrame>();
+  const screenInFlight = new Map<string, Promise<ScreenFrame>>();
+
+  const screenFrame = async (botId: string): Promise<ScreenFrame> => {
+    const cached = screenCache.get(botId);
+    if (cached && Date.now() - Date.parse(cached.capturedAt) < SCREEN_CACHE_MS) {
+      return cached;
+    }
+    const inFlight = screenInFlight.get(botId);
+    if (inFlight) {
+      return inFlight;
+    }
+    const sandbox = options.sandbox;
+    if (!sandbox) {
+      throw new ScreenError("sandbox is not available", 503);
+    }
+    const status = await sandbox.status(botId);
+    if (status.state !== "running") {
+      throw new ScreenError("agent's VM is not running", 409, status.state);
+    }
+    const task = captureScreen(sandbox, botId)
+      .then((png) => {
+        const frame = { png, capturedAt: new Date().toISOString() };
+        screenCache.set(botId, frame);
+        return frame;
+      })
+      .finally(() => {
+        screenInFlight.delete(botId);
+      });
+    screenInFlight.set(botId, task);
+    return task;
+  };
 
   const readCompactionSettings = (): CompactionSettings => {
     const stored = options.store.getSetting(COMPACTION_SETTING_KEY);
@@ -171,11 +242,55 @@ export function createDaemon(options: DaemonOptions): Daemon {
   const sandboxTimer = setInterval(checkSandbox, 30_000);
   sandboxTimer.unref();
 
-  const httpServer = createServer((request, response) => {
+  const httpServer = createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://localhost");
     if (url.pathname === "/health") {
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ ok: true, name: "openbotd" }));
+      return;
+    }
+    const screenMatch = /^\/bots\/([^/]+)\/screen$/.exec(url.pathname);
+    if (request.method === "GET" && screenMatch) {
+      const cors = screenCorsHeaders(request.headers.origin);
+      const botId = decodeURIComponent(screenMatch[1] ?? "");
+      const sendError = (status: number, payload: Record<string, unknown>) => {
+        const body = JSON.stringify(payload);
+        response.writeHead(status, {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+          ...cors,
+        });
+        response.end(body);
+      };
+      const bot = options.store.getBot(botId);
+      if (!bot) {
+        sendError(404, { error: `unknown bot: ${botId}` });
+        return;
+      }
+      if (bot.computer === "mac") {
+        sendError(409, {
+          error: "screen capture is only available for microVM computers",
+          code: "mac",
+        });
+        return;
+      }
+      try {
+        const frame = await screenFrame(botId);
+        response.writeHead(200, {
+          "content-type": "image/png",
+          "content-length": frame.png.length,
+          "cache-control": "no-store",
+          "x-screen-captured-at": frame.capturedAt,
+          ...cors,
+        });
+        response.end(frame.png);
+      } catch (error) {
+        const screenError = error instanceof ScreenError ? error : null;
+        sendError(screenError?.status ?? 502, {
+          error: (error as Error).message,
+          ...(screenError?.state ? { state: screenError.state } : {}),
+        });
+      }
       return;
     }
     if (
@@ -205,7 +320,113 @@ export function createDaemon(options: DaemonOptions): Daemon {
     response.end();
   });
 
-  const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  const wss = new WebSocketServer({ noServer: true });
+  const vncWss = new WebSocketServer({ noServer: true });
+
+  const proxyVnc = (botId: string, client: WebSocket) => {
+    const base = options.config.sandboxUrl
+      .replace(/\/+$/, "")
+      .replace(/^http/, "ws");
+    const upstream = new WebSocket(
+      `${base}/vms/${encodeURIComponent(botId)}/vnc`,
+    );
+    let closed = false;
+    let drainTimer: ReturnType<typeof setInterval> | null = null;
+
+    const shutdown = (code?: number, reason?: string) => {
+      if (closed) return;
+      closed = true;
+      if (drainTimer) {
+        clearInterval(drainTimer);
+        drainTimer = null;
+      }
+      try {
+        upstream.close();
+      } catch {
+        // already closed
+      }
+      try {
+        client.close(code, reason);
+      } catch {
+        // already closed
+      }
+    };
+
+    const relay = (from: WebSocket, to: WebSocket) => {
+      from.on("message", (data, isBinary) => {
+        if (to.readyState !== to.OPEN) return;
+        to.send(data, { binary: isBinary });
+        if (to.bufferedAmount > 1_000_000) from.pause();
+      });
+    };
+
+    upstream.on("open", () => {
+      relay(upstream, client);
+      relay(client, upstream);
+      drainTimer = setInterval(() => {
+        if (closed) return;
+        if (
+          client.isPaused &&
+          upstream.readyState === upstream.OPEN &&
+          upstream.bufferedAmount < 1_000_000
+        ) {
+          client.resume();
+        }
+        if (
+          upstream.isPaused &&
+          client.readyState === client.OPEN &&
+          client.bufferedAmount < 1_000_000
+        ) {
+          upstream.resume();
+        }
+      }, 25);
+    });
+    upstream.on("unexpected-response", (_request, response) => {
+      shutdown(1013, `sandbox host rejected vnc (${response.statusCode})`);
+    });
+    upstream.on("error", () => shutdown(1013, "sandbox host unreachable"));
+    upstream.on("close", () => shutdown(1011, "sandbox stream closed"));
+    client.on("close", () => shutdown());
+    client.on("error", () => shutdown());
+  };
+
+  httpServer.on("upgrade", (request, socket, head) => {
+    const url = new URL(request.url ?? "/", "http://localhost");
+    if (url.pathname === "/ws") {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        wss.emit("connection", client, request);
+      });
+      return;
+    }
+    const vncMatch = /^\/bots\/([^/]+)\/vnc$/.exec(url.pathname);
+    if (!vncMatch) {
+      socket.destroy();
+      return;
+    }
+    const reject = (status: number, message: string) => {
+      socket.write(
+        `HTTP/1.1 ${status} ${message}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n`,
+      );
+      socket.destroy();
+    };
+    const botId = decodeURIComponent(vncMatch[1] ?? "");
+    const bot = options.store.getBot(botId);
+    if (!bot) {
+      reject(404, "Not Found");
+      return;
+    }
+    if (bot.computer === "mac") {
+      reject(409, "Conflict");
+      return;
+    }
+    if (!sandboxAvailable || !options.sandbox) {
+      reject(503, "Service Unavailable");
+      return;
+    }
+    vncWss.handleUpgrade(request, socket, head, (client) => {
+      proxyVnc(botId, client);
+    });
+  });
 
   wss.on("connection", (socket: WebSocket) => {
     const send = (message: ServerMessage) => {

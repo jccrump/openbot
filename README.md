@@ -229,7 +229,9 @@ Be honest with yourself about the following before filing issues:
 10. **Mobile thin client** over Tailscale or a Cloudflare Tunnel.
 
 The detailed design, protocol, data model, and decision log live in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Research notes on how production
+computer-use agents work — vision versus text versus hybrid, and what makes them
+fast — live in [docs/research/computer-use.md](docs/research/computer-use.md).
 
 ## Development
 
@@ -249,6 +251,7 @@ Layout:
 - `packages/mcp` — MCP server exposing the computer's tools to Codex
 - `packages/responses-bridge` — Responses API to Chat Completions bridge
 - `packages/protocol` — shared Zod schemas for the daemon/UI protocol
+- `docs/research` — background research on production computer-use agents
 
 ## Security
 

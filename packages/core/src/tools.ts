@@ -3,7 +3,11 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ToolDefinition } from "@openbot/gateway";
 import type { ComputerKind, ToolArtifact } from "@openbot/protocol";
-import type { SandboxBackend, SandboxState } from "@openbot/sandbox";
+import type {
+  ExecResult,
+  SandboxBackend,
+  SandboxState,
+} from "@openbot/sandbox";
 import {
   ensureWorkspace,
   execLocal,
@@ -265,6 +269,65 @@ interface BrowserResult {
   screenshot?: string;
 }
 
+interface BrowserActionOutcome {
+  parsed: BrowserResult | null;
+  result: ExecResult;
+  durationMs: number;
+}
+
+const SCREEN_CAPTURE_TIMEOUT_MS = 30_000;
+
+async function runBrowserAction(
+  sandbox: SandboxBackend,
+  botId: string,
+  payload: Record<string, unknown>,
+  timeoutMs: number,
+): Promise<BrowserActionOutcome> {
+  const startedAt = Date.now();
+  const result = await sandbox.exec(botId, {
+    command: `/usr/local/bin/node /usr/local/bin/openbot-browser.js action ${shellQuote(JSON.stringify(payload))}`,
+    cwd: "/root",
+    timeoutMs,
+  });
+  let parsed: BrowserResult | null = null;
+  try {
+    parsed = JSON.parse(result.stdout.trim()) as BrowserResult;
+  } catch {
+    parsed = null;
+  }
+  return { parsed, result, durationMs: Date.now() - startedAt };
+}
+
+export async function captureScreen(
+  sandbox: SandboxBackend,
+  botId: string,
+): Promise<Buffer> {
+  let outcome = await runBrowserAction(
+    sandbox,
+    botId,
+    { action: "screenshot" },
+    SCREEN_CAPTURE_TIMEOUT_MS,
+  );
+  if (!outcome.parsed?.screenshot) {
+    await runBrowserAction(
+      sandbox,
+      botId,
+      { action: "goto", url: "about:blank" },
+      SCREEN_CAPTURE_TIMEOUT_MS,
+    );
+    outcome = await runBrowserAction(
+      sandbox,
+      botId,
+      { action: "screenshot" },
+      SCREEN_CAPTURE_TIMEOUT_MS,
+    );
+  }
+  if (!outcome.parsed?.screenshot) {
+    throw new Error(outcome.parsed?.error ?? "screen capture failed");
+  }
+  return Buffer.from(outcome.parsed.screenshot, "base64");
+}
+
 const browserTool: Tool = {
   definition: {
     name: "browser",
@@ -319,29 +382,19 @@ const browserTool: Tool = {
     }
     await ensureSandbox(context, sandbox);
 
-    const payload = JSON.stringify({
-      action,
-      url: args.url,
-      selector: args.selector,
-      text: args.text,
-      submit: args.submit,
-      milliseconds: args.milliseconds,
-    });
-
-    const startedAt = Date.now();
-    const result = await sandbox.exec(context.botId, {
-      command: `/usr/local/bin/node /usr/local/bin/openbot-browser.js action ${shellQuote(payload)}`,
-      cwd: "/root",
-      timeoutMs: 240_000,
-    });
-    const durationMs = Date.now() - startedAt;
-
-    let parsed: BrowserResult | null = null;
-    try {
-      parsed = JSON.parse(result.stdout.trim()) as BrowserResult;
-    } catch {
-      parsed = null;
-    }
+    const { parsed, result, durationMs } = await runBrowserAction(
+      sandbox,
+      context.botId,
+      {
+        action,
+        url: args.url,
+        selector: args.selector,
+        text: args.text,
+        submit: args.submit,
+        milliseconds: args.milliseconds,
+      },
+      240_000,
+    );
 
     if (!parsed) {
       return {

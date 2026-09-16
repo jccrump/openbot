@@ -109,6 +109,11 @@ const mockModelServer = createServer(async (request, response) => {
   finish();
 });
 
+const SCREEN_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+  "base64",
+);
+
 const executedCommands = [];
 const mockSandboxServer = createServer(async (request, response) => {
   const url = request.url ?? "";
@@ -136,6 +141,28 @@ const mockSandboxServer = createServer(async (request, response) => {
   }
 
   if (url.endsWith("/exec")) {
+    if (
+      typeof body.command === "string" &&
+      body.command.includes("openbot-browser.js")
+    ) {
+      const action = body.command.includes("screenshot")
+        ? { screenshot: SCREEN_PNG.toString("base64") }
+        : {};
+      response.end(
+        JSON.stringify({
+          exit: 0,
+          stdout: JSON.stringify({
+            ok: true,
+            url: "about:blank",
+            title: "",
+            ...action,
+          }),
+          stderr: "",
+          durationMs: 5,
+        }),
+      );
+      return;
+    }
     executedCommands.push(body.command);
     if (body.command === "uname -a") {
       response.end(
@@ -365,6 +392,26 @@ try {
   );
   assert.equal(assistantWithTools.length, 2, "tool runs persist on assistant messages");
 
+  const screenResponse = await fetch(
+    `http://127.0.0.1:${daemonPort}/bots/${botId}/screen`,
+  );
+  assert.equal(screenResponse.status, 200, "screen endpoint should serve a frame");
+  assert.equal(screenResponse.headers.get("content-type"), "image/png");
+  assert.ok(
+    screenResponse.headers.get("x-screen-captured-at"),
+    "screen endpoint should report the capture time",
+  );
+  const screenBytes = Buffer.from(await screenResponse.arrayBuffer());
+  assert.ok(
+    screenBytes.equals(SCREEN_PNG),
+    "screen endpoint should return the captured PNG bytes",
+  );
+
+  const unknownScreen = await fetch(
+    `http://127.0.0.1:${daemonPort}/bots/nope/screen`,
+  );
+  assert.equal(unknownScreen.status, 404, "unknown bot has no screen");
+
   socket.send(
     JSON.stringify({
       type: "bots.create",
@@ -398,6 +445,13 @@ try {
   );
   const updatedToLocal = await waitFor("bot.updated");
   assert.equal(updatedToLocal.bot.computer, "mac");
+
+  const macScreen = await fetch(
+    `http://127.0.0.1:${daemonPort}/bots/${localBotId}/screen`,
+  );
+  assert.equal(macScreen.status, 409, "This Mac computers have no VM screen");
+  const macScreenBody = await macScreen.json();
+  assert.equal(macScreenBody.code, "mac");
 
   socket.send(
     JSON.stringify({

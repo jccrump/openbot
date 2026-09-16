@@ -255,7 +255,10 @@ Working recipe, validated on an M4 Pro (macOS 27, Lima 2.2.0):
   launches `chrome-headless-shell` once, holds a persistent CDP connection, and
   serves browser actions over a Unix socket. That keeps per-action latency to a
   few seconds instead of paying a Node + Chromium start per call. Measured:
-  first navigation after boot ~15–25 s, later actions 2–8 s.
+  first navigation after boot ~15–25 s, later actions 2–8 s. Design notes on
+  how production computer-use agents batch actions, combine DOM text with
+  screenshots, and budget observations are in
+  [research/computer-use.md](research/computer-use.md).
 
 **Sandbox host service.** `packages/sandbox/host/service.ts` is bundled with
 esbuild into a single `service.mjs`, installed into the Lima VM at
