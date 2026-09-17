@@ -4,6 +4,11 @@ import { join } from "node:path";
 import { PROVIDER_PRESETS, type ProviderDefinition } from "@openbot/gateway";
 import type { CompactionSettings, HarnessSettings } from "@openbot/protocol";
 import { clampCompactionThreshold } from "./compaction";
+import {
+  decisionSettingsFromEnv,
+  normalizeDecisionSettings,
+  type DecisionSettings,
+} from "./decision";
 import { parseHarnessId } from "./harness";
 
 export interface OpenBotConfig {
@@ -15,6 +20,7 @@ export interface OpenBotConfig {
   requireApproval: boolean;
   compaction: CompactionSettings;
   harness: HarnessSettings;
+  decision: DecisionSettings;
 }
 
 interface FileConfig {
@@ -30,6 +36,7 @@ interface FileConfig {
   harness?: {
     default?: string;
   };
+  decision?: Partial<DecisionSettings>;
 }
 
 export function defaultDataDir(): string {
@@ -95,5 +102,9 @@ export function loadConfig(
     harness: {
       default: parseHarnessId(env.OPENBOT_HARNESS ?? file.harness?.default),
     },
+    decision: normalizeDecisionSettings(
+      file.decision,
+      decisionSettingsFromEnv(env),
+    ),
   };
 }

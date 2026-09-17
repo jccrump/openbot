@@ -1,8 +1,9 @@
-import type {
-  ChatMessage,
-  ChatProvider,
-  ChatRequest,
-  TokenUsage,
+import {
+  modelContextWindow,
+  type ChatMessage,
+  type ChatProvider,
+  type ChatRequest,
+  type TokenUsage,
 } from "@openbot/gateway";
 import type {
   CompactionMeta,
@@ -42,13 +43,6 @@ const SUMMARIZER_SYSTEM_PROMPT =
   "paragraphs or bullets, keep the conversation's language, and never invent " +
   "details that are not in the transcript.";
 
-const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
-  "deepseek-flash": 128_000,
-  "deepseek-v4-flash": 128_000,
-  "deepseek-v4-pro": 128_000,
-  "deepseek/deepseek-v4-flash": 128_000,
-};
-
 const OVERFLOW_PATTERNS: RegExp[] = [
   /context[_ ]length[_ ]exceeded/i,
   /maximum context length/i,
@@ -72,7 +66,7 @@ export function clampCompactionThreshold(value: number): number {
 }
 
 export function contextWindowFor(model: string): number | null {
-  return MODEL_CONTEXT_WINDOWS[model] ?? null;
+  return modelContextWindow(model);
 }
 
 export function resolveCompactionThreshold(

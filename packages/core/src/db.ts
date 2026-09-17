@@ -60,6 +60,96 @@ export function openDatabase(dataDir: string): DatabaseSync {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS tasks (
+      id TEXT PRIMARY KEY,
+      lead_id TEXT NOT NULL,
+      role_id TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+      project_id TEXT,
+      thread_id TEXT REFERENCES threads(id) ON DELETE SET NULL,
+      parent_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+      depth INTEGER NOT NULL DEFAULT 0,
+      title TEXT NOT NULL,
+      brief TEXT NOT NULL,
+      status TEXT NOT NULL,
+      display TEXT NOT NULL DEFAULT 'none',
+      grant TEXT,
+      budget TEXT,
+      usage TEXT,
+      result TEXT,
+      evidence TEXT,
+      error TEXT,
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      ended_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tasks_role
+      ON tasks(role_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_tasks_lead
+      ON tasks(lead_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS memories (
+      id TEXT PRIMARY KEY,
+      scope TEXT NOT NULL,
+      type TEXT NOT NULL,
+      content TEXT NOT NULL,
+      evidence TEXT,
+      confidence REAL NOT NULL DEFAULT 0.8,
+      importance REAL NOT NULL DEFAULT 0.5,
+      status TEXT NOT NULL DEFAULT 'active',
+      source TEXT NOT NULL,
+      embedding BLOB,
+      embedding_model TEXT,
+      embedding_dims INTEGER,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_used_at TEXT,
+      use_count INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_memories_scope
+      ON memories(scope, status, updated_at);
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
+      USING fts5(memory_id UNINDEXED, content);
+
+    CREATE TABLE IF NOT EXISTS soul_versions (
+      id TEXT PRIMARY KEY,
+      bot_id TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      content TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      source TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_soul_versions_bot
+      ON soul_versions(bot_id, version);
+
+    CREATE TABLE IF NOT EXISTS approvals (
+      id TEXT PRIMARY KEY,
+      request_id TEXT NOT NULL,
+      run_id TEXT,
+      thread_id TEXT,
+      bot_id TEXT,
+      task_id TEXT,
+      project_id TEXT,
+      tool TEXT NOT NULL,
+      arguments TEXT NOT NULL,
+      tier TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      decision TEXT,
+      decided_by TEXT,
+      requested_at TEXT NOT NULL,
+      decided_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_approvals_request
+      ON approvals(request_id);
+    CREATE INDEX IF NOT EXISTS idx_approvals_time
+      ON approvals(requested_at);
   `);
 
   const columns = db
@@ -117,6 +207,32 @@ export function openDatabase(dataDir: string): DatabaseSync {
   }
   if (!botColumnNames.has("computer")) {
     db.exec("ALTER TABLE bots ADD COLUMN computer TEXT");
+  }
+  if (!botColumnNames.has("kind")) {
+    db.exec("ALTER TABLE bots ADD COLUMN kind TEXT NOT NULL DEFAULT 'role'");
+  }
+  if (!botColumnNames.has("delegates")) {
+    db.exec("ALTER TABLE bots ADD COLUMN delegates INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!botColumnNames.has("policy")) {
+    db.exec("ALTER TABLE bots ADD COLUMN policy TEXT NOT NULL DEFAULT 'inherit'");
+  }
+
+  const taskColumns = db
+    .prepare("PRAGMA table_info(tasks)")
+    .all() as unknown as Array<{ name: string }>;
+  const taskColumnNames = new Set(taskColumns.map((column) => column.name));
+  if (!taskColumnNames.has("parent_id")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN parent_id TEXT");
+  }
+  if (!taskColumnNames.has("depth")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN depth INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!taskColumnNames.has("usage")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN usage TEXT");
+  }
+  if (!taskColumnNames.has("project_id")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN project_id TEXT");
   }
 
   return db;

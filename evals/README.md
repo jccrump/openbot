@@ -57,6 +57,16 @@ Judge a change primarily by strict pass rate and average score, then check
 browser actions, latency, token use, failed tool calls, and verifier repairs for
 the cost of that quality.
 
+### Evaluating the Jev decision paths
+
+The daemon enables the decision model automatically when `TYPESAFE_API_KEY` is
+set (override the endpoint or model with `TYPESAFE_BASE_URL` and
+`TYPESAFE_DEFAULT_MODEL`). Record a baseline without the key, then run the same
+scenarios with it. The decision paths add `decisionCalls` to the daemon log
+(`completion.audit` with `engine: "jev"`, `guardrail.flagged`) and the runner's
+verifier-repair counts show whether the typed audit accepted or returned
+drafts.
+
 ### Speed metrics
 
 Speed is a first-class comparison dimension. The runner records these values

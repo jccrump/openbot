@@ -6,18 +6,100 @@ export const ModelRefSchema = z.object({
 });
 export type ModelRef = z.infer<typeof ModelRefSchema>;
 
+export const POLICY_PRESET_IDS = [
+  "balanced",
+  "read-only",
+  "trusted",
+  "locked",
+] as const;
+export const PolicyPresetIdSchema = z.enum(POLICY_PRESET_IDS);
+export type PolicyPresetId = z.infer<typeof PolicyPresetIdSchema>;
+
+export const RolePolicySchema = z.enum([
+  "inherit",
+  "balanced",
+  "read-only",
+  "trusted",
+  "locked",
+]);
+export type RolePolicy = z.infer<typeof RolePolicySchema>;
+
+export const BotKindSchema = z.enum(["lead", "role", "project"]);
+export type BotKind = z.infer<typeof BotKindSchema>;
+
 export const BotSchema = z.object({
   id: z.string(),
   name: z.string(),
   systemPrompt: z.string(),
   model: ModelRefSchema,
   createdAt: z.string(),
+  kind: BotKindSchema.default("role"),
   role: z.string().nullable().optional(),
   avatar: z.string().nullable().optional(),
   color: z.string().nullable().optional(),
   computer: z.string().nullable().optional(),
+  delegates: z.boolean().default(false),
+  policy: RolePolicySchema.default("inherit"),
 });
 export type Bot = z.infer<typeof BotSchema>;
+
+export const TaskStatusSchema = z.enum([
+  "queued",
+  "running",
+  "done",
+  "failed",
+  "cancelled",
+]);
+export type TaskStatus = z.infer<typeof TaskStatusSchema>;
+
+export const TaskDisplaySchema = z.enum(["none", "browser", "desktop"]);
+export type TaskDisplay = z.infer<typeof TaskDisplaySchema>;
+
+export const TaskBudgetSchema = z.object({
+  wallClockMs: z.number().nullable().optional(),
+  tokens: z.number().nullable().optional(),
+  toolCalls: z.number().nullable().optional(),
+});
+export type TaskBudget = z.infer<typeof TaskBudgetSchema>;
+
+export const TaskGrantSchema = z.object({
+  tools: z.array(z.string()),
+  display: TaskDisplaySchema,
+  budget: TaskBudgetSchema,
+});
+export type TaskGrant = z.infer<typeof TaskGrantSchema>;
+
+export const TaskUsageSchema = z.object({
+  toolCalls: z.number(),
+  inputTokens: z.number(),
+  outputTokens: z.number(),
+  wallClockMs: z.number(),
+});
+export type TaskUsage = z.infer<typeof TaskUsageSchema>;
+
+export const TaskSchema = z.object({
+  id: z.string(),
+  leadId: z.string(),
+  roleId: z.string(),
+  projectId: z.string().nullable().optional(),
+  threadId: z.string().nullable(),
+  parentId: z.string().nullable(),
+  depth: z.number(),
+  title: z.string(),
+  brief: z.string(),
+  status: TaskStatusSchema,
+  display: TaskDisplaySchema,
+  grant: TaskGrantSchema.nullable(),
+  budget: TaskBudgetSchema.nullable(),
+  usage: TaskUsageSchema.nullable(),
+  result: z.string().nullable(),
+  evidence: z.string().nullable(),
+  error: z.string().nullable(),
+  createdAt: z.string(),
+  startedAt: z.string().nullable(),
+  endedAt: z.string().nullable(),
+});
+export type Task = z.infer<typeof TaskSchema>;
 
 export const ComputerKindSchema = z.enum(["firecracker", "mac"]);
 export type ComputerKind = z.infer<typeof ComputerKindSchema>;
@@ -74,6 +156,41 @@ export const HarnessSettingsSchema = z.object({
 });
 export type HarnessSettings = z.infer<typeof HarnessSettingsSchema>;
 
+export const DecisionGuardrailModeSchema = z.enum(["off", "annotate", "block"]);
+export type DecisionGuardrailMode = z.infer<
+  typeof DecisionGuardrailModeSchema
+>;
+
+export const DecisionInfoSchema = z.object({
+  enabled: z.boolean(),
+  baseUrl: z.string(),
+  model: z.string(),
+  hasApiKey: z.boolean(),
+  apiKeyEnv: z.string().nullable(),
+  audit: z.boolean(),
+  browse: z.boolean(),
+  route: z.boolean().optional(),
+  guardrail: DecisionGuardrailModeSchema,
+  timeoutMs: z.number(),
+});
+export type DecisionInfo = z.infer<typeof DecisionInfoSchema>;
+
+export const DecisionSettingsPatchSchema = z.object({
+  enabled: z.boolean().optional(),
+  baseUrl: z.string().min(1).optional(),
+  model: z.string().min(1).optional(),
+  apiKey: z.string().optional(),
+  apiKeyEnv: z.string().optional(),
+  audit: z.boolean().optional(),
+  browse: z.boolean().optional(),
+  route: z.boolean().optional(),
+  guardrail: DecisionGuardrailModeSchema.optional(),
+  timeoutMs: z.number().int().min(500).max(30_000).optional(),
+});
+export type DecisionSettingsPatch = z.infer<
+  typeof DecisionSettingsPatchSchema
+>;
+
 export const CodexInfoSchema = z.object({
   available: z.boolean(),
   version: z.string().nullable(),
@@ -106,6 +223,114 @@ export const ThreadSchema = z.object({
   updatedAt: z.string(),
 });
 export type Thread = z.infer<typeof ThreadSchema>;
+
+export const ApprovalTierSchema = z.enum(["auto", "ask", "deny"]);
+export type ApprovalTier = z.infer<typeof ApprovalTierSchema>;
+
+export const PolicyRuleSchema = z.object({
+  id: z.string(),
+  tool: z.string(),
+  scope: z.enum(["*", "firecracker", "mac"]).default("*"),
+  match: z.enum(["command", "path", "domain", "text"]),
+  pattern: z.string(),
+  tier: ApprovalTierSchema,
+  note: z.string().nullable().optional(),
+});
+export type PolicyRule = z.infer<typeof PolicyRuleSchema>;
+
+export const EgressModeSchema = z.enum(["off", "ask", "deny"]);
+export type EgressMode = z.infer<typeof EgressModeSchema>;
+
+export const EgressSettingsSchema = z.object({
+  mode: EgressModeSchema,
+  allow: z.array(z.string()),
+});
+export type EgressSettings = z.infer<typeof EgressSettingsSchema>;
+
+export const PolicySettingsSchema = z.object({
+  timeoutMs: z.number().int().min(0).max(86_400_000),
+  defaultTier: z.enum(["auto", "ask", "deny", "inherit"]),
+  tools: z.record(z.string(), ApprovalTierSchema),
+  rules: z.array(PolicyRuleSchema),
+  egress: EgressSettingsSchema.optional(),
+});
+export type PolicySettings = z.infer<typeof PolicySettingsSchema>;
+
+
+
+export const ApprovalDecisionSchema = z.enum([
+  "approve",
+  "deny",
+  "timeout",
+  "abort",
+]);
+export type ApprovalDecision = z.infer<typeof ApprovalDecisionSchema>;
+
+export const ApprovalRecordSchema = z.object({
+  id: z.string(),
+  requestId: z.string(),
+  runId: z.string().nullable(),
+  threadId: z.string().nullable(),
+  botId: z.string().nullable(),
+  taskId: z.string().nullable(),
+  projectId: z.string().nullable(),
+  tool: z.string(),
+  arguments: z.string(),
+  tier: ApprovalTierSchema,
+  reason: z.string(),
+  decision: ApprovalDecisionSchema.nullable(),
+  decidedBy: z.enum(["user", "timeout", "abort"]).nullable(),
+  requestedAt: z.string(),
+  decidedAt: z.string().nullable(),
+});
+export type ApprovalRecord = z.infer<typeof ApprovalRecordSchema>;
+
+export const MemoryTypeSchema = z.enum([
+  "semantic",
+  "relational",
+  "procedural",
+  "episodic",
+]);
+export type MemoryType = z.infer<typeof MemoryTypeSchema>;
+
+export const MemoryStatusSchema = z.enum(["active", "suspect", "archived"]);
+export type MemoryStatus = z.infer<typeof MemoryStatusSchema>;
+
+export const MemorySchema = z.object({
+  id: z.string(),
+  scope: z.string(),
+  type: MemoryTypeSchema,
+  content: z.string(),
+  evidence: z.array(z.string()).nullable().optional(),
+  confidence: z.number(),
+  importance: z.number(),
+  status: MemoryStatusSchema,
+  source: z.string(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  lastUsedAt: z.string().nullable().optional(),
+  useCount: z.number(),
+});
+export type Memory = z.infer<typeof MemorySchema>;
+
+export const SoulContentSchema = z.object({
+  voice: z.string(),
+  commitments: z.array(z.string()),
+  relationship: z.string(),
+});
+export type SoulContent = z.infer<typeof SoulContentSchema>;
+
+export const SoulVersionSchema = z.object({
+  id: z.string(),
+  botId: z.string(),
+  version: z.number(),
+  content: SoulContentSchema,
+  summary: z.string(),
+  reason: z.string(),
+  source: z.string(),
+  createdAt: z.string(),
+});
+export type SoulVersion = z.infer<typeof SoulVersionSchema>;
 
 export const ProviderInfoSchema = z.object({
   id: z.string(),

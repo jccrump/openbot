@@ -26,12 +26,16 @@ Single-user, Mac-first. Mobile is a later thin client.
   Responses-to-Chat-Completions bridge drives non-OpenAI models (verified end
   to end with a real DeepSeek key, including a tool call in the microVM). The
   ChatGPT subscription flow has not been verified end to end from the app.
-- **M4+ (planned):** multi-agent messaging, memory, routines, mobile. See
-  [Milestones](#milestones).
+- **M4 (in progress):** the lead/worker runtime — one lead identity with soul
+  and memory, ephemeral workers per task, a workboard, and task grants. See
+  [Lead and workers](#lead-and-workers).
+- **M5+ (planned):** routines, mobile.
 
-Subagent handoffs, group chats, and mentions are **planned for M4 and are not
-implemented**. Every agent today is independent: it has exactly one thread, and
-nothing routes work between agents.
+Subagent handoffs and group chats are not implemented yet. Today every agent is
+independent: it has exactly one thread, and nothing routes work between agents.
+The lead/worker model replaces that arrangement: the lead is the only chat
+surface, and workers are task instances with their own computers, not agents
+with their own conversations.
 
 ## System overview
 
@@ -89,19 +93,35 @@ docs/                      This document and screenshots
   development it also runs in a browser via `pnpm dev:app`.
 - Talks to the daemon exclusively over the WebSocket protocol. Reconnects
   automatically; the daemon can restart underneath it.
-- Surfaces today: agent list with search, last-message previews, a per-agent
-  settings menu, and the model picker in the sidebar; chat with streaming text
-  and a three-dot typing bubble while the model is thinking (reasoning deltas
-  are received but hidden by default); a computer switcher; tool cards with
-  output and screenshots; inline approval cards; a collapsible live noVNC
-  screen panel with screenshot fallback and a draggable resizer; create-agent modal; and
-  Settings.
+- Surfaces today: the lead pinned above a Team section and a Work list, search
+  across roles and tasks, a per-role settings modal (including the delegation
+  switch), and the model picker in the sidebar; chat with streaming text and a
+  three-dot typing bubble while the model is thinking (reasoning deltas are
+  received but hidden by default); a workboard strip with task chips and
+  worker approvals; a task detail with grant, budget, usage, child workers,
+  live transcript, cancel, and a Watch overlay for the task's own desktop;
+  tool cards with output and screenshots; inline approval cards; a collapsible
+  live noVNC screen panel with screenshot fallback and a draggable resizer;
+  create-role modal; and Settings.
 - Background or unfocused windows keep their RFB connection and last rendered
   canvas warm, but hold framebuffer update requests, disable input, and suspend
   screenshot polling. The pending update is released on focus, avoiding a new
   handshake without creating background x11vnc encoding work.
-- Not present: approvals inbox, run log, routines browser, memory browser, and
-  group chats.
+- The screenshot fallback captures the display host's desktop — the same
+  display the browser and desktop tools act on — so the panel never shows a
+  different desktop than the model is working with. While the VM is stopped the
+  panel backs off to a slow poll instead of hammering the daemon with 409s.
+- The screen panel preview is view-only: the small desktop view streams live
+  frames but noVNC never captures clicks, cursor, or keyboard there. Hovering
+  the preview shows a centered **Open** pill; clicking the preview or the pill
+  expands it to a full-screen takeover view where input is live, and Esc (or
+  the collapse control) returns to the view-only preview. Model actions over
+  VNC and manual takeover share the same display, so the model can keep
+  working while the user watches, and either can take over.
+- Not present yet: approvals inbox, routines browser, memory browser, and
+  group chats. The sidebar restructure (lead pinned, team, work), the
+  workboard, and the task detail and watch views are described in
+  [Lead and workers](#lead-and-workers).
 
 **Settings layout.** Four sections in a left nav with search:
 
@@ -114,6 +134,10 @@ docs/                      This document and screenshots
   model list, and "Fetch models".
 - **Harness** — pick the default harness (OpenBot or Codex). Codex is only
   selectable when the CLI is detected on `PATH`.
+- **Decision model** — the optional Jev (TypeSafe System One) integration:
+  enable, base URL, model, API key or environment variable, confidence
+  threshold, per-call timeout, and toggles for the completion audit, the
+  `browse` tool, and the untrusted-content guardrail (off / annotate / block).
 
 **Design language.** The UI matches the Grok Bot desktop app: light surfaces
 (`#fcfcfc` chat, `#fafafa` sidebar) and a dark theme, `system-ui` type at 14px
@@ -136,8 +160,18 @@ is also the drag region.
 - `agent.ts` — the built-in run loop for one message: resolve agent and model,
   persist the user message, compact if needed, stream provider events, execute
   tool calls with approvals, persist the assistant message, emit protocol
-  events. Abortable per run; at most 8 model/tool steps per user message.
+  events. Abortable per run; completion-driven, with no fixed round limit.
+- `orchestrator.ts` — the lead/worker runtime: task creation and lifecycle,
+  worker dispatch through the role's computer, the lead inbox, and workboard
+  context assembly for lead turns (M4).
+- `browse.ts` — the Jev-driven browse loop: reads the current page and its
+  links, asks the decision model which link to follow and whether the evidence
+  is sufficient, and returns the collected pages.
+- `guardrail.ts` — Jev screening of untrusted page text for instruction
+  override and exfiltration requests.
 - `compaction.ts` — context-window management (see [Compaction](#compaction)).
+- `decision.ts` — Jev settings, key resolution, and the decision-client
+  factory (env < `config.json` < stored settings).
 - `harness.ts` — persisted harness selection.
 - `codex.ts` — the Codex harness: binary detection, provider classification,
   bridge lifecycle, `codex exec` supervision, and JSONL event mapping (see
@@ -211,6 +245,136 @@ MCP tools default to requiring approval; the daemon and wrapper configure
 `default_tools_approval_mode = "approve"` and a long tool timeout because first
 boots and browser actions can take minutes.
 
+### Lead and workers
+
+The primary runtime is one **lead** with a team of ephemeral **workers**. The
+lead is a single durable identity: it owns the conversation, the soul, and the
+memory. Workers are task instances: they receive a brief, a role's tools and
+computer, a grant, and a budget, and they disappear when the task ends. The
+guiding rule is **one mind, many hands** — the lead's cognition is serialized
+(one lead run at a time), worker labor is parallel.
+
+**The lead.**
+
+- Exactly one lead per install: a `bots` row with `kind = 'lead'`, seeded on
+  migration. Existing agents become roles (`kind = 'role'`).
+- One continuous thread. A lead turn begins from a user message or from the
+  inbox (a task finished, failed, or needs attention) and is processed one at a
+  time, so the lead never races itself.
+- With Jev enabled, each user message is **routed before the model runs**:
+  `needs_work` and `route` decisions (conversation, direct, an existing
+  project, or a new one) arrive in a few hundred milliseconds. A confident
+  conversation answer runs the turn without tools; a confident project answer
+  injects a `[routing]` hint naming the project, and the lead still writes the
+  request. Unsure or unavailable falls back to the model (ADR-014 amendment).
+- The lead's turn context includes a bounded **workboard block**: active tasks
+  with status and budget, completed tasks with result summaries and artifact
+  handles, and memory retrieved for the current conversation. Raw worker
+  transcripts never enter the lead's context.
+- The lead can act directly on its own computer — its home microVM with the
+  persistent browser profile and sign-ins — or delegate. Quick lookups stay
+  with the lead; long, parallel, or risky work becomes a task.
+
+**Workers.**
+
+- A `tasks` row is a worker instance: role, brief, status, display, grant,
+  budget, result, evidence, error, and a thread for its step transcript. Tasks
+  are not chat surfaces; the task detail view renders the thread.
+- Worker execution reuses the agent loop with the role's model, computer, and
+  tool set. Workers never write memory and never talk to the user directly;
+  they return a result with evidence (observation IDs and artifact handles).
+- Workers are **display-on-demand** (ADR-016): headless by default, a browser
+  view for browser work, and a lazily attached desktop stack only when a task
+  declares it. Only the lead keeps a persistent visible desktop.
+- Workers that belong to a project run as **sessions inside the project's
+  computer** (see below). A standalone task — one the lead spawns directly,
+  outside any project — gets its own microVM keyed by the task id, booted on
+  the first tool call and destroyed when it ends. The role's home VM is never
+  used for task work. On daemon restart, tasks that were queued or running are
+  failed and their ephemeral computers removed.
+
+**Projects and managers.** A project is a persistent agent (`bots.kind =
+'project'`) that the lead creates for a topic — "Buddy Weather" — with its own
+computer, one long-lived thread with the lead, and the project's detailed
+context. The lead keeps the high-level index (which projects exist and what
+they are for) and routes work: `list_projects` first, then `ask_project` when a
+project matches, or `create_project` and then `ask_project` when none does. A
+request is a task attached to the project that reuses the project's thread, so
+every request and report accumulates in the project's own history.
+
+Workers are **sessions inside the project's computer**, not machines of their
+own: shell and file tools run in the project VM with a per-session workspace
+(`/root/workspaces/<taskId>`), and each session gets its own browser keyed by
+the session id, so parallel workers do not fight over one page. Sessions are
+ephemeral — they end with the request and leave no computer behind. The project
+computer persists until the project is deleted; requests to one project run one
+at a time, while different projects run in parallel. Managers do not talk to
+the user and do not write user memory: the lead stays the only voice and the
+only writer of user memory. Envelopes still hold: a worker grant must be a
+subset of its request's grant, budgets must fit inside the parent's remaining
+budget, and depth is capped at request → worker.
+
+### Memory and soul
+
+Memory is a SQLite store (`memories`) with FTS5 keyword search plus brute-force
+vector search over stored embeddings. The embedding client is any
+OpenAI-compatible `/embeddings` endpoint; with none configured, a deterministic
+hashed-embedding fallback keeps retrieval working offline. (`sqlite-vec` via
+`loadExtension` is the upgrade path if brute force ever matters at this scale.)
+Memories are typed (semantic, relational, procedural, episodic), scoped
+(`user` for the lead, the project bot id for a project), and carry evidence,
+confidence, importance, use counts, and status (`active` / `suspect` /
+`archived`).
+
+- **Writes.** The lead and project managers write explicitly with `remember`,
+  search with `recall`, and archive with `forget`. Workers cannot write memory.
+- **Injection.** Every turn retrieves a bounded, relevant slice (lead: user
+  scope; projects: their scope plus the user's; workers: the project slice
+  their brief matches) and injects it as a system note with memory ids. Used
+  memories get a use-count bump, which feeds ranking.
+- **Automatic upkeep.** A background reflection pass runs on a debounce after
+  turns and on a timer. It extracts durable memories from the new conversation
+  using the scope's model, folds near-duplicates into existing rows, decays
+  unused memories toward an archive threshold, and merges near-duplicates.
+  `memory.consolidate` lets the UI force a prune.
+- **Soul.** The lead's soul is a versioned constitution (`soul_versions`):
+  voice, commitments, relationship. The lead can update it with `update_soul`,
+  and the reflection pass rewrites it once enough new memories accumulate.
+  Every version is kept and the user can revert from the Memory panel; projects
+  have no soul of their own.
+
+**Watching a task.** The task detail shows the brief, result, evidence ledger,
+grant, budget, usage, and child workers, and it renders the worker's transcript
+live while it runs. A Watch action opens the task's own desktop stream; task
+computers are exposed as `/tasks/:id/screen` and `/tasks/:id/vnc` alongside the
+per-bot routes, so watching never touches the role's home computer. The
+transcript plus the persisted artifacts are the replay.
+
+**The workboard.** Task state is protocol data, not messages: `tasks` in the
+`hello` snapshot and `task.upserted` events as rows change. The UI shows the
+workboard inside the lead's turn — a row of task tiles with status, role,
+elapsed time, and budget — expandable to the event trail and artifacts, with
+approve, cancel, and (later) watch actions. The lead's notifications to the
+user are ordinary assistant messages.
+
+**Roles and the sidebar.** A role is a `bots` row with `kind = 'role'`: name,
+role description, avatar, color, model, computer, and tool policy. It is a
+template, not a chat. The sidebar becomes:
+
+- **Lead** — pinned at the top; the only chat surface.
+- **Team** — roles, with live task counts; the gear opens role settings.
+- **Work** — active and recent tasks, newest first.
+- Search covers roles, tasks, and artifacts.
+
+Creating a role is hiring a specialist; there is no per-role chat. One lead
+only; a role can be promoted to lead in settings, which demotes the previous
+lead to a role.
+
+**Routines (planned).** A routine is a lead-owned scheduled spawn: a role, a
+brief template, and a schedule. The lead watches routine runs like any other
+task, summarizes the outcome, and notifies the user; the run itself stays
+watchable and replayable.
+
 ### Model gateway (`packages/gateway`)
 
 - `ChatProvider` interface: `chat(request) -> AsyncIterable<ChatEvent>`, where
@@ -219,6 +383,11 @@ boots and browser actions can take minutes.
   endpoint (DeepSeek, OpenAI, OpenRouter, Groq, xAI, Google, Mistral, Ollama,
   LM Studio, vLLM, ...). Handles `reasoning_content` deltas and accumulates
   streamed tool calls.
+- `decision.ts` — TypeSafe System One client (`@typesafe-ai/sdk`) wrapped
+  behind a small `DecisionClient.evaluate({state, questions})` interface. It is
+  not a `ChatProvider`: Jev returns typed answers (`noul`, `choice`, `score`)
+  with calibrated confidence instead of streaming text, with per-call timeouts
+  and retries.
 - `presets.ts` — provider presets used by the settings UI; `models.ts` fetches
   the model list from any OpenAI-compatible `/models` endpoint.
 - There is no `@openai/codex-sdk` provider yet; the Codex path shells out to
@@ -231,7 +400,14 @@ managed from Settings:
 
 - Add, edit, remove, and enable/disable providers with a name, base URL,
   models, and either an API key or the name of an environment variable holding
-  one (an environment variable wins when both exist).
+  one (an environment variable wins when both exist). There is no
+  capability setting to configure: `packages/gateway/model-capabilities.ts`
+  indexes model families (vision support and context window) and the harness
+  looks up the selected model. Vision-capable models receive screenshots from
+  the browser and desktop tools as a follow-up user message — DeepSeek and
+  other OpenAI-compatible providers only accept images in `user` messages —
+  while unknown or text-only models never receive image content, so a request
+  cannot fail on an image. Only the latest screenshot is kept in history.
 - Presets for DeepSeek, OpenAI, OpenRouter, Groq, xAI, Google, Mistral, Ollama,
   and LM Studio prefill the form.
 - "Fetch models" calls the provider's `/models` endpoint; models can also be
@@ -249,8 +425,9 @@ Long threads are compacted instead of dropped. `compaction.ts` owns the policy:
 
 - **Threshold.** Settings are `{enabled, thresholdTokens}`. An explicit
   threshold is clamped to 32,000–1,000,000. With no explicit threshold the
-  daemon uses 75% of a known context window (`deepseek-v4-flash` and
-  `deepseek-v4-pro` are mapped to 128k) and falls back to 100,000 tokens.
+  daemon uses 75% of the context window from the model capability index
+  (`packages/gateway/model-capabilities.ts`; DeepSeek models are mapped to
+  128k) and falls back to 100,000 tokens for unknown models.
 - **Planning.** `planCompaction()` folds the oldest messages until the
   remaining estimated tokens are at or below the target (half the threshold for
   automatic compaction, half the current total for overflow/manual), always
@@ -283,8 +460,9 @@ Working recipe, validated on an M4 Pro (macOS 27, Lima 2.2.0):
 - The guest agent (`packages/sandbox/guest/agent.py`) runs as PID 1 via the
   `init=` boot arg and listens on vsock port 5000. It mounts /proc, /sys, and
   /dev itself, executes newline-delimited JSON requests
-  (`{cmd, cwd?, timeout?}` to `{exit, stdout, stderr}`), and survives
-  individual connection failures.
+  (`{cmd, cwd?, timeout?}` to `{exit, stdout, stderr}`), streams stdout/stderr
+  chunks (`{type: "chunk", stream, data}`) before the final result line, and
+  survives individual connection failures.
 - Browsers do not run inside nested Firecracker. Both Chromium and Firefox
   repeatedly stalled there despite healthy networking, software rendering, and
   a 6.1 kernel; the identical browser/rootfs loaded pages normally on the outer
@@ -293,6 +471,36 @@ Working recipe, validated on an M4 Pro (macOS 27, Lima 2.2.0):
   unprivileged Linux account with its sandbox enabled, while the profile and
   Unix socket are private to that account. Warm actions typically complete in
   tens to hundreds of milliseconds.
+- **The browser engine is CDP, not Playwright.** The host launches Chromium
+  itself with `--remote-debugging-port=0` (the daemon reads the port and path
+  from `DevToolsActivePort`) and drives it through the vendored
+  `browser-use/browser-harness-js` session
+  (`packages/sandbox/host/vendor/browser-harness-js/`, MIT — see its
+  PROVENANCE.md for the three local patches). Two sessions attach to the same
+  browser: a deterministic action session for the `browser` tool
+  (goto/click/type/links/fields/text/scroll/screenshot/back/wait/clickLink/
+  snapshot) and a snippet session for `browser_execute`, which runs
+  agent-written JavaScript against the full CDP surface with console capture,
+  JSON return values, auto-attached screenshots, and a scoped timeout guard.
+  playwright-core is still installed on the host only as the Chromium binary
+  downloader. `browser_step` pairs a page snapshot with a Jev choice so Jev
+  picks the element (~300 ms) and the browser acts, and
+  `/root/openbot-skills/browser-execute/` in the guest carries the vendored
+  playbook and interaction recipes for the model to read.
+- **The agent desktop is a small shell, not just a browser.** The host starts
+  Xvfb at 1280x800 with Openbox, a tint2 panel (Files, Browser, and Terminal
+  launchers, taskbar, clock), an xterm terminal, and a generated gradient
+  wallpaper; the browser opens as a window so the desktop stays visible. Files
+  is Thunar running against `/root`, and both apps are ordinary X clients of
+  the same display the agent drives, so the user can browse the VM while the
+  agent works. The Browser launcher is a per-agent script (written with the
+  agent's id and the Playwright Chromium icon) that opens the same persistent
+  profile the model uses through the host browser API, or focuses the existing
+  Chromium window when it is already running. The panel is tracked separately and respawned if it exits; closing the
+  terminal never tears down the session. The browser disables the
+  AutomationControlled blink feature so pages do not see
+  `navigator.webdriver`; a Chromium policy suppresses the resulting
+  command-line warning bar so the shared screen stays clean.
 - The live noVNC stream is the same outer X display Chromium renders into.
   Model actions and manual takeover therefore share a page, cookies, focus, and
   navigation history. The guest still owns shell/files and runs its lightweight
@@ -314,13 +522,22 @@ esbuild into a single `service.mjs`, installed into the Lima VM at
 - `POST /vms/:botId/ensure` boots the VM if needed, serializes concurrent
   ensures, configures Firecracker through its API, and does not report
   `running` until both the exec agent and an RFB framebuffer are reachable
-- `POST /vms/:botId/exec` runs a command through the vsock agent
+- `POST /vms/:botId/exec` runs a command through the vsock agent; the host
+  wraps it in `bash -c` so bash-only constructs (PIPESTATUS, `[[ ]]`, arrays)
+  behave the way agents expect. The guest agent streams stdout/stderr as it is
+  produced, and with `stream: true` the host relays NDJSON chunk lines
+  followed by the final result, so the app can show terminal output live.
 - `POST /vms/:botId/browser` runs an action in the persistent per-agent browser
+- `POST /vms/:botId/desktop` runs a mouse, keyboard, scroll, drag, or window
+  action on the agent's desktop display with xdotool (installed in the outer
+  Lima VM), and captures screenshots with scrot
 - `POST /vms/:botId/stop` and `POST /vms/:botId/destroy`
 
 Per-agent state lives in `/var/lib/fc/vms/<botId>/` (rootfs copy and version,
 newest recovery image, browser profile/log, `api.sock`, `vsock.sock`,
-`serial.log`). `sandbox:setup`
+`serial.log`). Task computers use the same paths keyed by the task id: they
+boot from the base image, and `destroy` stops the VM and removes its rootfs,
+browser profile, and Linux account, so per-task computers leave nothing behind. `sandbox:setup`
 hashes the managed guest payload into `/var/lib/fc/rootfs.version`. On a version
 mismatch, the host checks and mounts the stopped old image, creates a fresh
 rootfs from the base, copies durable data from `/root`, `/home`, `/srv`, and
@@ -348,52 +565,168 @@ and can reach anything the host can.
 data, plus a separate outer-browser profile and Linux account for sign-ins.
 Deleting an agent aborts its active runs,
 deletes its threads and messages, removes its local workspace, and destroys its
-VM (`POST /vms/:botId/destroy`). Image-upgrade rollback exists; general user
-snapshots, pause/resume, and point-in-time restore do not.
+VM (`POST /vms/:botId/destroy`). **Start fresh** (`bots.reset`) is the
+non-destructive variant: it aborts runs, deletes the threads, messages, and
+workspace, destroys the VM — including the browser profile — and immediately
+rebuilds it from the base image so the next use is a clean install. The app
+confirms it with a dedicated dialog before sending anything, and the sandbox
+state (`stopped` → `booting` → `running`) streams to the UI while the VM
+rebuilds. Image-upgrade rollback exists; general user snapshots, pause/resume,
+and point-in-time restore do not.
 
 ### Tools and approvals
 
-The daemon exposes four tools to any model that supports function calling:
+The daemon exposes six tools to any model that supports function calling:
 
 - `shell` — run a command on the agent's computer
 - `read_file` — read a file from the agent's computer
 - `write_file` — write a file, creating parent directories
-- `browser` — drive the real browser: `goto`, `click`, `type`, `text`, `links`,
-  `screenshot`, `back`, `wait`. Navigation and interaction actions include a
-  bounded text observation of the resulting page; `links` returns link labels
-  and URLs. Cookies and sign-ins persist in the browser profile between calls,
-  and screenshots are saved as artifacts and rendered in the chat and screen
-  panel. Every result is labeled with a stable per-run observation ID and a
-  coarse source type (`direct-page`, `search-results`, `blocked-or-missing`, or
-  `failed`) before it is returned to the model and persisted.
+- `browser` — drive the real browser: `goto`, `clickLink`, `click`, `type`,
+  `fields`, `text`, `links`, `scroll`, `screenshot`, `back`, `wait`. The tool
+  and the default system prompt steer human-style browsing: open the site, use
+  its own search bar, follow menus and links (`links` then `clickLink`), check
+  category pages and pagination, and try a sitemap (an HTML sitemap page or
+  `/sitemap.xml`) before inventing deep URLs; `fields` lists visible inputs and
+  buttons with ready selectors so the model can type into the site's search
+  box, and `scroll` loads content that appears as you move down the page.
+  `click`, `type` with submit, and `clickLink` are navigation-aware: they wait
+  briefly for a changed URL, a replaced document, or DOM activity before
+  reading the page, so the observation describes the page the action produced
+  instead of the one it left behind, and in-place interactions stay fast.
+  Selector waits for `click` and `type` fail after ten seconds instead of
+  thirty, so a stale selector costs less. Navigation and interaction actions
+  include a bounded text observation of the resulting page; `links` returns
+  link labels and URLs. After a navigation or interaction the action waits for
+  the page's own signals — the load event, then real body text plus a short
+  stretch of DOM silence (MutationObserver), capped at 3.5 seconds — so
+  client-rendered pages are observed after they paint instead of returning an
+  empty body, while static pages resolve in a few hundred milliseconds.
+  Cookies and sign-ins persist in the browser profile
+  between calls, and screenshots are saved as artifacts and rendered in the
+  chat and screen panel. Every result is labeled with a stable per-run
+  observation ID and a coarse source type (`direct-page`, `search-results`,
+  `blocked-or-missing`, or `failed`) before it is returned to the model and
+  persisted.
+- `desktop` — drive the live desktop GUI itself (the same 1280x800 X display
+  the app shows over VNC and Chromium renders into), for anything the browser
+  tool cannot reach: native dialogs, drag and drop, context menus, scrolling
+  inside apps, the terminal and file manager windows, and coordinate-level
+  interaction. Actions: `screenshot`, `move`, `click` (left/middle/right,
+  1-3 clicks), `drag` (with intermediate motion so drop targets register),
+  `scroll`, `type`, `key` (for example `alt+F4`, `ctrl+shift+t`), `wait`,
+  `windows`, and `activate`. Every action returns the pointer position, the
+  active window, and by default a fresh screenshot, which becomes a chat
+  artifact. Screenshots are captured with `scrot -p` and the desktop x11vnc
+  runs with `-nocursorshape`, so the pointer is drawn into both the captures
+  and the live framebuffer — the user can see where the model is pointing in
+  the screen panel and in the chat. Input is injected with xdotool by the
+  sandbox host on the agent's display; shell and file tools still run in the
+  microVM, so the desktop is a presentation and interaction layer, not a
+  second filesystem.
+- `browse` — offered only on Firecracker computers with Jev enabled. The
+  daemon runs the loop itself: it reads the page and its links, asks Jev
+  `goal_met` (noul) and `next` (choice over the candidate links plus
+  `__back__`/`__done__`), follows the chosen link with `clickLink`, and stops
+  when the evidence is sufficient, the model chooses `__done__`, or the step
+  and wall-clock budgets run out. One approval covers the whole run; the result
+  is the collected evidence with `browse-00N` observation IDs, which the
+  completion audit expands into one observation per page. It cannot type or
+  sign in; the plain `browser` tool remains for that.
 
-Tool activity is streamed to the app (`tool.start`, `tool.result`) and
-persisted on the assistant message as `toolCalls`, so the next turn rebuilds a
-correct assistant/tool-call/tool-result history for the provider.
+**Bot checks.** Chromium launches with
+`--disable-blink-features=AutomationControlled` and a consistent `en-US` locale,
+and every browser action checks the resulting page for a Cloudflare/Turnstile
+interstitial. Most non-interactive challenges clear on their own, so the action
+waits up to eight seconds, and if the interstitial is stuck in a loop it tries
+one fresh reload before giving up. A page that is still challenged returns
+`ok: false` with `challenge: true`, and the run pauses: the daemon emits
+`challenge.request` and waits (up to five minutes, or until the run is
+cancelled) for the user to solve the check in the live screen panel. The app
+shows a Bot check card with Open Screen, Retry, and Skip; Retry re-runs the same
+browser action in place, so the model receives the page it originally asked
+for, while Skip and timeouts return the blocked result and the model falls back
+to another source. The `browse` loop stops with reason `challenge` instead of
+burning its step budget on a blocked page.
+
+A persistent profile is what keeps sign-ins and clearances, but a profile that
+was flagged under older automation settings can keep looping even after a
+manual solve. `POST /vms/:botId/browser/reset` stops the browser, moves the
+profile to `browser-profile.flagged-<timestamp>` (keeping the newest backup),
+and lets the next action start clean; `pnpm browser:reset -- "<agent name>"`
+wraps that with agent-name resolution through the daemon.
+
+Tool activity is streamed to the app (`tool.start`, `tool.result`) and each
+step's narration and tool calls are persisted together as that step's assistant
+message, so the next turn rebuilds a correct assistant/tool-call/tool-result
+history for the provider. The app groups a turn's step messages and tool calls
+under one collapsed work group once the final answer arrives.
 
 The built-in agent loop is completion-driven. Every model-requested tool call
 is executed and returned to the model, and the loop continues until the model
 emits a response with no more tool calls. There is no fixed round or action
-count. The user can cancel the run, each provider round and tool action has its
-own timeout, and connection failures after tool activity persist an honest
+count. A step's narration and its tool calls are persisted as one assistant
+message (`chat.message`) and the live bubble is cleared: while the run is
+active the app shows each step as it happens, and when the final answer arrives
+the turn's steps and tool calls collapse into a single work group above it. The
+user can cancel the run, each provider round and tool action has its own
+timeout, and connection failures after tool activity persist an honest
 incomplete response instead of treating progress narration as success.
 
-When a run used the browser, the first proposed final answer is buffered rather
-than shown immediately. The daemon builds a bounded evidence ledger from the
-persisted observations and asks the same configured model to audit the draft
-against the original user request. The verifier must keep claims bound to the
-exact entity and source that support them. A passing draft is released to chat;
-a rejected draft and its concrete gaps are returned privately to the executor,
-which may browse again or revise unknown claims before another audit. Invalid or
-unavailable verifier output fails open so a provider formatting problem cannot
-strand an otherwise completed run.
+When a run used the browser (or the `browse` tool) and the completion audit is
+on, the draft answer streams to chat as it is written but is not final until it
+passes. The daemon builds a bounded evidence ledger from the persisted
+observations and audits the draft against the original user request. With Jev
+enabled, the audit is a single typed decision call (~100–500 ms): a
+`pass`/`continue` choice plus atomic `noul` checks for deliverables covered,
+claims bound to their exact subject, search-result discipline, labeled
+unknowns, and overstatement. Feedback text is composed in code from the failed
+checks. A decisive failure returns the draft privately to the executor for
+revision and the streamed text is cleared; an all-pass draft is released; only
+a passing draft with checks inside a small margin of their threshold escalates
+to the model verifier below, and revisions are capped at two attempts before
+the current draft is released with a flagged decision notice. The model
+verifier answers with a compact JSON verdict plus issue codes instead of prose.
+Invalid or unavailable verifier output fails open so a provider formatting
+problem cannot strand an otherwise completed run. Turning the completion audit
+off in Settings skips verification entirely and ships the draft.
+
+With Jev enabled, untrusted page text returned by the `browser` tool and every
+page collected by the `browse` loop is also screened for prompt injection
+(`instruction_override`, `exfiltration_request`). In `annotate` mode a
+`[guardrail: …]` banner is prepended and the event is logged; in `block` mode
+the page text is replaced with the warning. Jev errors fail open, and the mode
+is configurable in Settings.
 
 Approvals gate execution. With `requireApproval` on (default), the daemon emits
 `approval.request` and waits; the app shows a card with the exact command and
 Approve/Deny buttons. Denied actions never run and the model is told the user
 denied it. `OPENBOT_REQUIRE_APPROVAL=false` runs tools without asking, which is
-useful for trusted local experimentation. There is no per-tool policy engine or
-approvals inbox yet.
+useful for trusted local experimentation.
+
+**Approvals policy.** The policy engine decides `auto` / `ask` / `deny` for
+every tool call: all matching rules apply and the strictest wins (tool,
+computer scope, and an argument regex over the command, path, URL host, or
+text), then the per-tool tier, then the default tier (which can inherit the
+global switch). Deny is absolute: a task grant pre-approves ask-tier tools —
+approving the brief is the user's authorization for that work — but can never
+widen a deny, and This Mac tools ask unless a mac-scoped rule allows them.
+Built-in rules deny recursive deletes of `/` and home and raw disk writes, and
+ask for `sudo` and piping a download into a shell. A blocked call returns
+`Blocked by the approvals policy: <reason>` to the model instead of asking.
+
+Named **presets** (balanced, read-only, trusted, locked) are one-click starting
+points that always keep the built-in deny rules. Each role can carry a
+**role policy** (`bots.policy`): a preset that can only make things stricter
+than the global policy, since tool tiers take the stricter of the two, rules
+accumulate, and timeouts take the shorter. **Egress** adds an allowlist for
+browser navigation: with mode `ask` or `deny`, a host outside the list is
+asked for or blocked, and subdomains of an entry count as allowed. Egress
+currently covers the browser tools only; shell egress is not parsed.
+
+Every request and decision is persisted with its tier, reason, and who decided
+(`user`, `timeout`, `abort`); unanswered requests auto-deny after the
+configured timeout; and the Approvals panel shows pending plus history with a
+policy editor for tiers, timeout, rules, egress, and presets.
 
 **Local computers (This Mac).** An agent can be created with `computer: "mac"`
 ("This Mac" in the create-agent modal) instead of the default Firecracker
@@ -402,7 +735,7 @@ microVM. Constraints, all enforced in `local-computer.ts` and `tools.ts`:
 - `shell` runs `bash -lc` as the logged-in user with
   `<dataDir>/workspaces/<botId>` as the default working directory (created on
   demand). Any `cwd` inside the workspace is allowed; the timeout is capped at
-  120 s and output at 30,000 characters, matching the sandbox path.
+  300 s and output at 30,000 characters, matching the sandbox path.
 - `read_file` and `write_file` resolve paths inside that workspace only;
   paths that escape it (including symlink escapes) are rejected. They are
   implemented as shell commands on the host rather than direct file I/O.
@@ -412,7 +745,14 @@ microVM. Constraints, all enforced in `local-computer.ts` and `tools.ts`:
 - The Codex harness refuses to run against a This Mac agent.
 
 The chat header's computer pill switches an existing agent between Firecracker
-and This Mac (`bots.update` → `bot.updated`).
+and This Mac (`bots.update` → `bot.updated`). The gear on a sidebar row opens
+the **agent settings modal** (`apps/mac/src/components/AgentSettingsModal.tsx`):
+it edits name, role, icon, and color, carries the same computer switch, and
+adds a microVM power switch (`bots.power` → `sandbox.stop`/`ensure`, with
+`sandbox.state` streaming stopped → booting → running back to the UI). Opening
+the modal asks the daemon for the live computer state (`sandbox.status`).
+Start fresh and Delete live in the modal's danger zone, each behind a
+confirmation dialog.
 
 ### Protocol
 
@@ -422,24 +762,40 @@ Client to server:
 - `chat.send` — `{ botId, threadId?, text, model? }`
 - `chat.cancel` — `{ runId }`
 - `thread.list`, `thread.messages`
-- `bots.create`, `bots.update`, `bots.delete`
+- `bots.create`, `bots.update` (name, role, avatar, color, computer),
+  `bots.delete`, `bots.reset`, `bots.power`, `sandbox.status`
 - `provider.upsert`, `provider.remove`, `provider.fetchModels`
-- `settings.update` — default model, approval toggle, harness
+- `settings.update` — default model, approval toggle, harness, compaction,
+  decision-model settings (enabled, base URL, model, key or env var, audit,
+  browse, guardrail, timeout)
 - `approval.respond`
+- `challenge.respond`
+- `task.cancel` — `{ taskId }`, aborts the task's worker run
 
 Server to client:
 
-- `hello` — snapshot: agents, threads, providers, presets, default model,
-  approval setting, harness, Codex info
+- `hello` — snapshot: bots, threads, tasks, providers, presets, default model,
+  approval setting, harness, decision-model info, Codex info
 - `threads`, `thread.messages`, `thread.upserted`
-- `chat.start`, `chat.delta`, `chat.reasoning`, `chat.done`, `chat.error`,
-  `chat.compaction` — the app receives reasoning deltas but hides them by
-  default; the typing bubble is the only thinking signal
+- `chat.start`, `chat.delta`, `chat.reasoning`, `chat.done`, `chat.message`,
+  `chat.error`, `chat.compaction` — streaming text and live reasoning deltas
+  (rendered in the expanded work group while a run is active; reasoning is not
+  persisted); `chat.message` appends a persisted step message mid-run
+- `chat.decision` — one Jev evaluation (audit, browse step, or guardrail
+  screen) with its summary, latency, model, and whether it flagged something;
+  the app renders these in the per-turn work group
 - `tool.start`, `tool.result` — live tool activity for the transcript cards
+- `tool.output` — a stdout/stderr chunk streamed while a tool runs; the app
+  appends it to the running card so shell commands show their terminal output
+  live instead of only when they finish
 - `approval.request` — asks the user to approve a tool action
+- `challenge.request` — pauses the run on a bot check until the user retries or
+  skips it
 - `sandbox.state` — agent computer state (stopped, booting, running, error)
-- `bot.created`, `bot.updated`, `bot.deleted`, `providers.updated`,
+- `bot.created`, `bot.updated`, `bot.deleted`, `bot.reset`, `providers.updated`,
   `provider.models`
+- `task.upserted` — a task row changed (status, result, budget, error); the
+  workboard renders from these, not from chat messages
 
 Every message is defined once in `packages/protocol` with Zod and validated on
 both sides.
@@ -448,18 +804,40 @@ both sides.
 
 ```
 bots       id, name, system_prompt, provider, model, created_at,
-           role, avatar, color, computer
+           role, avatar, color, computer, kind, delegates
+           (kind: lead | role | project; a project is a persistent manager)
 threads    id, bot_id, title, created_at, updated_at,
            last_compacted_at, compaction_count
 messages   id, thread_id, role, content, provider, model, created_at,
            tool_calls, input_tokens, output_tokens, compaction, folded_at
+tasks      id, lead_id, role_id, project_id, thread_id, parent_id, depth,
+           title, brief, status, display, grant, budget, usage, result,
+           evidence, error, created_at, started_at, ended_at
 providers  id, label, base_url, api_key, api_key_env, models, enabled,
            created_at, updated_at
 settings   key, value
 ```
 
-Planned additions: `runs` (journal), `routines`, `memory`, `approvals`,
-`secrets` (references only; values would move to the macOS Keychain).
+`bots.kind` is `lead` or `role` (legacy rows migrate to `role`). A task's
+`thread_id` points at a thread owned by the role bot: the worker's step
+transcript, tool calls, and artifacts live there, and the task detail view
+reads it through the existing `thread.messages` path. `grant` and `budget` are
+JSON; `evidence` is a rendered ledger reference, not a copy of the raw pages.
+
+```
+approvals     id, request_id, run_id, thread_id, bot_id, task_id, project_id,
+              tool, arguments, tier, reason, decision, decided_by,
+              requested_at, decided_at
+memories      id, scope, type, content, evidence, confidence, importance,
+              status, source, embedding, embedding_model, embedding_dims,
+              created_at, updated_at, last_used_at, use_count
+soul_versions id, bot_id, version, content, summary, reason, source,
+              created_at
+```
+
+`memories` also has an FTS5 companion table (`memories_fts`) kept in sync on
+write. Planned additions: `runs` (journal), `routines`, `approvals`, `secrets`
+(references only; values would move to the macOS Keychain).
 
 ## Security model
 
@@ -472,6 +850,11 @@ Planned additions: `runs` (journal), `routines`, `memory`, `approvals`,
 - Provider keys live in the SQLite database (`0600` file in a `0700` directory)
   or in environment variables referenced by name. The macOS Keychain is
   planned, not implemented. Keys are never logged.
+- Jev is off unless enabled (a `TYPESAFE_API_KEY` env var turns it on). When it
+  is on, page text, answer drafts, and tool observations are sent to the
+  configured TypeSafe endpoint; its key is stored exactly like provider keys.
+  The guardrail screens untrusted page text before it reaches the model, and
+  every Jev path fails open to the local model behavior.
 - Firecracker microVMs isolate shell and file execution for cloud models.
 - Chromium runs under a dedicated per-agent Linux account with Chromium's
   namespace sandbox enabled in the shared outer Lima VM. Profiles and runtime
@@ -479,8 +862,13 @@ Planned additions: `runs` (journal), `routines`, `memory`, `approvals`,
   Lima remains the outer containment boundary for browser compromise.
 - This Mac agents run as the user. The only boundary is the workspace path
   check for file tools plus mandatory approvals for every action.
+- Worker tasks are intended to run under a **grant** approved once at spawn
+  (role, tools, display, budget), with escalation for out-of-scope actions, so
+  a fan-out cannot flood the user with per-action approval cards. Until grants
+  land (M4 phase 2), workers inherit the global approval setting and their
+  approvals surface in the workboard.
 - There are no per-bot egress allowlists and no snapshots before risky
-  operations yet.
+  operations yet. Both matter more once the lead fans out unattended tasks.
 
 ## Milestones
 
@@ -490,8 +878,8 @@ Planned additions: `runs` (journal), `routines`, `memory`, `approvals`,
 | M1 | Lima + Firecracker host, one agent VM, guest agent, shell/file tools, approvals | Done except snapshots and egress policy |
 | M2 | Browser automation, persistent sign-ins, live screen view | Browser automation, screenshots, and live noVNC desktop done; sign-in polish pending |
 | M3 | Codex provider with ChatGPT sign-in | Optional Codex harness + responses bridge implemented; bridge verified end to end with a real non-OpenAI provider; ChatGPT subscription flow not verified end to end; SDK provider planned |
-| M4 | Multi-agent messaging, group chats, handoffs, memory | Planned |
-| M5 | Routines: record, replay, schedule | Planned |
+| M4 | Lead/worker runtime: one lead, ephemeral workers, workboard, task grants, memory + soul | In progress |
+| M5 | Routines: scheduled spawns, procedural memory, replay | Planned |
 | M6 | Mobile thin client over Tailscale | Planned |
 
 ## Decisions
@@ -560,8 +948,9 @@ not a completion signal. Browser navigation returns page evidence in the same
 action and the model continues until it chooses to answer. Cancellation,
 per-operation timeouts, and honest failure recovery contain real failures. The
 default system prompt is a small general contract about completing the request,
-binding facts to their evidence, separating verification from inference, and
-returning the useful result to chat.
+finding things the way a person would (search bars, menus, links, category
+pages, sitemaps), binding facts to their evidence, separating verification from
+inference, and returning the useful result to chat.
 
 **ADR-013: Verify browser-backed answers against an evidence ledger.** Prompt
 instructions alone do not prevent a weaker model from combining a price from
@@ -572,6 +961,136 @@ completion audit, and returns gaps to the executor until it can either support
 the claim or label it unknown. The verifier is intentionally separate from the
 compact general system prompt so research-specific quality control does not grow
 that prompt into a catalog of situations.
+
+**ADR-014 amendment: Jev routes the lead's requests.** Routing — is this
+conversation, direct work, an existing project, or a new one — is a decision,
+not generation, so it belongs to Jev. Before a lead turn, the daemon sends the
+user's message plus a compact project index and asks two questions:
+`needs_work` (noul) and `route` (choice over direct, a new project, and each
+existing project). A confident conversation answer drops tools for the turn; a
+confident project answer injects a routing hint, and the lead still composes
+the request because the brief is its job. When Jev is off, unavailable, or
+unsure, the model decides exactly as before, so routing is fail-open like every
+other Jev path. Rejected: letting the model pick projects unaided (it misroutes
+and burns a tool round trip), and auto-calling `ask_project` without the lead
+(the brief is the lead's job).
+
+**ADR-014: Use Jev (TypeSafe System One) for decisions, with the configured
+model as fallback.** The audit, link selection, and injection screening are
+judgments, not text generation. A decision model answers them as typed values
+with calibrated confidence in ~100–500 ms at negligible cost, where the same
+judgment as an LLM call costs seconds, tokens, and JSON-parsing failure modes.
+The integration is deliberately auxiliary and fail-open: Jev never writes user
+facing text, cannot type into forms, and every path — audit, browse, guardrail —
+falls back to the existing model behavior when Jev is disabled, unauthenticated,
+borderline, or erroring. Feature toggles and the per-call timeout live in
+Settings so the trade-off is visible and tunable, and the direct TypeSafe API is
+the only transport (no AI SDK dependency). Rejected: making Jev the primary
+model (it cannot chat or call tools), and auto-approving tool calls from a risk
+score (that changes the safety model; approvals stay human).
+
+**ADR-015: One lead, many ephemeral workers.** Grok Bot-style isolation gives
+every agent its own chat, computer, and (eventually) memory, which duplicates
+identity and makes cross-task awareness impossible. OpenBot instead has one
+durable identity that owns the conversation, the soul, and the memory, and
+spawns ephemeral workers for tasks. The lead's cognition is serialized (one run
+at a time) while workers run in parallel, so the lead never races itself;
+worker events queue in the lead's inbox and trigger a lead turn when it is idle.
+Workers are `tasks` rows with their own thread for the step transcript, not chat
+surfaces and not identities. Roles (the former agents) are reusable templates
+with a model, computer, and tool policy. Rejected: many full agents with their
+own chats and memory (duplication, no shared context); a separate orchestration
+service (needless moving part); workers sharing the lead's computer (loses the
+per-task isolation that makes fan-out safe).
+
+**ADR-015 amendment: one persistent manager per project, ephemeral sessions
+under it.** The hierarchy is the lead, then a project manager per topic, then
+worker sessions. A project manager is a persistent agent (`bots.kind =
+'project'`) with its own computer, its own thread with the lead, and the
+project's detailed context; the lead holds only the high-level project index
+and routes requests (`list_projects` → `ask_project`, or `create_project`
+first). A project manager is not a chat surface and has no soul of its own:
+the lead remains the only voice to the user and the only writer of user
+memory. Workers are sessions inside the project's computer — no VM of their
+own, no persistence, gone when the request ends — with a per-session workspace
+and a per-session browser so parallel work stays isolated. Requests to one
+project run one at a time; projects run in parallel. Envelopes are enforced in
+the orchestrator, not the prompt: a worker grant must be a subset of its
+request's grant, and budgets must fit inside the parent's remaining budget.
+Depth is capped at request → worker. Rejected: ephemeral managers (loses the
+project's context and forces a rebuild every time); per-task VMs for workers
+(~20s of boot per worker and no shared assets); managers as chat surfaces
+(recreates the many-agents problem); unlimited depth (cost and fidelity
+collapse).
+
+**ADR-016: Task grants and display-on-demand.** Approvals attach to the brief,
+not to each action: a task is approved once at spawn with a grant (role, tool
+capabilities, display, budget) and escalates only when it needs something
+outside it. This is what makes one-to-many workable — twenty per-action cards
+per fan-out is not a product. Display is a requested resource: workers are
+headless by default because headless Chromium still renders, screenshots, and
+returns page text; a browser view is always available for browser work; a full
+desktop stack is attached only when a task declares it, and x11vnc encodes only
+while someone is watching. Visibility is not optional for unattended runs:
+every task keeps an event trail and artifacts from day one, live watch and
+replay follow, and routine runs are watched by the lead and summarized to the
+user. Rejected: an always-on desktop per worker (idle encoding cost defeats
+cheap fan-out); invisible unattended runs (untrustworthy, undebuggable).
+
+**ADR-016 amendment: grants are the approval unit, and they attenuate.**
+Approving a spawn approves the brief and its grant together: the tool set, the
+display, and the budget. Inside the grant, a worker's tool calls run without
+per-action cards; anything outside the grant escalates as an approval request,
+and a denial returns to the model like any other denial. Budgets (wall clock,
+tool calls, tokens) are enforced by the harness, not the prompt; exceeding one
+fails the task with a clear error and the partial results preserved. A child
+grant must be a subset of its parent's grant, and the sum of a project's child
+budgets must fit inside its own remaining budget, so a manager can only
+allocate what it was given. Orchestration tools are envelope-constrained rather
+than approval-gated for a manager (its grant was approved when it was spawned)
+and approval-gated for the lead (approving the spawn is how the user authorizes
+the project). Local-Mac workers are exempt: their tools always ask, grant or
+not (ADR-010).
+
+**ADR-018: Policy is the ceiling, grants are the approval unit.** The global
+approval toggle was too coarse once agents started fanning out; users need
+per-tool tiers and argument-level rules without re-approving every call. The
+engine evaluates rules first, then the tool tier, then the default (which can
+inherit the global switch). Deny is absolute — a grant pre-approves ask-tier
+tools but can never widen a deny — and This Mac tools ask unless a mac-scoped
+rule says otherwise. Every request and decision is persisted with its tier,
+reason, and who decided; unanswered requests auto-deny on a configurable
+timeout; an inbox shows pending plus history so a fan-out cannot strand a run
+on an unseen card. Presets are one-click starting points that keep the built-in
+deny floor, and role policies narrow the global policy the same way grants
+narrow a task: a role can only be stricter. Egress allowlists gate browser
+navigation per host, with shell egress explicitly out of scope until a real
+network policy exists. Rejected: per-action risk scoring that auto-approves
+(approvals stay human) and policy in the prompt (the model must not be able to
+widen its own permissions).
+
+**ADR-017 amendment: memory and soul adapt automatically, but stay legible.**
+The user asked for memory and soul to change over time without being told to,
+so reflection is automatic: a background pass extracts durable memories from
+new conversations, and the soul is rewritten once enough new memories
+accumulate. The safety property is legibility rather than a manual gate —
+every soul version is kept with its reason, the Memory panel shows what the
+assistant believes with confidence and usage, and any memory or soul version
+can be deleted or reverted in one click. Project-scoped memory belongs to the
+project manager; user memory belongs to the lead.
+
+**ADR-017: One writer for memory, a versioned soul.** The lead is the only
+writer of durable memory; workers propose findings through task results and the
+lead commits them. Memory is typed (semantic, procedural, relational, episodic),
+carries provenance (task, observation, or user statement), confidence, and
+decay, and is reinforced when it proves useful. The soul is a bounded, versioned
+constitution — voice, commitments, relationship — that the lead may propose
+amending but only the user approves, so identity change is reviewable instead of
+silent. Retrieval happens at brief time as a bounded, ID'd slice; workers can
+ask for more. Completion audits may mark contradicted memories suspect instead
+of leaving them stale. Rejected: per-worker memory (duplication, conflicts);
+a static soul file (a costume that never develops); silent self-rewriting (no
+audit trail, alignment risk).
 
 ## Running it
 

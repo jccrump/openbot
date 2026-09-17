@@ -2,6 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import type {
   CodexInfo,
+  DecisionGuardrailMode,
+  DecisionInfo,
+  DecisionSettingsPatch,
   HarnessId,
   HarnessSettings,
   ModelRef,
@@ -12,6 +15,7 @@ import { HarnessLogo, ProviderLogo } from "./components/ProviderLogo";
 import type { DaemonStatus } from "./lib/daemon";
 import type { ThemePreference } from "./lib/useTheme";
 import type {
+  DecisionTestResult,
   FetchModelsResult,
   ModelOption,
   ProviderInput,
@@ -27,6 +31,7 @@ interface SettingsProps {
   defaultModel: ModelRef | null;
   requireApproval: boolean;
   harness: HarnessSettings;
+  decision: DecisionInfo | null;
   codex: CodexInfo | null;
   theme: ThemePreference;
   onThemeChange: (theme: ThemePreference) => void;
@@ -36,12 +41,14 @@ interface SettingsProps {
     defaultModel?: ModelRef;
     requireApproval?: boolean;
     harness?: { default: HarnessId };
+    decision?: DecisionSettingsPatch;
   }) => void;
   onFetchModels: (input: {
     providerId?: string;
     baseUrl: string;
     apiKey?: string;
   }) => Promise<FetchModelsResult>;
+  onTestDecision: () => Promise<DecisionTestResult>;
 }
 
 interface FormState {
@@ -53,7 +60,15 @@ interface FormState {
   modelsText: string;
 }
 
-type SectionId = "general" | "appearance" | "providers" | "harness";
+interface DecisionFormState {
+  baseUrl: string;
+  model: string;
+  apiKey: string;
+  apiKeyEnv: string;
+  timeoutMs: string;
+}
+
+type SectionId = "general" | "appearance" | "providers" | "harness" | "decision";
 
 const EMPTY_FORM: FormState = {
   label: "",
@@ -68,12 +83,22 @@ const SECTION_LABEL: Record<SectionId, string> = {
   appearance: "Appearance",
   providers: "Providers",
   harness: "Harness",
+  decision: "Decision model",
 };
 
 const THEME_OPTIONS: Array<{ value: ThemePreference; label: string }> = [
   { value: "system", label: "System" },
   { value: "light", label: "Light" },
   { value: "dark", label: "Dark" },
+];
+
+const GUARDRAIL_OPTIONS: Array<{
+  value: DecisionGuardrailMode;
+  label: string;
+}> = [
+  { value: "off", label: "Off" },
+  { value: "annotate", label: "Annotate" },
+  { value: "block", label: "Block" },
 ];
 
 const STATUS_TEXT: Record<DaemonStatus, string> = {
@@ -150,6 +175,19 @@ function HarnessIcon() {
   );
 }
 
+function DecisionIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path
+        d="M8.6 1.8 3.4 8.6h3.4l-.8 5.6 5.2-6.8H7.8z"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 function BackIcon() {
   return (
     <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -204,6 +242,7 @@ const NAV_ITEMS: Array<{
   { id: "appearance", label: "Appearance", icon: AppearanceIcon },
   { id: "providers", label: "Providers", icon: ProvidersIcon },
   { id: "harness", label: "Harness", icon: HarnessIcon },
+  { id: "decision", label: "Decision model", icon: DecisionIcon },
 ];
 
 export function Settings(props: SettingsProps) {
@@ -216,6 +255,13 @@ export function Settings(props: SettingsProps) {
     loading: boolean;
     error: string | null;
   }>({ loading: false, error: null });
+  const [decisionForm, setDecisionForm] =
+    useState<DecisionFormState | null>(null);
+  const [decisionSaved, setDecisionSaved] = useState(false);
+  const [decisionTest, setDecisionTest] = useState<{
+    testing: boolean;
+    result: DecisionTestResult | null;
+  }>({ testing: false, result: null });
   const searchRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -224,8 +270,30 @@ export function Settings(props: SettingsProps) {
       setSelectedId(null);
       setSearch("");
       setFetchState({ loading: false, error: null });
+      setDecisionForm(null);
     }
   }, [open]);
+
+  useEffect(() => {
+    if (!open || !props.decision) {
+      return;
+    }
+    setDecisionForm({
+      baseUrl: props.decision.baseUrl,
+      model: props.decision.model,
+      apiKey: "",
+      apiKeyEnv: props.decision.apiKeyEnv ?? "",
+      timeoutMs: String(props.decision.timeoutMs),
+    });
+  }, [open, props.decision]);
+
+  useEffect(() => {
+    if (!decisionSaved) {
+      return;
+    }
+    const timer = setTimeout(() => setDecisionSaved(false), 2_000);
+    return () => clearTimeout(timer);
+  }, [decisionSaved]);
 
   useEffect(() => {
     if (!open) {
@@ -341,6 +409,49 @@ export function Settings(props: SettingsProps) {
       models: provider.models,
       enabled: !provider.enabled,
     });
+  };
+
+  const saveDecision = () => {
+    if (!decisionForm || !decisionForm.baseUrl.trim() || !decisionForm.model.trim()) {
+      return;
+    }
+    const timeout = Number(decisionForm.timeoutMs);
+    props.onUpdateSettings({
+      decision: {
+        baseUrl: decisionForm.baseUrl.trim(),
+        model: decisionForm.model.trim(),
+        ...(decisionForm.apiKey.trim()
+          ? { apiKey: decisionForm.apiKey.trim() }
+          : {}),
+        apiKeyEnv: decisionForm.apiKeyEnv.trim(),
+        ...(Number.isFinite(timeout)
+          ? {
+              timeoutMs: Math.round(
+                Math.min(30_000, Math.max(500, timeout)),
+              ),
+            }
+          : {}),
+      },
+    });
+    setDecisionForm((current) =>
+      current ? { ...current, apiKey: "" } : current,
+    );
+    setDecisionSaved(true);
+    setDecisionTest({ testing: false, result: null });
+  };
+
+  const removeDecisionKey = () => {
+    props.onUpdateSettings({ decision: { apiKey: "" } });
+    setDecisionForm((current) =>
+      current ? { ...current, apiKey: "" } : current,
+    );
+    setDecisionTest({ testing: false, result: null });
+  };
+
+  const testDecision = async () => {
+    setDecisionTest({ testing: true, result: null });
+    const result = await props.onTestDecision();
+    setDecisionTest({ testing: false, result });
   };
 
   const removeSelected = () => {
@@ -806,6 +917,290 @@ export function Settings(props: SettingsProps) {
                   MCP. ChatGPT quota is only used with OpenAI/ChatGPT models;
                   other providers run through a local bridge with an isolated
                   Codex home.
+                </p>
+              </>
+            )}
+
+            {section === "decision" && (
+              <>
+                <section className="settings-card">
+                  <div className="settings-row">
+                    <span>Use Jev for fast decisions</span>
+                    <button
+                      role="switch"
+                      aria-checked={props.decision?.enabled ?? false}
+                      aria-label="Use Jev for fast decisions"
+                      className={`switch ${
+                        props.decision?.enabled ? "switch-on" : ""
+                      }`}
+                      onClick={() =>
+                        props.onUpdateSettings({
+                          decision: { enabled: !(props.decision?.enabled ?? false) },
+                        })
+                      }
+                    >
+                      <span className="switch-knob" />
+                    </button>
+                  </div>
+                  <p className="field-note">
+                    {props.decision?.hasApiKey
+                      ? "Authenticated · API key saved"
+                      : props.decision?.apiKeyEnv
+                        ? `Waiting on ${props.decision.apiKeyEnv}`
+                        : "No API key yet"}
+                    {" · "}
+                    TypeSafe System One (Jev) returns typed decisions in about
+                    100–500 ms. Page text, drafts, and tool context are sent to
+                    the configured endpoint.
+                  </p>
+                </section>
+
+                {decisionForm && (
+                  <section className="settings-detail">
+                    <div className="settings-detail-head">
+                      <h3>Connection</h3>
+                      <span className="settings-detail-url">
+                        {props.decision?.model ?? decisionForm.model}
+                      </span>
+                    </div>
+                    <form
+                      className="settings-detail-card"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        saveDecision();
+                      }}
+                    >
+                      <label className="field">
+                        <span>Base URL</span>
+                        <input
+                          value={decisionForm.baseUrl}
+                          onChange={(event) =>
+                            setDecisionForm({
+                              ...decisionForm,
+                              baseUrl: event.target.value,
+                            })
+                          }
+                          placeholder="https://api.typesafe.ai"
+                          spellCheck={false}
+                        />
+                      </label>
+                      <label className="field">
+                        <span>Model</span>
+                        <input
+                          value={decisionForm.model}
+                          onChange={(event) =>
+                            setDecisionForm({
+                              ...decisionForm,
+                              model: event.target.value,
+                            })
+                          }
+                          placeholder="jev-latest"
+                          spellCheck={false}
+                        />
+                      </label>
+                      <label className="field">
+                        <span>
+                          API key{" "}
+                          {props.decision?.hasApiKey && (
+                            <span className="badge badge-ok">saved</span>
+                          )}
+                        </span>
+                        <input
+                          type="password"
+                          value={decisionForm.apiKey}
+                          onChange={(event) =>
+                            setDecisionForm({
+                              ...decisionForm,
+                              apiKey: event.target.value,
+                            })
+                          }
+                          placeholder={
+                            props.decision?.hasApiKey
+                              ? "•••••••• key saved — type a new key to replace"
+                              : "typesafe key"
+                          }
+                          spellCheck={false}
+                        />
+                      </label>
+                      <label className="field">
+                        <span>Or environment variable</span>
+                        <input
+                          value={decisionForm.apiKeyEnv}
+                          onChange={(event) =>
+                            setDecisionForm({
+                              ...decisionForm,
+                              apiKeyEnv: event.target.value,
+                            })
+                          }
+                          placeholder="TYPESAFE_API_KEY"
+                          spellCheck={false}
+                        />
+                      </label>
+                      <label className="field">
+                        <span>Timeout (ms)</span>
+                        <input
+                          value={decisionForm.timeoutMs}
+                          onChange={(event) =>
+                            setDecisionForm({
+                              ...decisionForm,
+                              timeoutMs: event.target.value,
+                            })
+                          }
+                          placeholder="3000"
+                          spellCheck={false}
+                        />
+                      </label>
+                      <div className="form-actions">
+                        <button
+                          type="button"
+                          className="ghost-button"
+                          onClick={testDecision}
+                          disabled={decisionTest.testing}
+                        >
+                          {decisionTest.testing ? "Testing…" : "Test key"}
+                        </button>
+                        {props.decision?.hasApiKey && (
+                          <button
+                            type="button"
+                            className="ghost-button"
+                            onClick={removeDecisionKey}
+                          >
+                            Remove key
+                          </button>
+                        )}
+                        <span className="spacer" />
+                        <button
+                          type="submit"
+                          className="save-button"
+                          disabled={
+                            !decisionForm.baseUrl.trim() ||
+                            !decisionForm.model.trim()
+                          }
+                        >
+                          {decisionSaved ? "Saved" : "Save"}
+                        </button>
+                      </div>
+                      {decisionTest.result && (
+                        <p
+                          className={
+                            decisionTest.result.ok
+                              ? "field-note"
+                              : "form-error"
+                          }
+                        >
+                          {decisionTest.result.ok
+                            ? `Connected · ${decisionTest.result.model ?? decisionForm.model}${
+                                decisionTest.result.latencyMs !== null
+                                  ? ` · ${decisionTest.result.latencyMs} ms`
+                                  : ""
+                              }`
+                            : `Test failed: ${
+                                decisionTest.result.error ??
+                                "unknown error"
+                              }`}
+                        </p>
+                      )}
+                    </form>
+                  </section>
+                )}
+
+                <section className="settings-card">
+                  <div className="settings-row">
+                    <span>Route requests</span>
+                    <button
+                      role="switch"
+                      aria-checked={props.decision?.route ?? true}
+                      aria-label="Route requests"
+                      className={`switch ${
+                        props.decision?.route ?? true ? "switch-on" : ""
+                      }`}
+                      onClick={() =>
+                        props.onUpdateSettings({
+                          decision: { route: !(props.decision?.route ?? true) },
+                        })
+                      }
+                    >
+                      <span className="switch-knob" />
+                    </button>
+                  </div>
+                  <div className="settings-row">
+                    <span>Completion audit</span>
+                    <button
+                      role="switch"
+                      aria-checked={props.decision?.audit ?? true}
+                      aria-label="Completion audit"
+                      className={`switch ${
+                        props.decision?.audit ?? true ? "switch-on" : ""
+                      }`}
+                      onClick={() =>
+                        props.onUpdateSettings({
+                          decision: { audit: !(props.decision?.audit ?? true) },
+                        })
+                      }
+                    >
+                      <span className="switch-knob" />
+                    </button>
+                  </div>
+                  <div className="settings-row">
+                    <span>Browse loop</span>
+                    <button
+                      role="switch"
+                      aria-checked={props.decision?.browse ?? true}
+                      aria-label="Browse loop"
+                      className={`switch ${
+                        props.decision?.browse ?? true ? "switch-on" : ""
+                      }`}
+                      onClick={() =>
+                        props.onUpdateSettings({
+                          decision: {
+                            browse: !(props.decision?.browse ?? true),
+                          },
+                        })
+                      }
+                    >
+                      <span className="switch-knob" />
+                    </button>
+                  </div>
+                  <div className="settings-row">
+                    <span>Untrusted-content guardrail</span>
+                    <div
+                      className="segmented"
+                      role="radiogroup"
+                      aria-label="Untrusted-content guardrail"
+                    >
+                      {GUARDRAIL_OPTIONS.map((option) => {
+                        const selected =
+                          (props.decision?.guardrail ?? "annotate") ===
+                          option.value;
+                        return (
+                          <button
+                            key={option.value}
+                            role="radio"
+                            aria-checked={selected}
+                            className={`segmented-option ${
+                              selected ? "segmented-option-active" : ""
+                            }`}
+                            onClick={() =>
+                              props.onUpdateSettings({
+                                decision: { guardrail: option.value },
+                              })
+                            }
+                          >
+                            {option.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </section>
+
+                <p className="settings-empty">
+                  Jev drives the browse tool and screens page text for prompt
+                  injection. With the completion audit on, browser-backed
+                  drafts are verified before they are final — Jev when it is
+                  available, the model verifier otherwise — and rejected drafts
+                  are revised up to two times. With it off, answers stream
+                  straight to chat.
                 </p>
               </>
             )}

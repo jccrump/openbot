@@ -423,8 +423,7 @@ function extractOutputUrl(output) {
   return /^url:\s*(\S+)/m.exec(output)?.[1] || null;
 }
 
-function runContext(scenario, message) {
-  const toolCalls = message.toolCalls || [];
+function runContext(scenario, message, toolCalls) {
   const visitedPageIds = new Set();
   for (const call of toolCalls) {
     if (call.name !== "browser") continue;
@@ -523,9 +522,21 @@ async function evaluateRun(input) {
     .filter(({ message }) => message.runId === started.runId);
   let output;
   if (completed.type === "chat.done") {
-    const context = runContext(input.scenario, completed.message);
+    input.client.send({
+      type: "thread.messages",
+      threadId: started.threadId,
+    });
+    const history = await input.client.waitFor(
+      (message) =>
+        message.type === "thread.messages" &&
+        message.threadId === started.threadId,
+      15_000,
+    );
+    const toolCalls = history.messages.flatMap(
+      (message) => message.toolCalls || [],
+    );
+    const context = runContext(input.scenario, completed.message, toolCalls);
     const grade = input.scenario.grade(context);
-    const toolCalls = completed.message.toolCalls || [];
     output = {
       scenarioId: input.scenario.id,
       scenarioTitle: input.scenario.title,

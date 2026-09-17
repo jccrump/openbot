@@ -1,16 +1,28 @@
 import { z } from "zod";
 import {
+  ApprovalDecisionSchema,
+  ApprovalRecordSchema,
+  ApprovalTierSchema,
   BotSchema,
   CodexInfoSchema,
   CompactionSettingsSchema,
   CompactionTriggerSchema,
   ComputerKindSchema,
+  DecisionInfoSchema,
+  DecisionSettingsPatchSchema,
   HarnessIdSchema,
   HarnessSettingsSchema,
+  MemorySchema,
+  MemoryStatusSchema,
   MessageSchema,
   ModelRefSchema,
+  PolicyPresetIdSchema,
+  PolicySettingsSchema,
   ProviderInfoSchema,
+  RolePolicySchema,
   ProviderPresetSchema,
+  SoulVersionSchema,
+  TaskSchema,
   ThreadSchema,
   ToolArtifactSchema,
 } from "./domain";
@@ -29,15 +41,38 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     color: z.string().optional(),
     model: ModelRefSchema.optional(),
     computer: ComputerKindSchema.optional(),
+    delegates: z.boolean().optional(),
+    policy: RolePolicySchema.optional(),
   }),
   z.object({
     type: z.literal("bots.update"),
     requestId: z.string(),
     botId: z.string(),
+    name: z.string().min(1).optional(),
+    role: z.string().nullable().optional(),
+    avatar: z.string().nullable().optional(),
+    color: z.string().nullable().optional(),
     computer: ComputerKindSchema.optional(),
+    delegates: z.boolean().optional(),
+    policy: RolePolicySchema.optional(),
+  }),
+  z.object({
+    type: z.literal("bots.power"),
+    requestId: z.string(),
+    botId: z.string(),
+    on: z.boolean(),
+  }),
+  z.object({
+    type: z.literal("sandbox.status"),
+    botId: z.string(),
   }),
   z.object({
     type: z.literal("bots.delete"),
+    requestId: z.string(),
+    botId: z.string(),
+  }),
+  z.object({
+    type: z.literal("bots.reset"),
     requestId: z.string(),
     botId: z.string(),
   }),
@@ -53,6 +88,10 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     runId: z.string(),
   }),
   z.object({
+    type: z.literal("task.cancel"),
+    taskId: z.string(),
+  }),
+  z.object({
     type: z.literal("thread.list"),
   }),
   z.object({
@@ -63,6 +102,11 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("approval.respond"),
     requestId: z.string(),
     decision: z.enum(["approve", "deny"]),
+  }),
+  z.object({
+    type: z.literal("challenge.respond"),
+    requestId: z.string(),
+    action: z.enum(["retry", "skip"]),
   }),
   z.object({
     type: z.literal("provider.upsert"),
@@ -92,6 +136,8 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     settings: z.object({
       defaultModel: ModelRefSchema.optional(),
       requireApproval: z.boolean().optional(),
+      policy: PolicySettingsSchema.optional(),
+      policyPreset: PolicyPresetIdSchema.optional(),
       compaction: z
         .object({
           enabled: z.boolean().optional(),
@@ -109,7 +155,38 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
           default: HarnessIdSchema.optional(),
         })
         .optional(),
-      }),
+      decision: DecisionSettingsPatchSchema.optional(),
+    }),
+  }),
+  z.object({
+    type: z.literal("decision.test"),
+    requestId: z.string(),
+  }),
+  z.object({
+    type: z.literal("approvals.list"),
+    limit: z.number().int().min(1).max(500).optional(),
+  }),
+  z.object({
+    type: z.literal("memory.list"),
+    scope: z.string().optional(),
+    status: MemoryStatusSchema.optional(),
+    limit: z.number().int().min(1).max(1000).optional(),
+  }),
+  z.object({
+    type: z.literal("memory.remove"),
+    id: z.string(),
+  }),
+  z.object({
+    type: z.literal("memory.consolidate"),
+  }),
+  z.object({
+    type: z.literal("soul.get"),
+    botId: z.string().optional(),
+  }),
+  z.object({
+    type: z.literal("soul.revert"),
+    botId: z.string().optional(),
+    versionId: z.string(),
   }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessageSchema>;
@@ -119,12 +196,15 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("hello"),
     bots: z.array(BotSchema),
     threads: z.array(ThreadSchema),
+    tasks: z.array(TaskSchema).optional(),
     providers: z.array(ProviderInfoSchema),
     presets: z.array(ProviderPresetSchema),
     defaultModel: ModelRefSchema,
     requireApproval: z.boolean(),
+    policy: PolicySettingsSchema.optional(),
     compaction: CompactionSettingsSchema.optional(),
     harness: HarnessSettingsSchema.optional(),
+    decision: DecisionInfoSchema.optional(),
     codex: CodexInfoSchema.optional(),
   }),
   z.object({
@@ -143,12 +223,20 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     botId: z.string(),
   }),
   z.object({
+    type: z.literal("bot.reset"),
+    requestId: z.string(),
+    botId: z.string(),
+    thread: ThreadSchema,
+  }),
+  z.object({
     type: z.literal("providers.updated"),
     providers: z.array(ProviderInfoSchema),
     defaultModel: ModelRefSchema,
     requireApproval: z.boolean(),
+    policy: PolicySettingsSchema.optional(),
     compaction: CompactionSettingsSchema.optional(),
     harness: HarnessSettingsSchema.optional(),
+    decision: DecisionInfoSchema.optional(),
     codex: CodexInfoSchema.optional(),
   }),
   z.object({
@@ -156,6 +244,14 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     requestId: z.string(),
     ok: z.boolean(),
     models: z.array(z.string()),
+    error: z.string().nullable(),
+  }),
+  z.object({
+    type: z.literal("decision.test"),
+    requestId: z.string(),
+    ok: z.boolean(),
+    model: z.string().nullable(),
+    latencyMs: z.number().nullable(),
     error: z.string().nullable(),
   }),
   z.object({
@@ -183,6 +279,7 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     threadId: z.string(),
     messageId: z.string(),
     text: z.string(),
+    reset: z.boolean().optional(),
   }),
   z.object({
     type: z.literal("chat.reasoning"),
@@ -190,6 +287,17 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     threadId: z.string(),
     messageId: z.string(),
     text: z.string(),
+  }),
+  z.object({
+    type: z.literal("chat.decision"),
+    runId: z.string(),
+    threadId: z.string(),
+    messageId: z.string(),
+    kind: z.enum(["audit", "browse", "route", "guardrail"]),
+    summary: z.string(),
+    flagged: z.boolean(),
+    latencyMs: z.number().nullable(),
+    model: z.string().nullable(),
   }),
   z.object({
     type: z.literal("chat.compaction"),
@@ -206,6 +314,12 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("chat.done"),
+    runId: z.string(),
+    threadId: z.string(),
+    message: MessageSchema,
+  }),
+  z.object({
+    type: z.literal("chat.message"),
     runId: z.string(),
     threadId: z.string(),
     message: MessageSchema,
@@ -235,6 +349,14 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     artifacts: z.array(ToolArtifactSchema).nullable(),
   }),
   z.object({
+    type: z.literal("tool.output"),
+    runId: z.string(),
+    threadId: z.string(),
+    callId: z.string(),
+    stream: z.enum(["stdout", "stderr"]),
+    text: z.string(),
+  }),
+  z.object({
     type: z.literal("approval.request"),
     requestId: z.string(),
     runId: z.string(),
@@ -242,11 +364,55 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     callId: z.string(),
     name: z.string(),
     arguments: z.string(),
+    tier: ApprovalTierSchema,
+    reason: z.string(),
+  }),
+  z.object({
+    type: z.literal("challenge.request"),
+    requestId: z.string(),
+    runId: z.string(),
+    threadId: z.string(),
+    callId: z.string(),
+    url: z.string().nullable(),
   }),
   z.object({
     type: z.literal("sandbox.state"),
     botId: z.string(),
+    taskId: z.string().optional(),
     state: z.enum(["stopped", "booting", "running", "error"]),
+  }),
+  z.object({
+    type: z.literal("task.upserted"),
+    task: TaskSchema,
+  }),
+  z.object({
+    type: z.literal("approvals.list"),
+    approvals: z.array(ApprovalRecordSchema),
+  }),
+  z.object({
+    type: z.literal("approval.resolved"),
+    requestId: z.string(),
+    decision: ApprovalDecisionSchema,
+    reason: z.string(),
+  }),
+  z.object({
+    type: z.literal("memory.list"),
+    memories: z.array(MemorySchema),
+  }),
+  z.object({
+    type: z.literal("memory.removed"),
+    id: z.string(),
+  }),
+  z.object({
+    type: z.literal("memory.consolidated"),
+    archived: z.number(),
+    merged: z.number(),
+  }),
+  z.object({
+    type: z.literal("soul"),
+    botId: z.string(),
+    soul: SoulVersionSchema.nullable(),
+    versions: z.array(SoulVersionSchema),
   }),
 ]);
 export type ServerMessage = z.infer<typeof ServerMessageSchema>;

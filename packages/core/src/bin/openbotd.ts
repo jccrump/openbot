@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { providerPresetList } from "@openbot/gateway";
 import { HttpSandboxBackend } from "@openbot/sandbox";
 import { ApprovalBroker } from "../approvals";
+import { ChallengeBroker } from "../challenges";
 import { loadConfig } from "../config";
 import { openDatabase } from "../db";
 import { ProviderRegistry } from "../provider-registry";
@@ -22,7 +23,7 @@ for (const candidate of [
 const config = loadConfig();
 const db = openDatabase(config.dataDir);
 const store = new Store(db);
-store.ensureDefaultBot(config.defaultModel);
+store.ensureLeadBot(config.defaultModel);
 store.migrateLegacyPrompts();
 store.seedProviders(config.providers);
 if (!store.getSetting("defaultModel")) {
@@ -33,13 +34,15 @@ const registry = new ProviderRegistry();
 registry.reload(store.listProviders());
 
 const sandbox = new HttpSandboxBackend({ url: config.sandboxUrl });
-const approvals = new ApprovalBroker();
+const approvals = new ApprovalBroker({ store });
+const challenges = new ChallengeBroker();
 const daemon = createDaemon({
   config,
   store,
   registry,
   sandbox,
   approvals,
+  challenges,
   presets: providerPresetList(),
 });
 const { port } = await daemon.start();

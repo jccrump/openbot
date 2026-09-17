@@ -1,27 +1,41 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ReactNode } from "react";
 import type {
   Bot,
   ComputerKind,
   Message,
   ModelRef,
+  Task,
   Thread,
   ToolArtifact,
   ToolCallRecord,
 } from "@openbot/protocol";
 import { Settings } from "./Settings";
+import { AgentSettingsModal } from "./components/AgentSettingsModal";
+import { ApprovalsModal } from "./components/ApprovalsModal";
+import { Markdown } from "./components/Markdown";
+import { MemoryModal } from "./components/MemoryModal";
 import { PanelResizer } from "./components/PanelResizer";
 import { VncView, type VncState } from "./components/VncView";
+import {
+  AVATAR_COLORS,
+  COMPUTER_LABEL,
+  EMOJI_CHOICES,
+  avatarColor,
+  initialOf,
+} from "./lib/agentOptions";
 import { DAEMON_HTTP_URL } from "./lib/daemon";
 import { useTheme } from "./lib/useTheme";
 import {
   isProviderUsable,
   useDaemon,
   type CreateBotInput,
+  type DecisionActivity,
   type ModelOption,
   type PendingApproval,
+  type PendingChallenge,
   type SandboxState,
   type StreamingState,
+  type ToolActivity,
 } from "./lib/useDaemon";
 import "./App.css";
 
@@ -29,13 +43,6 @@ const STATUS_LABEL: Record<string, string> = {
   connected: "Daemon connected",
   connecting: "Connecting to daemon…",
   disconnected: "Daemon offline — run pnpm dev:daemon",
-};
-
-const COMPUTER_LABEL: Record<SandboxState, string> = {
-  stopped: "Computer off",
-  booting: "Booting computer…",
-  running: "Computer running",
-  error: "Computer error",
 };
 
 function isLocalBot(bot: Bot | null | undefined): boolean {
@@ -48,6 +55,15 @@ function computerLabel(bot: Bot | null, state: SandboxState): string {
 
 const SCREEN_PANEL_KEY = "openbot.screenPanel";
 const SCREEN_POLL_MS = 1500;
+const SCREEN_OFF_POLL_MS = 8_000;
+
+const TASK_STATUS_LABEL: Record<Task["status"], string> = {
+  queued: "Queued",
+  running: "Running",
+  done: "Done",
+  failed: "Failed",
+  cancelled: "Cancelled",
+};
 
 type ScreenStatus = "loading" | "live" | "vm-off" | "error";
 
@@ -59,46 +75,78 @@ function storedScreenPanelOpen(): boolean {
   }
 }
 
-const AVATAR_COLORS = [
-  "#1f8a65",
-  "#d97706",
-  "#7c3aed",
-  "#2563eb",
-  "#dc2626",
-  "#0891b2",
-];
+interface ToolArguments {
+  command?: string;
+  path?: string;
+  action?: string;
+  url?: string;
+  href?: string;
+  selector?: string;
+  text?: string;
+  keys?: string;
+  title?: string;
+  goal?: string;
+  startUrl?: string;
+  milliseconds?: number;
+  pixels?: number;
+  x?: number;
+  y?: number;
+  brief?: string;
+  roleId?: string;
+  grant?: {
+    tools?: string[];
+    budget?: {
+      wallClockMs?: number | null;
+      tokens?: number | null;
+      toolCalls?: number | null;
+    };
+  };
+  taskId?: string;
+}
 
-const EMOJI_CHOICES = [
-  "🤖",
-  "🧠",
-  "📈",
-  "🎨",
-  "🛠️",
-  "🔬",
-  "✍️",
-  "🚀",
-  "📣",
-  "🧭",
-  "⚙️",
-  "🦾",
-];
+const TOOL_LABEL: Record<string, string> = {
+  shell: "Ran",
+  read_file: "Read",
+  write_file: "Wrote",
+  browser: "Browsed",
+  browse: "Researched",
+  desktop: "Computer",
+  list_roles: "Checked the team",
+  spawn_worker: "Delegated",
+  worker_status: "Checked work",
+  cancel_worker: "Cancelled work",
+};
 
-function avatarColor(seed: string): string {
-  let hash = 0;
-  for (let index = 0; index < seed.length; index += 1) {
-    hash = (hash * 31 + seed.charCodeAt(index)) % 9973;
+function formatGrantDetail(grant: ToolArguments["grant"]): string | null {
+  if (!grant) {
+    return null;
   }
-  return AVATAR_COLORS[hash % AVATAR_COLORS.length] ?? "#1f8a65";
+  const parts: string[] = [];
+  if (grant.tools && grant.tools.length > 0) {
+    parts.push(`tools: ${grant.tools.join(", ")}`);
+  }
+  const budget = grant.budget;
+  if (budget) {
+    const limits: string[] = [];
+    if (budget.wallClockMs != null) {
+      limits.push(`${Math.round(budget.wallClockMs / 1000)}s`);
+    }
+    if (budget.toolCalls != null) {
+      limits.push(`${budget.toolCalls} calls`);
+    }
+    if (budget.tokens != null) {
+      limits.push(`${budget.tokens} tokens`);
+    }
+    if (limits.length > 0) {
+      parts.push(`budget: ${limits.join(", ")}`);
+    }
+  }
+  return parts.length > 0 ? parts.join(" · ") : null;
 }
 
-function initialOf(name: string): string {
-  return name.trim().charAt(0).toUpperCase() || "A";
-}
-
-function parseToolArguments(raw: string): { command?: string; path?: string } {
+function parseToolArguments(raw: string): ToolArguments {
   try {
-    const parsed = JSON.parse(raw) as { command?: string; path?: string };
-    return parsed;
+    return JSON.parse(raw) as ToolArguments;
   } catch {
     return {};
   }
@@ -106,9 +154,40 @@ function parseToolArguments(raw: string): { command?: string; path?: string } {
 
 function toolDetail(raw: string): string {
   const parsed = parseToolArguments(raw);
+  if (parsed.brief) {
+    const grant = formatGrantDetail(parsed.grant);
+    return grant
+      ? `Brief: ${parsed.brief}\nGrant — ${grant}`
+      : `Brief: ${parsed.brief}`;
+  }
+  if (parsed.taskId) return parsed.taskId;
   if (parsed.command) return parsed.command;
   if (parsed.path) return parsed.path;
+  if (parsed.goal) return parsed.goal;
+  if (parsed.action) {
+    const target =
+      parsed.url ??
+      parsed.href ??
+      parsed.selector ??
+      parsed.keys ??
+      parsed.title ??
+      parsed.text ??
+      parsed.startUrl ??
+      (parsed.milliseconds !== undefined
+        ? `${parsed.milliseconds} ms`
+        : undefined) ??
+      (parsed.pixels !== undefined ? `${parsed.pixels} px` : undefined) ??
+      (parsed.x !== undefined && parsed.y !== undefined
+        ? `${parsed.x}, ${parsed.y}`
+        : undefined);
+    return target ? `${parsed.action} ${target}` : parsed.action;
+  }
+  if (parsed.startUrl) return parsed.startUrl;
   return raw;
+}
+
+function toolLabel(name: string): string {
+  return TOOL_LABEL[name] ?? name;
 }
 
 function PlusIcon() {
@@ -212,6 +291,49 @@ function GearIcon() {
   );
 }
 
+function ShieldIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path
+        d="M8 1.8 13 3.6v4.2c0 3.1-2.1 5.4-5 6.4-2.9-1-5-3.3-5-6.4V3.6L8 1.8Z"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinejoin="round"
+      />
+      <path
+        d="m5.9 7.9 1.5 1.5 2.8-3"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function MemoryIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect
+        x="3.2"
+        y="3.2"
+        width="9.6"
+        height="9.6"
+        rx="2.4"
+        stroke="currentColor"
+        strokeWidth="1.4"
+      />
+      <path
+        d="M6.4 1.6v1.6M9.6 1.6v1.6M6.4 12.8v1.6M9.6 12.8v1.6M1.6 6.4h1.6M1.6 9.6h1.6M12.8 6.4h1.6M12.8 9.6h1.6"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+      />
+      <circle cx="8" cy="8" r="1.6" fill="currentColor" />
+    </svg>
+  );
+}
+
 function SidebarIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -265,87 +387,18 @@ function AgentAvatar({ bot, size = 30 }: { bot: Bot | null; size?: number }) {
   );
 }
 
-function Markdown({ text }: { text: string }) {
-  const blocks: ReactNode[] = [];
-  let list: string[] = [];
-  let key = 0;
-
-  const flush = () => {
-    if (list.length === 0) {
-      return;
-    }
-    const items = list;
-    list = [];
-    blocks.push(
-      <ul key={`ul-${key++}`}>
-        {items.map((item, index) => (
-          <li key={`li-${index}`}>{inline(item, `li-${key}-${index}`)}</li>
-        ))}
-      </ul>,
-    );
-  };
-
-  for (const line of text.split("\n")) {
-    const bullet = line.match(/^\s*[-*]\s+(.*)$/);
-    if (bullet && bullet[1]) {
-      list.push(bullet[1]);
-      continue;
-    }
-    flush();
-    if (!line.trim()) {
-      continue;
-    }
-    blocks.push(<p key={`p-${key++}`}>{inline(line, `p-${key}`)}</p>);
-  }
-  flush();
-
-  return <div className="markdown">{blocks}</div>;
-}
-
-function inline(text: string, keyPrefix: string): ReactNode[] {
-  const nodes: ReactNode[] = [];
-  const pattern = /(\*\*[^*]+\*\*|`[^`]+`)/g;
-  let last = 0;
-  let match: RegExpExecArray | null;
-  let index = 0;
-  while ((match = pattern.exec(text)) !== null) {
-    if (match.index > last) {
-      nodes.push(text.slice(last, match.index));
-    }
-    const token = match[0];
-    if (token.startsWith("**")) {
-      nodes.push(
-        <strong key={`${keyPrefix}-b-${index}`}>{token.slice(2, -2)}</strong>,
-      );
-    } else {
-      nodes.push(
-        <code key={`${keyPrefix}-c-${index}`}>{token.slice(1, -1)}</code>,
-      );
-    }
-    last = match.index + token.length;
-    index += 1;
-  }
-  if (last < text.length) {
-    nodes.push(text.slice(last));
-  }
-  return nodes;
-}
-
 export default function App() {
   const daemon = useDaemon();
   const { theme, setTheme } = useTheme();
   const [draft, setDraft] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const [approvalsOpen, setApprovalsOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [computerMenu, setComputerMenu] = useState<{
-    botId: string;
-    top: number;
-    left: number;
-    width: number;
-    confirmDelete?: boolean;
-  } | null>(null);
+  const [settingsBotId, setSettingsBotId] = useState<string | null>(null);
+  const [watchTaskId, setWatchTaskId] = useState<string | null>(null);
   const [screenOpen, setScreenOpen] = useState(storedScreenPanelOpen);
   const [screenPlaying, setScreenPlaying] = useState(true);
   const [screenExpanded, setScreenExpanded] = useState(false);
@@ -397,7 +450,8 @@ export default function App() {
     : "";
   const canStream = Boolean(bot) && !isLocalBot(bot);
   const vncLive = vncState === "live";
-  const vncActive = canStream && screenPlaying && screenOpen;
+  const vncActive =
+    canStream && screenPlaying && screenOpen && screenStatus !== "vm-off";
   const screenCaption = (() => {
     if (!bot) {
       return "No agent selected";
@@ -470,6 +524,14 @@ export default function App() {
     () => daemon.approvals.filter((item) => item.threadId === activeThreadId),
     [daemon.approvals, activeThreadId],
   );
+  const challenges = useMemo(
+    () => daemon.challenges.filter((item) => item.threadId === activeThreadId),
+    [daemon.challenges, activeThreadId],
+  );
+  const decisions = useMemo(
+    () => daemon.decisions.filter((item) => item.threadId === activeThreadId),
+    [daemon.decisions, activeThreadId],
+  );
   const streaming =
     daemon.streaming && daemon.streaming.threadId === activeThreadId
       ? daemon.streaming
@@ -485,12 +547,60 @@ export default function App() {
     return map;
   }, [daemon.threads]);
 
+  const settingsThread = settingsBotId
+    ? (threadByBot.get(settingsBotId) ?? null)
+    : null;
+  const settingsStreaming =
+    settingsThread !== null &&
+    daemon.streaming?.threadId === settingsThread.id;
+
   const query = search.trim().toLowerCase();
-  const visibleBots = query
-    ? daemon.bots.filter((item) =>
+  const leadBot = daemon.bots.find((item) => item.kind === "lead") ?? null;
+  const roles = daemon.bots.filter((item) => item.kind === "role");
+  const projects = daemon.bots.filter((item) => item.kind === "project");
+  const roleName = (roleId: string): string =>
+    daemon.bots.find((item) => item.id === roleId)?.name ?? "Unknown role";
+  const visibleRoles = query
+    ? roles.filter((item) =>
         `${item.name} ${item.role ?? ""}`.toLowerCase().includes(query),
       )
-    : daemon.bots;
+    : roles;
+  const visibleProjects = query
+    ? projects.filter((item) =>
+        `${item.name} ${item.role ?? ""}`.toLowerCase().includes(query),
+      )
+    : projects;
+  const visibleTasks = query
+    ? daemon.tasks.filter((task) =>
+        `${task.title} ${task.brief} ${roleName(task.roleId)}`
+          .toLowerCase()
+          .includes(query),
+      )
+    : daemon.tasks;
+  const activeTasks = visibleTasks.filter(
+    (task) => task.status === "queued" || task.status === "running",
+  );
+  const finishedTasks = visibleTasks.filter(
+    (task) => task.status !== "queued" && task.status !== "running",
+  );
+  const selectedTask =
+    daemon.tasks.find((task) => task.id === daemon.selectedTaskId) ?? null;
+  const taskThreadIds = useMemo(
+    () =>
+      new Set(
+        daemon.tasks
+          .map((task) => task.threadId)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    [daemon.tasks],
+  );
+  const workApprovals = useMemo(
+    () => daemon.approvals.filter((item) => taskThreadIds.has(item.threadId)),
+    [daemon.approvals, taskThreadIds],
+  );
+  const pendingApprovalCount = daemon.approvals.filter(
+    (approval) => !approval.decision,
+  ).length;
 
   useEffect(() => {
     setScreenImageUrl(null);
@@ -522,11 +632,12 @@ export default function App() {
     }
     let cancelled = false;
     let inFlight = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
     const controller = new AbortController();
 
-    const load = async () => {
+    const load = async (): Promise<boolean> => {
       if (inFlight || document.hidden) {
-        return;
+        return false;
       }
       inFlight = true;
       try {
@@ -535,47 +646,59 @@ export default function App() {
           { signal: controller.signal },
         );
         if (cancelled) {
-          return;
+          return false;
         }
         if (response.ok) {
           const blob = await response.blob();
           const capturedAt = response.headers.get("x-screen-captured-at");
           if (cancelled) {
-            return;
+            return false;
           }
           setScreenImageUrl(URL.createObjectURL(blob));
           setScreenUpdatedAt(capturedAt ? Date.parse(capturedAt) : Date.now());
           setScreenVmState("running");
           setScreenError(null);
           setScreenStatus("live");
-        } else {
-          const body = (await response.json().catch(() => null)) as {
-            error?: string;
-            state?: string;
-          } | null;
-          if (cancelled) {
-            return;
-          }
-          setScreenVmState(body?.state ?? null);
-          setScreenError(body?.error ?? `screen request failed (${response.status})`);
-          setScreenStatus(response.status === 409 ? "vm-off" : "error");
+          return false;
         }
+        const body = (await response.json().catch(() => null)) as {
+          error?: string;
+          state?: string;
+        } | null;
+        if (cancelled) {
+          return false;
+        }
+        setScreenVmState(body?.state ?? null);
+        setScreenError(body?.error ?? `screen request failed (${response.status})`);
+        setScreenStatus(response.status === 409 ? "vm-off" : "error");
+        return response.status === 409;
       } catch (error) {
         if (!cancelled && (error as Error).name !== "AbortError") {
           setScreenError((error as Error).message);
           setScreenStatus("error");
         }
+        return false;
       } finally {
         inFlight = false;
       }
     };
 
-    void load();
-    const timer = setInterval(() => void load(), SCREEN_POLL_MS);
+    // Poll fast while the VM is up, and back off while it is stopped so the
+    // panel does not hammer the daemon with 409s.
+    const loop = async () => {
+      const vmOff = await load();
+      if (cancelled) {
+        return;
+      }
+      timer = setTimeout(loop, vmOff ? SCREEN_OFF_POLL_MS : SCREEN_POLL_MS);
+    };
+    void loop();
     return () => {
       cancelled = true;
       controller.abort();
-      clearInterval(timer);
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
     };
   }, [screenOpen, screenPlaying, windowActive, bot, vncLive]);
 
@@ -630,8 +753,8 @@ export default function App() {
               </label>
               <button
                 className="icon-button"
-                title="New agent"
-                aria-label="New agent"
+                title="Hire a role"
+                aria-label="Hire a role"
                 onClick={() => setCreateOpen(true)}
               >
                 <PlusIcon />
@@ -641,32 +764,67 @@ export default function App() {
         </div>
 
         <div className="agent-list">
-          {visibleBots.map((item) => {
-            const thread = threadByBot.get(item.id);
-            const preview = thread?.lastMessage?.trim();
-            const subtitle =
-              [item.role, preview].filter(Boolean).join(" · ") ||
-              "No messages yet";
+          {leadBot && (
+            <div
+              role="button"
+              tabIndex={0}
+              className={`agent-row lead-row ${
+                leadBot.id === daemon.selectedBotId && !selectedTask
+                  ? "agent-row-selected"
+                  : ""
+              }`}
+              title={sidebarCollapsed ? leadBot.name : undefined}
+              onClick={() => daemon.selectBot(leadBot.id)}
+              onKeyDown={(event) => {
+                if (event.target !== event.currentTarget) {
+                  return;
+                }
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  daemon.selectBot(leadBot.id);
+                }
+              }}
+            >
+              <AgentAvatar bot={leadBot} />
+              {!sidebarCollapsed && (
+                <span className="agent-row-body">
+                  <span className="agent-row-name">{leadBot.name}</span>
+                  <span className="agent-row-sub">
+                    {threadByBot.get(leadBot.id)?.lastMessage?.trim() ||
+                      "Lead · your primary assistant"}
+                  </span>
+                </span>
+              )}
+              {!sidebarCollapsed && <span className="lead-badge">Lead</span>}
+            </div>
+          )}
+
+          {!sidebarCollapsed && visibleProjects.length > 0 && (
+            <div className="sidebar-section">
+              <span className="sidebar-section-title">Projects</span>
+            </div>
+          )}
+          {visibleProjects.map((item) => {
+            const activeRequest = daemon.tasks.find(
+              (task) =>
+                task.projectId === item.id &&
+                task.roleId === item.id &&
+                (task.status === "queued" || task.status === "running"),
+            );
             const state = daemon.sandboxStates[item.id] ?? "stopped";
             return (
               <div
                 key={item.id}
                 role="button"
                 tabIndex={0}
-                className={`agent-row ${
-                  item.id === daemon.selectedBotId ? "agent-row-selected" : ""
+                className={`agent-row project-row ${
+                  item.id === daemon.selectedBotId && !selectedTask
+                    ? "agent-row-selected"
+                    : ""
                 }`}
-                title={sidebarCollapsed ? item.name : undefined}
+                title={sidebarCollapsed ? item.name : (item.role ?? undefined)}
                 onClick={() => daemon.selectBot(item.id)}
                 onKeyDown={(event) => {
-                  if (
-                    event.key === "Escape" &&
-                    computerMenu?.botId === item.id
-                  ) {
-                    event.preventDefault();
-                    setComputerMenu(null);
-                    return;
-                  }
                   if (event.target !== event.currentTarget) {
                     return;
                   }
@@ -680,36 +838,97 @@ export default function App() {
                 {!sidebarCollapsed && (
                   <span className="agent-row-body">
                     <span className="agent-row-name">{item.name}</span>
-                    <span className="agent-row-sub">{subtitle}</span>
+                    <span className="agent-row-sub">
+                      {activeRequest
+                        ? activeRequest.title
+                        : item.role?.trim() || "Project"}
+                    </span>
+                  </span>
+                )}
+                {!sidebarCollapsed && activeRequest && (
+                  <span className="task-count" title="Active request">
+                    1
+                  </span>
+                )}
+                {!sidebarCollapsed && (
+                  <span
+                    className={`status-dot ${
+                      isLocalBot(item) ? "status-local" : `status-${state}`
+                    }`}
+                    title={computerLabel(item, state)}
+                  />
+                )}
+              </div>
+            );
+          })}
+
+          {!sidebarCollapsed && visibleRoles.length > 0 && (
+            <div className="sidebar-section">
+              <span className="sidebar-section-title">Team</span>
+            </div>
+          )}
+          {visibleRoles.map((item) => {
+            const activeCount = daemon.tasks.filter(
+              (task) =>
+                task.roleId === item.id &&
+                (task.status === "queued" || task.status === "running"),
+            ).length;
+            const state = daemon.sandboxStates[item.id] ?? "stopped";
+            return (
+              <div
+                key={item.id}
+                role="button"
+                tabIndex={0}
+                className={`agent-row role-row ${
+                  item.id === daemon.selectedBotId && !selectedTask
+                    ? "agent-row-selected"
+                    : ""
+                }`}
+                title={sidebarCollapsed ? item.name : undefined}
+                onClick={() => daemon.selectBot(item.id)}
+                onKeyDown={(event) => {
+                  if (event.target !== event.currentTarget) {
+                    return;
+                  }
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    daemon.selectBot(item.id);
+                  }
+                }}
+              >
+                <AgentAvatar bot={item} />
+                {!sidebarCollapsed && (
+                  <span className="agent-row-body">
+                    <span className="agent-row-name">{item.name}</span>
+                    <span className="agent-row-sub">
+                      {item.role?.trim() || "Team role"}
+                    </span>
+                  </span>
+                )}
+                {!sidebarCollapsed && activeCount > 0 && (
+                  <span
+                    className="task-count"
+                    title={`${activeCount} active task${activeCount === 1 ? "" : "s"}`}
+                  >
+                    {activeCount}
                   </span>
                 )}
                 {!sidebarCollapsed && (
                   <button
                     className="agent-settings-button"
-                    title="Computer settings"
-                    aria-label={`Computer settings for ${item.name}`}
-                    aria-haspopup="menu"
-                    aria-expanded={computerMenu?.botId === item.id}
+                    title="Role settings"
+                    aria-label={`Role settings for ${item.name}`}
+                    aria-haspopup="dialog"
+                    aria-expanded={settingsBotId === item.id}
                     onClick={(event) => {
                       event.stopPropagation();
                       if (item.id !== daemon.selectedBotId) {
                         daemon.selectBot(item.id);
                       }
-                      const row = event.currentTarget.closest(".agent-row");
-                      if (!row) {
-                        return;
+                      if (item.computer !== "mac") {
+                        daemon.refreshSandboxState(item.id);
                       }
-                      const rect = row.getBoundingClientRect();
-                      setComputerMenu((current) =>
-                        current?.botId === item.id
-                          ? null
-                          : {
-                              botId: item.id,
-                              top: rect.bottom + 6,
-                              left: rect.left,
-                              width: rect.width,
-                            },
-                      );
+                      setSettingsBotId(item.id);
                     }}
                   >
                     <GearIcon />
@@ -723,117 +942,56 @@ export default function App() {
                     title={computerLabel(item, state)}
                   />
                 )}
-                {!sidebarCollapsed && computerMenu?.botId === item.id && (
-                  <>
-                    <div
-                      className="computer-menu-backdrop"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        setComputerMenu(null);
-                      }}
-                    />
-                    <div
-                      className="computer-menu"
-                      role="menu"
-                      style={{
-                        top: computerMenu.top,
-                        left: computerMenu.left,
-                        width: computerMenu.width,
-                      }}
-                      onClick={(event) => event.stopPropagation()}
-                    >
-                      <button
-                        role="menuitemradio"
-                        aria-checked={!isLocalBot(item)}
-                        className={`computer-menu-item ${
-                          !isLocalBot(item) ? "computer-menu-item-active" : ""
-                        }`}
-                        onClick={() => {
-                          daemon.updateBotComputer(item.id, "firecracker");
-                          setComputerMenu(null);
-                        }}
-                      >
-                        <span>Firecracker microVM</span>
-                        <span className="computer-menu-sub">
-                          Isolated Linux computer
-                        </span>
-                      </button>
-                      <button
-                        role="menuitemradio"
-                        aria-checked={isLocalBot(item)}
-                        className={`computer-menu-item ${
-                          isLocalBot(item) ? "computer-menu-item-active" : ""
-                        }`}
-                        onClick={() => {
-                          daemon.updateBotComputer(item.id, "mac");
-                          setComputerMenu(null);
-                        }}
-                      >
-                        <span>This Mac</span>
-                        <span className="computer-menu-sub">
-                          Runs commands directly on this Mac
-                        </span>
-                      </button>
-                      <div className="computer-menu-separator" />
-                      {computerMenu.confirmDelete ? (
-                        <div className="computer-menu-confirm">
-                          <p className="computer-menu-confirm-text">
-                            Delete {item.name}? Its computer and chat history
-                            are removed.
-                          </p>
-                          <div className="computer-menu-confirm-actions">
-                            <button
-                              className="ghost-button"
-                              onClick={() =>
-                                setComputerMenu((current) =>
-                                  current
-                                    ? { ...current, confirmDelete: false }
-                                    : current,
-                                )
-                              }
-                            >
-                              Cancel
-                            </button>
-                            <button
-                              className="danger-button"
-                              onClick={() => {
-                                daemon.deleteBot(item.id);
-                                setComputerMenu(null);
-                              }}
-                            >
-                              Delete
-                            </button>
-                          </div>
-                        </div>
-                      ) : (
-                        <button
-                          role="menuitem"
-                          className="computer-menu-item computer-menu-item-danger"
-                          onClick={() =>
-                            setComputerMenu((current) =>
-                              current
-                                ? { ...current, confirmDelete: true }
-                                : current,
-                            )
-                          }
-                        >
-                          <span>Delete agent</span>
-                          <span className="computer-menu-sub">
-                            Removes its computer and chats
-                          </span>
-                        </button>
-                      )}
-                    </div>
-                  </>
-                )}
               </div>
             );
           })}
-          {!sidebarCollapsed && visibleBots.length === 0 && (
-            <p className="sidebar-empty">
-              {query ? "No agents match your search." : "No agents yet."}
-            </p>
+
+          {!sidebarCollapsed && visibleTasks.length > 0 && (
+            <div className="sidebar-section">
+              <span className="sidebar-section-title">Work</span>
+            </div>
           )}
+          {[...activeTasks, ...finishedTasks.slice(0, 8)].map((task) => (
+            <div
+              key={task.id}
+              role="button"
+              tabIndex={0}
+              className={`task-row ${
+                task.id === daemon.selectedTaskId ? "task-row-selected" : ""
+              }`}
+              title={sidebarCollapsed ? task.title : task.brief}
+              onClick={() => daemon.selectTask(task.id)}
+              onKeyDown={(event) => {
+                if (event.target !== event.currentTarget) {
+                  return;
+                }
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  daemon.selectTask(task.id);
+                }
+              }}
+            >
+              <span className={`task-dot task-dot-${task.status}`} />
+              {!sidebarCollapsed && (
+                <span className="agent-row-body">
+                  <span className="agent-row-name">{task.title}</span>
+                  <span className="agent-row-sub">
+                    {roleName(task.roleId)} · {TASK_STATUS_LABEL[task.status]}
+                  </span>
+                </span>
+              )}
+            </div>
+          ))}
+
+          {!sidebarCollapsed &&
+            visibleRoles.length === 0 &&
+            visibleTasks.length === 0 && (
+              <p className="sidebar-empty">
+                {query
+                  ? "No roles or tasks match your search."
+                  : "Hire a role to delegate work."}
+              </p>
+            )}
         </div>
 
         <div className="sidebar-footer">
@@ -870,6 +1028,29 @@ export default function App() {
             {!sidebarCollapsed && (
               <button
                 className="icon-button"
+                title="Approvals"
+                aria-label="Approvals"
+                onClick={() => setApprovalsOpen(true)}
+              >
+                <ShieldIcon />
+                {pendingApprovalCount > 0 && (
+                  <span className="icon-badge">{pendingApprovalCount}</span>
+                )}
+              </button>
+            )}
+            {!sidebarCollapsed && (
+              <button
+                className="icon-button"
+                title="Memory and soul"
+                aria-label="Memory and soul"
+                onClick={() => setMemoryOpen(true)}
+              >
+                <MemoryIcon />
+              </button>
+            )}
+            {!sidebarCollapsed && (
+              <button
+                className="icon-button"
                 title="Settings"
                 aria-label="Settings"
                 onClick={() => setSettingsOpen(true)}
@@ -888,6 +1069,31 @@ export default function App() {
       </aside>
 
       <main className="chat">
+        {selectedTask ? (
+          <TaskView
+            task={selectedTask}
+            roleNameFor={roleName}
+            childTasks={daemon.tasks.filter(
+              (task) => task.parentId === selectedTask.id,
+            )}
+            messages={daemon.messages}
+            decisions={decisions}
+            approvals={approvals}
+            activity={activity}
+            streaming={streaming}
+            computerState={daemon.sandboxStates[selectedTask.id] ?? null}
+            onCancel={daemon.cancelTask}
+            onBack={() => {
+              if (leadBot) {
+                daemon.selectBot(leadBot.id);
+              }
+            }}
+            onWatch={setWatchTaskId}
+            onSelectTask={daemon.selectTask}
+            onRespondApproval={daemon.respondToApproval}
+          />
+        ) : (
+          <>
         <header className="chat-header" data-tauri-drag-region>
           <div className="chat-title">
             <AgentAvatar bot={bot} size={26} />
@@ -923,6 +1129,38 @@ export default function App() {
           </div>
         </header>
 
+        {daemon.tasks.length > 0 && (
+          <div className="workboard">
+            <div className="workboard-row">
+              {[...activeTasks, ...finishedTasks.slice(0, 4)].map((task) => (
+                <button
+                  key={task.id}
+                  className={`task-chip task-chip-${task.status}`}
+                  title={task.brief}
+                  onClick={() => daemon.selectTask(task.id)}
+                >
+                  <span className={`task-dot task-dot-${task.status}`} />
+                  <span className="task-chip-title">{task.title}</span>
+                  <span className="task-chip-meta">
+                    {roleName(task.roleId)} · {TASK_STATUS_LABEL[task.status]}
+                  </span>
+                </button>
+              ))}
+            </div>
+            {workApprovals.length > 0 && (
+              <div className="workboard-approvals">
+                {workApprovals.map((approval) => (
+                  <ApprovalCard
+                    key={approval.requestId}
+                    approval={approval}
+                    onRespond={daemon.respondToApproval}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
         <div className="transcript" ref={scrollRef}>
           <div className="transcript-inner">
             {daemon.messages.length === 0 && !streaming && (
@@ -930,12 +1168,21 @@ export default function App() {
                 <span className="empty-mark" style={{ background: bot?.color ?? avatarColor(bot?.id ?? "assistant") }}>
                   {bot?.avatar ?? initialOf(botName)}
                 </span>
-                <h1>Hand off the work.</h1>
-                {hasUsableProvider ? (
+                <h1>
+                  {bot?.kind === "project"
+                    ? "No requests yet."
+                    : "Hand off the work."}
+                </h1>
+                {bot?.kind === "project" ? (
+                  <p>
+                    When the lead routes work to this project, the request and
+                    the manager's report appear here.
+                  </p>
+                ) : hasUsableProvider ? (
                   <p>
                     {isLocalBot(bot)
-                      ? "Give the bot a task. It can run commands directly on this Mac and come back with the result."
-                      : "Give the bot a task. It can run commands on its own Linux computer and come back with the result."}
+                      ? "Ask for what you need. The lead can run commands directly on this Mac or delegate to a team role."
+                      : "Ask for what you need. The lead can work on its own computer or delegate to a team role — workers run on their own computers and report back here."}
                   </p>
                 ) : (
                   <>
@@ -955,35 +1202,68 @@ export default function App() {
               </div>
             )}
 
-            {daemon.messages.map((message) => (
-              <MessageBubble key={message.id} message={message} />
-            ))}
+            {groupTranscript(daemon.messages, streaming !== null).map((entry) =>
+              entry.kind === "turn" ? (
+                <TurnBubble
+                  key={entry.final.id}
+                  entry={entry}
+                  decisions={decisions.filter(
+                    (decision) => decision.messageId === entry.final.id,
+                  )}
+                />
+              ) : (
+                <MessageBubble
+                  key={entry.message.id}
+                  message={entry.message}
+                  decisions={decisions.filter(
+                    (decision) => decision.messageId === entry.message.id,
+                  )}
+                />
+              ),
+            )}
 
-            {activity.map((item) => (
-              <ToolCard
-                key={item.callId}
-                name={item.name}
-                arguments={item.arguments}
-                status={item.status}
-                ok={item.ok}
-                output={item.output}
-                durationMs={item.durationMs}
-                artifacts={item.artifacts}
-              />
-            ))}
-
-            {approvals.map((approval) => (
-              <ApprovalCard
-                key={approval.requestId}
-                approval={approval}
-                onRespond={daemon.respondToApproval}
-              />
-            ))}
-
-            {streaming && <StreamingRow streaming={streaming} />}
+            {streaming && (() => {
+              const liveDecisions = decisions.filter(
+                (decision) => decision.messageId === streaming.messageId,
+              );
+              const hasWork =
+                activity.length > 0 ||
+                liveDecisions.length > 0 ||
+                approvals.length > 0;
+              return (
+                <div className="entry entry-assistant">
+                  {challenges.map((challenge) => (
+                    <ChallengeCard
+                      key={challenge.requestId}
+                      challenge={challenge}
+                      onRespond={daemon.respondToChallenge}
+                      onOpenScreen={() => setScreenOpen(true)}
+                    />
+                  ))}
+                  {hasWork && (
+                    <WorkGroup
+                      items={activity}
+                      decisions={liveDecisions}
+                      reasoning={streaming.reasoning}
+                      startedAt={streaming.startedAt}
+                      running
+                      approvals={approvals}
+                      onRespondApproval={daemon.respondToApproval}
+                    />
+                  )}
+                  <StreamingRow streaming={streaming} showTyping={!hasWork} />
+                </div>
+              );
+            })()}
           </div>
         </div>
 
+        {bot?.kind === "project" ? (
+          <div className="composer-note">
+            {bot.name} is a project manager. The lead routes requests to it —
+            ask the lead for changes.
+          </div>
+        ) : (
         <footer className="composer-wrap">
           <div className="composer">
             <span
@@ -1029,10 +1309,13 @@ export default function App() {
             )}
           </div>
         </footer>
+        )}
+          </>
+        )}
       </main>
 
-      <PanelResizer active={screenOpen} />
-      {screenOpen && (
+      <PanelResizer active={screenOpen && !selectedTask} />
+      {screenOpen && !selectedTask && (
         <aside className="screen-panel">
           <div className="screen-panel-bar">
             <span className="screen-panel-title">Computer</span>
@@ -1068,9 +1351,19 @@ export default function App() {
               className={`screen-frame ${
                 screenExpanded ? "screen-frame-expanded" : ""
               }`}
+              onClick={
+                canStream && !screenExpanded
+                  ? () => setScreenExpanded(true)
+                  : undefined
+              }
             >
               {canStream && (
-                <VncView url={vncUrl} active={vncActive} onState={setVncState} />
+                <VncView
+                  url={vncUrl}
+                  active={vncActive}
+                  interactive={screenExpanded}
+                  onState={setVncState}
+                />
               )}
               {!vncLive && (
                 <div className="screen-fallback">
@@ -1094,19 +1387,24 @@ export default function App() {
                   )}
                 </div>
               )}
-              {canStream && (
+              {canStream && !screenExpanded && (
+                <button
+                  className="screen-open"
+                  onClick={() => setScreenExpanded(true)}
+                >
+                  <ExpandIcon />
+                  <span>Open</span>
+                </button>
+              )}
+              {canStream && screenExpanded && (
                 <div className="screen-frame-actions">
                   <button
                     className="screen-action"
-                    title={screenExpanded ? "Collapse (Esc)" : "Expand"}
-                    aria-label={
-                      screenExpanded
-                        ? "Collapse desktop view"
-                        : "Expand desktop view"
-                    }
-                    onClick={() => setScreenExpanded((value) => !value)}
+                    title="Collapse (Esc)"
+                    aria-label="Collapse desktop view"
+                    onClick={() => setScreenExpanded(false)}
                   >
-                    {screenExpanded ? <CollapseIcon /> : <ExpandIcon />}
+                    <CollapseIcon />
                   </button>
                 </div>
               )}
@@ -1145,6 +1443,47 @@ export default function App() {
         </aside>
       )}
 
+      <ApprovalsModal
+        open={approvalsOpen}
+        onClose={() => setApprovalsOpen(false)}
+        records={daemon.approvalRecords}
+        pendingCount={pendingApprovalCount}
+        policy={daemon.policy}
+        requireApproval={daemon.requireApproval}
+        onLoad={() => daemon.loadApprovals()}
+        onRespond={daemon.respondToApproval}
+        onSavePolicy={({ requireApproval, policy }) =>
+          daemon.updateSettings({ requireApproval, policy })
+        }
+        onApplyPreset={(preset) => daemon.updateSettings({ policyPreset: preset })}
+      />
+
+      <MemoryModal
+        open={memoryOpen}
+        onClose={() => setMemoryOpen(false)}
+        memories={daemon.memories}
+        soul={daemon.soul}
+        soulVersions={daemon.soulVersions}
+        lastConsolidation={daemon.lastConsolidation}
+        onLoad={() => daemon.loadMemories()}
+        onRemove={daemon.removeMemory}
+        onConsolidate={daemon.consolidateMemories}
+        onLoadSoul={() => daemon.loadSoul()}
+        onRevertSoul={daemon.revertSoul}
+      />
+
+      {watchTaskId &&
+        (() => {
+          const watchTask =
+            daemon.tasks.find((task) => task.id === watchTaskId) ?? null;
+          return watchTask ? (
+            <TaskWatchOverlay
+              task={watchTask}
+              onClose={() => setWatchTaskId(null)}
+            />
+          ) : null;
+        })()}
+
       {daemon.error && (
         <div className="toast" role="alert">
           <span>{daemon.error}</span>
@@ -1162,6 +1501,45 @@ export default function App() {
         onCreate={daemon.createBot}
       />
 
+      <AgentSettingsModal
+        bot={
+          settingsBotId
+            ? (daemon.bots.find((item) => item.id === settingsBotId) ?? null)
+            : null
+        }
+        sandboxState={
+          settingsBotId ? (daemon.sandboxStates[settingsBotId] ?? "stopped") : "stopped"
+        }
+        streaming={settingsStreaming}
+        onClose={() => setSettingsBotId(null)}
+        onSave={(patch) => {
+          if (settingsBotId) {
+            daemon.updateBot(settingsBotId, patch);
+            if (patch.computer === "firecracker") {
+              daemon.refreshSandboxState(settingsBotId);
+            }
+          }
+          setSettingsBotId(null);
+        }}
+        onPower={(on) => {
+          if (settingsBotId) {
+            daemon.powerBot(settingsBotId, on);
+          }
+        }}
+        onReset={() => {
+          if (settingsBotId) {
+            daemon.resetBot(settingsBotId);
+          }
+          setSettingsBotId(null);
+        }}
+        onDelete={() => {
+          if (settingsBotId) {
+            daemon.deleteBot(settingsBotId);
+          }
+          setSettingsBotId(null);
+        }}
+      />
+
       <Settings
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
@@ -1172,6 +1550,7 @@ export default function App() {
         defaultModel={daemon.defaultModel}
         requireApproval={daemon.requireApproval}
         harness={daemon.harness}
+        decision={daemon.decision}
         codex={daemon.codex}
         theme={theme}
         onThemeChange={setTheme}
@@ -1179,12 +1558,19 @@ export default function App() {
         onRemoveProvider={daemon.removeProvider}
         onUpdateSettings={daemon.updateSettings}
         onFetchModels={daemon.fetchModels}
+        onTestDecision={daemon.testDecision}
       />
     </div>
   );
 }
 
-function MessageBubble({ message }: { message: Message }) {
+function MessageBubble({
+  message,
+  decisions,
+}: {
+  message: Message;
+  decisions?: DecisionActivity[];
+}) {
   const calls = message.toolCalls ?? [];
 
   if (message.id.startsWith("error-")) {
@@ -1219,18 +1605,22 @@ function MessageBubble({ message }: { message: Message }) {
 
   return (
     <div className="entry entry-assistant">
-      {calls.map((call: ToolCallRecord, index: number) => (
-        <ToolCard
-          key={`${call.id}-${index}`}
-          name={call.name}
-          arguments={call.arguments}
-          status="done"
-          ok={call.ok}
-          output={call.output}
-          durationMs={call.durationMs}
-          artifacts={call.artifacts}
+      {(calls.length > 0 || (decisions?.length ?? 0) > 0) && (
+        <WorkGroup
+          items={calls.map((call: ToolCallRecord) => ({
+            callId: call.id,
+            name: call.name,
+            arguments: call.arguments,
+            status: "done" as const,
+            ok: call.ok,
+            output: call.output,
+            durationMs: call.durationMs,
+            artifacts: call.artifacts,
+          }))}
+          decisions={decisions}
+          running={false}
         />
-      ))}
+      )}
       {message.content && (
         <div className="entry-body">
           <Markdown text={message.content} />
@@ -1240,7 +1630,321 @@ function MessageBubble({ message }: { message: Message }) {
   );
 }
 
-function ToolCard({
+type TranscriptEntry =
+  | { kind: "single"; message: Message }
+  | { kind: "turn"; work: Message[]; final: Message };
+
+function isWorkMessage(message: Message): boolean {
+  return (
+    message.role === "assistant" &&
+    !message.id.startsWith("error-") &&
+    !message.compaction
+  );
+}
+
+// A turn is one user request: its step messages and tool calls collapse under
+// a single work group once the final answer arrives. While the turn is still
+// streaming, its steps render individually so progress stays visible.
+function groupTranscript(messages: Message[], live: boolean): TranscriptEntry[] {
+  const entries: TranscriptEntry[] = [];
+  let work: Message[] = [];
+
+  const flush = (trailing: boolean) => {
+    if (work.length === 0) {
+      return;
+    }
+    if (work.length === 1 || (trailing && live)) {
+      for (const message of work) {
+        entries.push({ kind: "single", message });
+      }
+    } else {
+      entries.push({
+        kind: "turn",
+        work: work.slice(0, -1),
+        final: work[work.length - 1]!,
+      });
+    }
+    work = [];
+  };
+
+  for (const message of messages) {
+    if (isWorkMessage(message)) {
+      work.push(message);
+      continue;
+    }
+    flush(false);
+    entries.push({ kind: "single", message });
+  }
+  flush(true);
+  return entries;
+}
+
+function TurnBubble({
+  entry,
+  decisions,
+}: {
+  entry: { work: Message[]; final: Message };
+  decisions?: DecisionActivity[];
+}) {
+  const items: WorkItem[] = entry.work.flatMap((message) =>
+    (message.toolCalls ?? []).map((call) => ({
+      callId: call.id,
+      name: call.name,
+      arguments: call.arguments,
+      status: "done" as const,
+      ok: call.ok,
+      output: call.output,
+      durationMs: call.durationMs,
+      artifacts: call.artifacts,
+      at: Date.parse(message.createdAt),
+    })),
+  );
+  const narration: NarrationItem[] = entry.work
+    .filter((message) => message.content.trim().length > 0)
+    .map((message) => ({
+      id: message.id,
+      text: message.content,
+      at: Date.parse(message.createdAt),
+    }));
+
+  return (
+    <div className="entry entry-assistant">
+      <WorkGroup
+        items={items}
+        decisions={decisions}
+        narration={narration}
+        running={false}
+      />
+      {entry.final.content && (
+        <div className="entry-body">
+          <Markdown text={entry.final.content} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface WorkItem {
+  callId: string;
+  name: string;
+  arguments: string;
+  status: "running" | "done";
+  ok: boolean | null;
+  output: string | null;
+  durationMs: number | null;
+  artifacts: ToolArtifact[] | null;
+  at?: number;
+}
+
+interface NarrationItem {
+  id: string;
+  text: string;
+  at: number;
+}
+
+function formatElapsed(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+}
+
+function WorkGroup({
+  items,
+  decisions,
+  narration,
+  reasoning,
+  startedAt,
+  running,
+  approvals,
+  onRespondApproval,
+}: {
+  items: WorkItem[];
+  decisions?: DecisionActivity[];
+  narration?: NarrationItem[];
+  reasoning?: string;
+  startedAt?: number;
+  running: boolean;
+  approvals?: PendingApproval[];
+  onRespondApproval?: (requestId: string, decision: "approve" | "deny") => void;
+}) {
+  const pending = (approvals ?? []).filter((approval) => !approval.decision);
+  const [open, setOpen] = useState(pending.length > 0 || running);
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (pending.length > 0) {
+      setOpen(true);
+    }
+  }, [pending.length]);
+
+  useEffect(() => {
+    if (!running) {
+      return;
+    }
+    const timer = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(timer);
+  }, [running]);
+
+  const elapsed =
+    running && startedAt !== undefined ? Math.max(0, now - startedAt) : 0;
+  const failed = items.filter((item) => item.ok === false).length;
+  const approvalByCall = new Map(
+    (approvals ?? []).map((approval) => [approval.callId, approval]),
+  );
+  const trailingApprovals = (approvals ?? []).filter(
+    (approval) => !items.some((item) => item.callId === approval.callId),
+  );
+  const seenCalls = new Set<string>();
+  const uniqueItems = items.filter((item) => {
+    if (seenCalls.has(item.callId)) {
+      return false;
+    }
+    seenCalls.add(item.callId);
+    return true;
+  });
+  const timeline = [
+    ...uniqueItems.map((item) => ({
+      type: "tool" as const,
+      at: item.at ?? 0,
+      item,
+    })),
+    ...(narration ?? []).map((entry) => ({
+      type: "narration" as const,
+      at: entry.at,
+      narration: entry,
+    })),
+    ...(decisions ?? []).map((decision) => ({
+      type: "decision" as const,
+      at: decision.at,
+      decision,
+    })),
+  ].sort((a, b) => a.at - b.at);
+
+  return (
+    <div className="work-group">
+      <button
+        type="button"
+        className="work-group-head"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <span className={`work-group-chevron ${open ? "open" : ""}`}>
+          <ChevronIcon />
+        </span>
+        {running ? (
+          <span className="work-group-label">
+            Working
+            <span className="work-group-dots" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </span>
+          </span>
+        ) : (
+          <span className="work-group-label">Worked</span>
+        )}
+        <span className="work-group-meta">
+          {items.length > 0 &&
+            `${items.length} action${items.length === 1 ? "" : "s"}`}
+          {items.length > 0 && failed > 0 && (
+            <span className="work-group-failed"> · {failed} failed</span>
+          )}
+          {(decisions?.length ?? 0) > 0 &&
+            `${items.length > 0 ? " · " : ""}${decisions?.length} Jev decision${
+              decisions?.length === 1 ? "" : "s"
+            }`}
+          {running && elapsed > 0 && ` · ${formatElapsed(elapsed)}`}
+          {pending.length > 0 && (
+            <span className="work-group-approval"> · Approval needed</span>
+          )}
+        </span>
+      </button>
+      {open && (
+        <div className="work-group-body">
+          {reasoning && reasoning.trim().length > 0 && (
+            <details className="work-thinking">
+              <summary>
+                <span className="work-thinking-label">Thinking</span>
+                <span className="work-thinking-preview">
+                  {reasoning.trim().split("\n")[0]}
+                </span>
+              </summary>
+              <pre>{reasoning.trim()}</pre>
+            </details>
+          )}
+          {timeline.map((entry) => {
+            if (entry.type === "decision") {
+              const decision = entry.decision;
+              return (
+                <div
+                  key={decision.id}
+                  className={`work-decision ${
+                    decision.flagged ? "work-decision-flagged" : ""
+                  }`}
+                >
+                  <span className="work-decision-engine">Jev</span>
+                  <span className="work-decision-kind">{decision.kind}</span>
+                  <span className="work-decision-summary">
+                    {decision.summary}
+                  </span>
+                  <span className="work-decision-meta">
+                    {decision.model}
+                    {decision.latencyMs !== null
+                      ? ` · ${decision.latencyMs} ms`
+                      : ""}
+                  </span>
+                </div>
+              );
+            }
+            if (entry.type === "narration") {
+              return (
+                <div key={entry.narration.id} className="work-narration">
+                  <Markdown text={entry.narration.text} />
+                </div>
+              );
+            }
+            const item = entry.item;
+            const approval = approvalByCall.get(item.callId);
+            return (
+              <div key={item.callId} className="work-step">
+                {approval && onRespondApproval && (
+                  <ApprovalCard
+                    approval={approval}
+                    onRespond={onRespondApproval}
+                  />
+                )}
+                <ToolRow
+                  name={item.name}
+                  arguments={item.arguments}
+                  status={item.status}
+                  ok={item.ok}
+                  output={item.output}
+                  durationMs={item.durationMs}
+                  artifacts={item.artifacts}
+                  at={item.at}
+                />
+              </div>
+            );
+          })}
+          {trailingApprovals.map((approval) =>
+            onRespondApproval ? (
+              <ApprovalCard
+                key={approval.requestId}
+                approval={approval}
+                onRespond={onRespondApproval}
+              />
+            ) : null,
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ToolRow({
   name,
   arguments: rawArguments,
   status,
@@ -1248,6 +1952,7 @@ function ToolCard({
   output,
   durationMs,
   artifacts,
+  at,
 }: {
   name: string;
   arguments: string;
@@ -1256,41 +1961,66 @@ function ToolCard({
   output: string | null;
   durationMs: number | null;
   artifacts: ToolArtifact[] | null;
+  at?: number;
 }) {
-  const label = name === "shell" ? "Computer" : name;
+  const [now, setNow] = useState(() => Date.now());
+  const outputRef = useRef<HTMLPreElement | null>(null);
+
+  useEffect(() => {
+    if (status !== "running") {
+      return;
+    }
+    const timer = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(timer);
+  }, [status]);
+
+  useEffect(() => {
+    if (status === "running" && outputRef.current) {
+      outputRef.current.scrollTop = outputRef.current.scrollHeight;
+    }
+  }, [output, status]);
+
+  const label = toolLabel(name);
   const detail = toolDetail(rawArguments);
   const local = output?.startsWith("[local Mac]") ?? false;
-  const stateLabel =
-    status === "running" ? "Running" : ok === null ? "Done" : ok ? "Done" : "Failed";
-  const badgeClass =
-    status === "running" ? "tool-running" : ok ? "tool-ok" : "tool-failed";
+  const failed = status === "done" && ok === false;
+  const runningFor =
+    status === "running" && at !== undefined ? Math.max(0, now - at) : null;
 
   return (
-    <div className="tool-card">
-      <div className="tool-card-head">
-        <span className="tool-card-heading">
-          {local && <span className="tool-card-local">This Mac</span>}
-          <span className="tool-card-title">{label}</span>
-        </span>
-        <span className={`tool-card-badge ${badgeClass}`}>
-          {status === "running" && <span className="tool-card-dot" />}
-          {stateLabel}
-          {durationMs !== null && ` · ${durationMs} ms`}
-        </span>
+    <div className="tool-row">
+      <div className="tool-row-head">
+        <span className="tool-row-label">{label}</span>
+        {detail && (
+          <span className="tool-row-detail" title={detail}>
+            {detail}
+          </span>
+        )}
+        {local && <span className="tool-row-local">this Mac</span>}
+        {status === "running" ? (
+          <span className="tool-row-meta tool-row-running">
+            <span className="tool-row-dot" />
+            {runningFor !== null ? formatElapsed(runningFor) : "Running"}
+          </span>
+        ) : failed ? (
+          <span className="tool-row-meta tool-row-failed">
+            Failed
+            {durationMs !== null ? ` · ${durationMs} ms` : ""}
+          </span>
+        ) : null}
       </div>
-      {detail && <pre className="tool-card-command">{detail}</pre>}
       {artifacts?.map((artifact) => (
         <img
           key={artifact.url}
-          className="tool-card-image"
+          className="tool-row-image"
           src={`${DAEMON_HTTP_URL}${artifact.url}`}
           alt="Screenshot from the bot's computer"
         />
       ))}
       {output && (
-        <details className="tool-card-output" open={output.length < 400}>
+        <details className="tool-row-output">
           <summary>Output</summary>
-          <pre>{output}</pre>
+          <pre ref={outputRef}>{output}</pre>
         </details>
       )}
     </div>
@@ -1312,7 +2042,7 @@ function ApprovalCard({
         <div className="approval-title">
           {approval.decision === "approve" ? "Approved" : "Denied"}
         </div>
-        <pre className="tool-card-command">{detail}</pre>
+        <pre className="tool-command">{detail}</pre>
       </div>
     );
   }
@@ -1321,9 +2051,11 @@ function ApprovalCard({
     <div className="approval-card">
       <div className="approval-title">Approval needed</div>
       <div className="approval-sub">
-        The bot wants to run this on its computer:
+        {approval.reason
+          ? approval.reason
+          : "The bot wants to run this on its computer:"}
       </div>
-      <pre className="tool-card-command">{detail}</pre>
+      <pre className="tool-command">{detail}</pre>
       <div className="approval-actions">
         <button
           className="approve-button"
@@ -1342,30 +2074,384 @@ function ApprovalCard({
   );
 }
 
-function StreamingRow({ streaming }: { streaming: StreamingState }) {
-  if (!streaming.text) {
+function challengeHost(url: string | null): string | null {
+  if (!url) {
+    return null;
+  }
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return null;
+  }
+}
+
+function ChallengeCard({
+  challenge,
+  onRespond,
+  onOpenScreen,
+}: {
+  challenge: PendingChallenge;
+  onRespond: (requestId: string, action: "retry" | "skip") => void;
+  onOpenScreen?: () => void;
+}) {
+  const host = challengeHost(challenge.url);
+
+  if (challenge.action) {
     return (
-      <div className="entry entry-assistant">
-        <div
-          className="entry-body typing-bubble"
-          role="status"
-          aria-label="Assistant is typing"
-        >
-          <span className="typing-dot" />
-          <span className="typing-dot" />
-          <span className="typing-dot" />
+      <div className="challenge-card challenge-resolved">
+        <div className="challenge-title">
+          {challenge.action === "retry" ? "Retrying" : "Skipped"}
         </div>
+        {host && <div className="challenge-sub">{host}</div>}
       </div>
     );
   }
 
   return (
-    <div className="entry entry-assistant">
-      <div className="entry-body">
-        <Markdown text={streaming.text} />
-        <span className="caret" />
+    <div className="challenge-card">
+      <div className="challenge-title">Bot check</div>
+      <div className="challenge-sub">
+        {host
+          ? `${host} is showing a bot check.`
+          : "The site is showing a bot check."}{" "}
+        Open the Screen panel, solve it there, then retry — the browser keeps
+        the clearance.
+      </div>
+      <div className="challenge-actions">
+        {onOpenScreen && (
+          <button className="challenge-screen-button" onClick={onOpenScreen}>
+            Open Screen
+          </button>
+        )}
+        <button
+          className="approve-button"
+          onClick={() => onRespond(challenge.requestId, "retry")}
+        >
+          Retry
+        </button>
+        <button
+          className="deny-button"
+          onClick={() => onRespond(challenge.requestId, "skip")}
+        >
+          Skip
+        </button>
       </div>
     </div>
+  );
+}
+
+function StreamingRow({
+  streaming,
+  showTyping,
+}: {
+  streaming: StreamingState;
+  showTyping: boolean;
+}) {
+  if (!streaming.text) {
+    if (!showTyping) {
+      return null;
+    }
+    return (
+      <div
+        className="entry-body typing-bubble"
+        role="status"
+        aria-label="Assistant is typing"
+      >
+        <span className="typing-dot" />
+        <span className="typing-dot" />
+        <span className="typing-dot" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="entry-body">
+      <Markdown text={streaming.text} />
+      <span className="caret" />
+    </div>
+  );
+}
+
+function budgetLabel(budget: Task["budget"]): string {
+  if (!budget) {
+    return "unlimited";
+  }
+  const parts: string[] = [];
+  if (budget.wallClockMs != null) {
+    parts.push(`${Math.round(budget.wallClockMs / 1000)}s`);
+  }
+  if (budget.toolCalls != null) {
+    parts.push(`${budget.toolCalls} calls`);
+  }
+  if (budget.tokens != null) {
+    parts.push(`${budget.tokens} tokens`);
+  }
+  return parts.join(", ") || "unlimited";
+}
+
+function usageLabel(usage: Task["usage"]): string {
+  if (!usage) {
+    return "—";
+  }
+  const seconds = Math.round(usage.wallClockMs / 1000);
+  const tokens = usage.inputTokens + usage.outputTokens;
+  return `${usage.toolCalls} calls, ${tokens} tokens, ${seconds}s`;
+}
+
+function TaskWatchOverlay({
+  task,
+  onClose,
+}: {
+  task: Task;
+  onClose: () => void;
+}) {
+  const [vncState, setVncState] = useState<VncState>("idle");
+  const vncUrl = `${DAEMON_HTTP_URL.replace(/^http/, "ws")}/tasks/${encodeURIComponent(task.id)}/vnc`;
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [onClose]);
+
+  return (
+    <div className="watch-overlay" role="dialog" aria-label="Watch task">
+      <div className="watch-frame">
+        <div className="watch-bar">
+          <span className="task-dot task-dot-running" />
+          <span className="watch-title">{task.title}</span>
+          <span className="watch-status">
+            {vncState === "live"
+              ? "Live desktop"
+              : vncState === "connecting"
+                ? "Connecting…"
+                : vncState === "down"
+                  ? "Desktop stream unavailable"
+                  : "Starting…"}
+          </span>
+          <button className="ghost-button" onClick={onClose}>
+            Close
+          </button>
+        </div>
+        <div className="watch-view">
+          <VncView
+            url={vncUrl}
+            active
+            interactive
+            onState={setVncState}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TaskView({
+  task,
+  roleNameFor,
+  childTasks,
+  messages,
+  decisions,
+  approvals,
+  activity,
+  streaming,
+  computerState,
+  onCancel,
+  onBack,
+  onWatch,
+  onSelectTask,
+  onRespondApproval,
+}: {
+  task: Task;
+  roleNameFor: (roleId: string) => string;
+  childTasks: Task[];
+  messages: Message[];
+  decisions: DecisionActivity[];
+  approvals: PendingApproval[];
+  activity: ToolActivity[];
+  streaming: StreamingState | null;
+  computerState: SandboxState | null;
+  onCancel: (taskId: string) => void;
+  onBack: () => void;
+  onWatch: (taskId: string) => void;
+  onSelectTask: (taskId: string) => void;
+  onRespondApproval: (requestId: string, decision: "approve" | "deny") => void;
+}) {
+  const roleName = roleNameFor(task.roleId);
+  const running = task.status === "queued" || task.status === "running";
+  const canWatch =
+    running && (computerState === "running" || computerState === "booting");
+  const startedAt = task.startedAt
+    ? Date.parse(task.startedAt)
+    : Date.parse(task.createdAt);
+  const endedAt = task.endedAt ? Date.parse(task.endedAt) : Date.now();
+  const elapsed = formatElapsed(endedAt - startedAt);
+
+  return (
+    <>
+      <header className="chat-header" data-tauri-drag-region>
+        <div className="chat-title">
+          <span className={`task-dot task-dot-${task.status}`} />
+          <span className="chat-title-name">{task.title}</span>
+          <span className="chat-title-role">
+            {roleName} · {TASK_STATUS_LABEL[task.status]} · {elapsed}
+          </span>
+        </div>
+        <div className="chat-actions">
+          {canWatch && (
+            <button
+              className="ghost-button"
+              onClick={() => onWatch(task.id)}
+              title="Watch this task's computer"
+            >
+              Watch
+            </button>
+          )}
+          <button className="ghost-button" onClick={onBack}>
+            Back to lead
+          </button>
+          {running && (
+            <button
+              className="deny-button"
+              onClick={() => onCancel(task.id)}
+              title="Stop this worker"
+            >
+              Cancel task
+            </button>
+          )}
+        </div>
+      </header>
+
+      <div className="transcript">
+        <div className="transcript-inner">
+          <section className="task-summary">
+            <h2>Brief</h2>
+            <p className="task-brief">{task.brief}</p>
+            {task.result && (
+              <>
+                <h2>Result</h2>
+                <Markdown text={task.result} />
+              </>
+            )}
+            {task.error && (
+              <div className="entry-body entry-error">{task.error}</div>
+            )}
+            {task.evidence && (
+              <details className="task-evidence">
+                <summary>Evidence ledger</summary>
+                <pre>{task.evidence}</pre>
+              </details>
+            )}
+          </section>
+
+          <section className="task-meta">
+            <div className="task-meta-item">
+              <span className="task-meta-label">Computer</span>
+              <span>{computerState ?? "—"}</span>
+            </div>
+            <div className="task-meta-item">
+              <span className="task-meta-label">Tools</span>
+              <span>{task.grant?.tools.join(", ") || "none"}</span>
+            </div>
+            <div className="task-meta-item">
+              <span className="task-meta-label">Display</span>
+              <span>{task.grant?.display ?? "none"}</span>
+            </div>
+            <div className="task-meta-item">
+              <span className="task-meta-label">Budget</span>
+              <span>{budgetLabel(task.budget)}</span>
+            </div>
+            <div className="task-meta-item">
+              <span className="task-meta-label">Used</span>
+              <span>{usageLabel(task.usage)}</span>
+            </div>
+          </section>
+
+          {childTasks.length > 0 && (
+            <section className="task-children">
+              <h2>Workers</h2>
+              {childTasks.map((child) => (
+                <button
+                  key={child.id}
+                  className="task-child-row"
+                  onClick={() => onSelectTask(child.id)}
+                >
+                  <span className={`task-dot task-dot-${child.status}`} />
+                  <span className="task-child-title">{child.title}</span>
+                  <span className="task-child-meta">
+                    {roleNameFor(child.roleId)} ·{" "}
+                    {TASK_STATUS_LABEL[child.status]}
+                  </span>
+                </button>
+              ))}
+            </section>
+          )}
+
+          {approvals.map((approval) => (
+            <ApprovalCard
+              key={approval.requestId}
+              approval={approval}
+              onRespond={onRespondApproval}
+            />
+          ))}
+
+          {messages.length === 0 && !streaming && running && (
+            <p className="sidebar-empty">Waiting for the worker to start…</p>
+          )}
+
+          {groupTranscript(messages, streaming !== null).map((entry) =>
+            entry.kind === "turn" ? (
+              <TurnBubble
+                key={entry.final.id}
+                entry={entry}
+                decisions={decisions.filter(
+                  (decision) => decision.messageId === entry.final.id,
+                )}
+              />
+            ) : (
+              <MessageBubble
+                key={entry.message.id}
+                message={entry.message}
+                decisions={decisions.filter(
+                  (decision) => decision.messageId === entry.message.id,
+                )}
+              />
+            ),
+          )}
+
+          {streaming &&
+            (() => {
+              const liveDecisions = decisions.filter(
+                (decision) => decision.messageId === streaming.messageId,
+              );
+              const hasWork =
+                activity.length > 0 || liveDecisions.length > 0;
+              return (
+                <div className="entry entry-assistant">
+                  {hasWork && (
+                    <WorkGroup
+                      items={activity}
+                      decisions={liveDecisions}
+                      reasoning={streaming.reasoning}
+                      startedAt={streaming.startedAt}
+                      running
+                      approvals={approvals}
+                      onRespondApproval={onRespondApproval}
+                    />
+                  )}
+                  <StreamingRow streaming={streaming} showTyping={!hasWork} />
+                </div>
+              );
+            })()}
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -1458,7 +2544,7 @@ function CreateAgentModal({
     <div
       className="modal-overlay"
       role="dialog"
-      aria-label="New agent"
+      aria-label="New role"
       onClick={onClose}
     >
       <div className="modal" onClick={(event) => event.stopPropagation()}>
@@ -1467,7 +2553,7 @@ function CreateAgentModal({
             <span className="avatar avatar-lg" style={{ background: color }}>
               {avatar}
             </span>
-            <h2>New agent</h2>
+            <h2>Hire a role</h2>
           </div>
           <button
             className="icon-button"

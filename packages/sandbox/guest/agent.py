@@ -76,7 +76,7 @@ def ensure_network():
             log(f"failed to repair guest DNS configuration: {error}")
 
 
-def execute(raw):
+def execute(raw, send):
     try:
         request = json.loads(raw)
     except Exception as error:
@@ -93,32 +93,83 @@ def execute(raw):
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             cwd=request.get("cwd", "/"),
             start_new_session=True,
         )
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
-                process.kill()
-            try:
-                process.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-            return {"exit": -1, "stdout": "", "stderr": f"timeout after {timeout}s"}
-        return {
-            "exit": process.returncode,
-            "stdout": stdout[-MAX_OUTPUT:],
-            "stderr": stderr[-MAX_OUTPUT:],
-        }
     except Exception as error:
         return {"exit": -1, "stdout": "", "stderr": str(error)}
 
+    stdout_parts = []
+    stderr_parts = []
+
+    def pump(pipe, stream, sink):
+        try:
+            while True:
+                data = os.read(pipe.fileno(), 65536)
+                if not data:
+                    break
+                text = data.decode("utf-8", "replace")
+                sink.append(text)
+                send({"type": "chunk", "stream": stream, "data": text})
+        except OSError:
+            pass
+        finally:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+    readers = [
+        threading.Thread(
+            target=pump, args=(process.stdout, "stdout", stdout_parts), daemon=True
+        ),
+        threading.Thread(
+            target=pump, args=(process.stderr, "stderr", stderr_parts), daemon=True
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+
+    timed_out = False
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    for reader in readers:
+        reader.join(timeout=2)
+
+    stdout = "".join(stdout_parts)
+    stderr = "".join(stderr_parts)
+    if timed_out:
+        note = f"\ntimeout after {timeout}s"
+        return {
+            "exit": -1,
+            "stdout": stdout[-MAX_OUTPUT:],
+            "stderr": (stderr + note).strip()[-MAX_OUTPUT:],
+        }
+    return {
+        "exit": process.returncode,
+        "stdout": stdout[-MAX_OUTPUT:],
+        "stderr": stderr[-MAX_OUTPUT:],
+    }
+
 
 def handle(conn):
+    send_lock = threading.Lock()
+
+    def send(payload):
+        line = json.dumps(payload).encode() + b"\n"
+        with send_lock:
+            conn.sendall(line)
+
     buffer = b""
     while True:
         chunk = conn.recv(65536)
@@ -129,8 +180,8 @@ def handle(conn):
             line, buffer = buffer.split(b"\n", 1)
             if not line.strip():
                 continue
-            response = execute(line)
-            conn.sendall(json.dumps(response).encode() + b"\n")
+            response = execute(line, send)
+            send(response)
 
 
 def handle_connection(conn, slots):

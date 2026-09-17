@@ -73,10 +73,12 @@ function clearFrameHold(client: RFB) {
 export function VncView({
   url,
   active,
+  interactive,
   onState,
 }: {
   url: string;
   active: boolean;
+  interactive: boolean;
   onState: (state: VncState) => void;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -87,6 +89,8 @@ export function VncView({
   );
   const interactiveRef = useRef(pageInteractive);
   interactiveRef.current = pageInteractive;
+  const viewInteractiveRef = useRef(interactive);
+  viewInteractiveRef.current = interactive;
   stateRef.current = onState;
 
   useEffect(() => {
@@ -106,9 +110,9 @@ export function VncView({
   useEffect(() => {
     const client = clientRef.current;
     if (!client) return;
-    client.viewOnly = !pageInteractive;
+    client.viewOnly = !(pageInteractive && interactive);
     setFrameHeld(client, !pageInteractive);
-  }, [pageInteractive]);
+  }, [pageInteractive, interactive]);
 
   useEffect(() => {
     const target = containerRef.current;
@@ -148,7 +152,7 @@ export function VncView({
         scheduleReconnect();
         return;
       }
-      rfb.viewOnly = !interactiveRef.current;
+      rfb.viewOnly = !(interactiveRef.current && viewInteractiveRef.current);
       rfb.scaleViewport = true;
       rfb.resizeSession = false;
       // A little compression keeps full-screen updates out of the relay

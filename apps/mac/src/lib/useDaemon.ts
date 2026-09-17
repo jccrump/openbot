@@ -1,15 +1,25 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
+  ApprovalRecord,
+  ApprovalTier,
   Bot,
   CodexInfo,
   ComputerKind,
+  DecisionInfo,
+  DecisionSettingsPatch,
   HarnessId,
   HarnessSettings,
+  Memory,
   Message,
   ModelRef,
+  PolicyPresetId,
+  PolicySettings,
   ProviderInfo,
   ProviderPreset,
+  RolePolicy,
   ServerMessage,
+  SoulVersion,
+  Task,
   Thread,
   ToolArtifact,
 } from "@openbot/protocol";
@@ -22,6 +32,8 @@ export interface StreamingState {
   threadId: string;
   messageId: string;
   text: string;
+  reasoning: string;
+  startedAt: number;
 }
 
 export interface ToolActivity {
@@ -34,6 +46,19 @@ export interface ToolActivity {
   output: string | null;
   durationMs: number | null;
   artifacts: ToolArtifact[] | null;
+  at: number;
+}
+
+export interface DecisionActivity {
+  threadId: string;
+  messageId: string;
+  id: string;
+  kind: "audit" | "browse" | "route" | "guardrail";
+  summary: string;
+  flagged: boolean;
+  latencyMs: number | null;
+  model: string | null;
+  at: number;
 }
 
 export interface PendingApproval {
@@ -41,8 +66,18 @@ export interface PendingApproval {
   requestId: string;
   callId: string;
   name: string;
+  tier?: ApprovalTier;
+  reason?: string;
   arguments: string;
   decision: "approve" | "deny" | null;
+}
+
+export interface PendingChallenge {
+  threadId: string;
+  requestId: string;
+  callId: string;
+  url: string | null;
+  action: "retry" | "skip" | null;
 }
 
 export interface ModelOption {
@@ -76,6 +111,13 @@ export interface FetchModelsResult {
   error: string | null;
 }
 
+export interface DecisionTestResult {
+  ok: boolean;
+  model: string | null;
+  latencyMs: number | null;
+  error: string | null;
+}
+
 const SELECTED_BOT_KEY = "openbot.bot";
 const STREAM_WATCHDOG_MS = 90_000;
 const DISCONNECTED_ERROR = "Daemon disconnected — reconnect";
@@ -85,8 +127,11 @@ function progressThreadFor(message: ServerMessage): string | null {
     case "chat.start":
     case "chat.delta":
     case "chat.reasoning":
+    case "chat.decision":
     case "chat.compaction":
+    case "chat.message":
     case "tool.start":
+    case "tool.output":
     case "tool.result":
     case "approval.request":
       return message.threadId;
@@ -137,15 +182,24 @@ export function useDaemon() {
 
   const [status, setStatus] = useState<DaemonStatus>(client.status);
   const [bots, setBots] = useState<Bot[]>([]);
+  const [tasks, setTasks] = useState<Task[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [selectedBotId, setSelectedBotId] = useState<string | null>(null);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [presets, setPresets] = useState<ProviderPreset[]>([]);
   const [defaultModel, setDefaultModel] = useState<ModelRef | null>(null);
   const [requireApproval, setRequireApproval] = useState(true);
+  const [policy, setPolicy] = useState<PolicySettings>({
+    timeoutMs: 10 * 60_000,
+    defaultTier: "inherit",
+    tools: {},
+    rules: [],
+  });
   const [harness, setHarness] = useState<HarnessSettings>({
     default: "openbot",
   });
+  const [decision, setDecision] = useState<DecisionInfo | null>(null);
   const [codex, setCodex] = useState<CodexInfo | null>(null);
   const [selectedModel, setSelectedModel] = useState<ModelRef | null>(null);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
@@ -155,29 +209,48 @@ export function useDaemon() {
   >({});
   const [error, setError] = useState<string | null>(null);
   const [toolActivity, setToolActivity] = useState<ToolActivity[]>([]);
+  const [decisions, setDecisions] = useState<DecisionActivity[]>([]);
   const [approvals, setApprovals] = useState<PendingApproval[]>([]);
+  const [challenges, setChallenges] = useState<PendingChallenge[]>([]);
   const [sandboxStates, setSandboxStates] = useState<
     Record<string, SandboxState>
   >({});
+  const [memories, setMemories] = useState<Memory[]>([]);
+  const [soul, setSoul] = useState<SoulVersion | null>(null);
+  const [soulVersions, setSoulVersions] = useState<SoulVersion[]>([]);
+  const [lastConsolidation, setLastConsolidation] = useState<{
+    archived: number;
+    merged: number;
+  } | null>(null);
+  const [approvalRecords, setApprovalRecords] = useState<ApprovalRecord[]>([]);
 
   const activeThreadIdRef = useRef<string | null>(null);
   activeThreadIdRef.current = activeThreadId;
   const streamingRef = useRef<Record<string, StreamingState>>({});
   streamingRef.current = streamingByThread;
+  const toolActivityRef = useRef<ToolActivity[]>([]);
+  toolActivityRef.current = toolActivity;
   const watchdogTimers = useRef(
     new Map<string, ReturnType<typeof setTimeout>>(),
   );
   const outageRef = useRef(false);
   const botsRef = useRef<Bot[]>(bots);
   botsRef.current = bots;
+  const tasksRef = useRef<Task[]>(tasks);
+  tasksRef.current = tasks;
   const threadsRef = useRef<Thread[]>(threads);
   threadsRef.current = threads;
   const providersRef = useRef<ProviderInfo[]>(providers);
   providersRef.current = providers;
   const selectedBotIdRef = useRef<string | null>(selectedBotId);
   selectedBotIdRef.current = selectedBotId;
+  const selectedTaskIdRef = useRef<string | null>(selectedTaskId);
+  selectedTaskIdRef.current = selectedTaskId;
   const modelRequests = useRef(
     new Map<string, (result: FetchModelsResult) => void>(),
+  );
+  const decisionTestRequests = useRef(
+    new Map<string, (result: DecisionTestResult) => void>(),
   );
   const createRequests = useRef(
     new Map<
@@ -194,6 +267,7 @@ export function useDaemon() {
       providerList?: ProviderInfo[],
     ) => {
       setSelectedBotId(botId);
+      setSelectedTaskId(null);
       try {
         localStorage.setItem(SELECTED_BOT_KEY, botId);
       } catch {}
@@ -232,33 +306,52 @@ export function useDaemon() {
   }, []);
 
   const armWatchdog = useCallback((threadId: string) => {
-    const existing = watchdogTimers.current.get(threadId);
-    if (existing !== undefined) {
-      clearTimeout(existing);
-    }
-    watchdogTimers.current.set(
-      threadId,
-      setTimeout(() => {
-        watchdogTimers.current.delete(threadId);
-        if (!streamingRef.current[threadId]) {
-          return;
-        }
-        setStreamingByThread((current) => {
-          if (!current[threadId]) {
-            return current;
+    // A tool can legitimately run for longer than the watchdog window (shell
+    // commands cap at 300s), so an active tool re-arms instead of firing.
+    const schedule = () => {
+      const existing = watchdogTimers.current.get(threadId);
+      if (existing !== undefined) {
+        clearTimeout(existing);
+      }
+      watchdogTimers.current.set(
+        threadId,
+        setTimeout(() => {
+          watchdogTimers.current.delete(threadId);
+          if (!streamingRef.current[threadId]) {
+            return;
           }
-          const next = { ...current };
-          delete next[threadId];
-          return next;
-        });
-        setToolActivity((current) =>
-          current.filter((item) => item.threadId !== threadId),
-        );
-        setError(
-          "No response from the daemon — the turn timed out. Try again.",
-        );
-      }, STREAM_WATCHDOG_MS),
-    );
+          if (
+            toolActivityRef.current.some(
+              (item) =>
+                item.threadId === threadId && item.status === "running",
+            )
+          ) {
+            schedule();
+            return;
+          }
+          if (tasksRef.current.some((task) => task.threadId === threadId)) {
+            // Worker streams belong to the workboard; the task row is the
+            // source of truth, so a quiet worker never raises a global error.
+            return;
+          }
+          setStreamingByThread((current) => {
+            if (!current[threadId]) {
+              return current;
+            }
+            const next = { ...current };
+            delete next[threadId];
+            return next;
+          });
+          setToolActivity((current) =>
+            current.filter((item) => item.threadId !== threadId),
+          );
+          setError(
+            "No response from the daemon — the turn timed out. Try again.",
+          );
+        }, STREAM_WATCHDOG_MS),
+      );
+    };
+    schedule();
   }, []);
 
   const clearInFlight = useCallback(() => {
@@ -266,6 +359,7 @@ export function useDaemon() {
     setStreamingByThread({});
     setToolActivity([]);
     setApprovals([]);
+    setChallenges([]);
   }, [disarmWatchdog]);
 
   useEffect(() => {
@@ -280,12 +374,17 @@ export function useDaemon() {
           clearInFlight();
           setError(null);
           setBots(message.bots);
+          setTasks(message.tasks ?? []);
           setThreads(message.threads);
           setProviders(message.providers);
           setPresets(message.presets);
           setDefaultModel(message.defaultModel);
           setRequireApproval(message.requireApproval);
+          if (message.policy) {
+            setPolicy(message.policy);
+          }
           setHarness(message.harness ?? { default: "openbot" });
+          setDecision(message.decision ?? null);
           setCodex(message.codex ?? null);
           const stored = storedBotId();
           const current = selectedBotIdRef.current;
@@ -373,6 +472,17 @@ export function useDaemon() {
               current.filter((item) => !removedThreadIds.has(item.threadId)),
             );
           }
+          setTasks((current) =>
+            current.filter((task) => task.roleId !== message.botId),
+          );
+          const selectedTask = tasksRef.current.find(
+            (task) => task.id === selectedTaskIdRef.current,
+          );
+          if (selectedTask && selectedTask.roleId === message.botId) {
+            setSelectedTaskId(null);
+            setActiveThreadId(null);
+            setMessages([]);
+          }
           if (selectedBotIdRef.current === message.botId) {
             const next = remainingBots[0] ?? null;
             if (next) {
@@ -389,11 +499,59 @@ export function useDaemon() {
           }
           break;
         }
+        case "bot.reset": {
+          const replacedThreadIds = new Set(
+            threadsRef.current
+              .filter((thread) => thread.botId === message.botId)
+              .map((thread) => thread.id),
+          );
+          setThreads((current) => [
+            ...current.filter((thread) => thread.botId !== message.botId),
+            message.thread,
+          ]);
+          for (const threadId of replacedThreadIds) {
+            disarmWatchdog(threadId);
+          }
+          setStreamingByThread((current) => {
+            const next = { ...current };
+            for (const threadId of replacedThreadIds) {
+              delete next[threadId];
+            }
+            return next;
+          });
+          setToolActivity((current) =>
+            current.filter((item) => !replacedThreadIds.has(item.threadId)),
+          );
+          setApprovals((current) =>
+            current.filter((item) => !replacedThreadIds.has(item.threadId)),
+          );
+          setDecisions((current) =>
+            current.filter((item) => !replacedThreadIds.has(item.threadId)),
+          );
+          setTasks((current) =>
+            current.filter((task) => task.roleId !== message.botId),
+          );
+          const selectedResetTask = tasksRef.current.find(
+            (task) => task.id === selectedTaskIdRef.current,
+          );
+          if (selectedResetTask && selectedResetTask.roleId === message.botId) {
+            setSelectedTaskId(null);
+          }
+          if (selectedBotIdRef.current === message.botId) {
+            setActiveThreadId(message.thread.id);
+            setMessages([]);
+          }
+          break;
+        }
         case "providers.updated": {
           setProviders(message.providers);
           setDefaultModel(message.defaultModel);
           setRequireApproval(message.requireApproval);
+          if (message.policy) {
+            setPolicy(message.policy);
+          }
           setHarness(message.harness ?? { default: "openbot" });
+          setDecision(message.decision ?? null);
           setCodex(message.codex ?? null);
           setSelectedModel((current) => {
             if (
@@ -418,6 +576,19 @@ export function useDaemon() {
             resolve({
               ok: message.ok,
               models: message.models,
+              error: message.error,
+            });
+          }
+          break;
+        }
+        case "decision.test": {
+          const resolve = decisionTestRequests.current.get(message.requestId);
+          if (resolve) {
+            decisionTestRequests.current.delete(message.requestId);
+            resolve({
+              ok: message.ok,
+              model: message.model,
+              latencyMs: message.latencyMs,
               error: message.error,
             });
           }
@@ -461,6 +632,9 @@ export function useDaemon() {
           setApprovals((current) =>
             current.filter((item) => item.threadId !== message.threadId),
           );
+          setChallenges((current) =>
+            current.filter((item) => item.threadId !== message.threadId),
+          );
           setStreamingByThread((current) => ({
             ...current,
             [message.threadId]: {
@@ -468,8 +642,26 @@ export function useDaemon() {
               threadId: message.threadId,
               messageId: message.messageId,
               text: "",
+              reasoning: "",
+              startedAt: Date.now(),
             },
           }));
+          break;
+        }
+        case "chat.reasoning": {
+          setStreamingByThread((current) => {
+            const entry = current[message.threadId];
+            if (!entry || entry.messageId !== message.messageId) {
+              return current;
+            }
+            return {
+              ...current,
+              [message.threadId]: {
+                ...entry,
+                reasoning: entry.reasoning + message.text,
+              },
+            };
+          });
           break;
         }
         case "chat.delta": {
@@ -482,27 +674,65 @@ export function useDaemon() {
               ...current,
               [message.threadId]: {
                 ...entry,
-                text: entry.text + message.text,
+                text: message.reset ? message.text : entry.text + message.text,
               },
             };
           });
           break;
         }
-        case "tool.start": {
-          setToolActivity((current) => [
+        case "chat.decision": {
+          setDecisions((current) => [
             ...current,
             {
               threadId: message.threadId,
-              callId: message.callId,
-              name: message.name,
-              arguments: message.arguments,
-              status: "running",
-              ok: null,
-              output: null,
-              durationMs: null,
-              artifacts: null,
+              messageId: message.messageId,
+              id: `decision-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+              kind: message.kind,
+              summary: message.summary,
+              flagged: message.flagged,
+              latencyMs: message.latencyMs,
+              model: message.model,
+              at: Date.now(),
             },
           ]);
+          break;
+        }
+        case "tool.start": {
+          setToolActivity((current) => {
+            if (current.some((item) => item.callId === message.callId)) {
+              return current;
+            }
+            return [
+              ...current,
+              {
+                threadId: message.threadId,
+                callId: message.callId,
+                name: message.name,
+                arguments: message.arguments,
+                status: "running",
+                ok: null,
+                output: null,
+                durationMs: null,
+                artifacts: null,
+                at: Date.now(),
+              },
+            ];
+          });
+          break;
+        }
+        case "tool.output": {
+          setToolActivity((current) =>
+            current.map((activity) =>
+              activity.callId === message.callId
+                ? {
+                    ...activity,
+                    output: `${activity.output ?? ""}${message.text}`.slice(
+                      -40_000,
+                    ),
+                  }
+                : activity,
+            ),
+          );
           break;
         }
         case "tool.result": {
@@ -531,16 +761,100 @@ export function useDaemon() {
               callId: message.callId,
               name: message.name,
               arguments: message.arguments,
+              tier: message.tier,
+              reason: message.reason,
               decision: null,
             },
           ]);
           break;
         }
+        case "approval.resolved": {
+          setApprovals((current) =>
+            current.map((approval) =>
+              approval.requestId === message.requestId &&
+              approval.decision === null
+                ? {
+                    ...approval,
+                    decision:
+                      message.decision === "approve" ? "approve" : "deny",
+                  }
+                : approval,
+            ),
+          );
+          break;
+        }
+        case "approvals.list": {
+          setApprovalRecords(message.approvals);
+          break;
+        }
+        case "challenge.request": {
+          disarmWatchdog(message.threadId);
+          setChallenges((current) => [
+            ...current,
+            {
+              threadId: message.threadId,
+              requestId: message.requestId,
+              callId: message.callId,
+              url: message.url,
+              action: null,
+            },
+          ]);
+          break;
+        }
+        case "task.upserted": {
+          setTasks((current) => {
+            const index = current.findIndex(
+              (task) => task.id === message.task.id,
+            );
+            if (index === -1) {
+              return [message.task, ...current];
+            }
+            const next = [...current];
+            next[index] = message.task;
+            return next;
+          });
+          break;
+        }
         case "sandbox.state": {
           setSandboxStates((current) => ({
             ...current,
-            [message.botId]: message.state,
+            [message.taskId ?? message.botId]: message.state,
           }));
+          break;
+        }
+        case "memory.list": {
+          setMemories(message.memories);
+          break;
+        }
+        case "memory.removed": {
+          setMemories((current) =>
+            current.filter((memory) => memory.id !== message.id),
+          );
+          break;
+        }
+        case "memory.consolidated": {
+          setLastConsolidation({
+            archived: message.archived,
+            merged: message.merged,
+          });
+          break;
+        }
+        case "soul": {
+          setSoul(message.soul);
+          setSoulVersions(message.versions);
+          break;
+        }
+        case "chat.message": {
+          setToolActivity((current) =>
+            current.filter((item) => item.threadId !== message.threadId),
+          );
+          if (message.threadId === activeThreadIdRef.current) {
+            setMessages((current) =>
+              current.some((item) => item.id === message.message.id)
+                ? current
+                : [...current, message.message],
+            );
+          }
           break;
         }
         case "chat.done": {
@@ -557,6 +871,9 @@ export function useDaemon() {
             current.filter((item) => item.threadId !== message.threadId),
           );
           setApprovals((current) =>
+            current.filter((item) => item.threadId !== message.threadId),
+          );
+          setChallenges((current) =>
             current.filter((item) => item.threadId !== message.threadId),
           );
           if (message.threadId === activeThreadIdRef.current) {
@@ -578,9 +895,13 @@ export function useDaemon() {
             setApprovals((current) =>
               current.filter((item) => item.threadId !== message.threadId),
             );
+            setChallenges((current) =>
+              current.filter((item) => item.threadId !== message.threadId),
+            );
           } else {
             setToolActivity([]);
             setApprovals([]);
+            setChallenges([]);
           }
           const threadId = message.threadId ?? activeThreadIdRef.current;
           if (threadId !== null && threadId === activeThreadIdRef.current) {
@@ -685,11 +1006,95 @@ export function useDaemon() {
     [client],
   );
 
+  const respondToChallenge = useCallback(
+    (requestId: string, action: "retry" | "skip") => {
+      client.send({ type: "challenge.respond", requestId, action });
+      setChallenges((current) =>
+        current.map((challenge) =>
+          challenge.requestId === requestId
+            ? { ...challenge, action }
+            : challenge,
+        ),
+      );
+      const threadId = activeThreadIdRef.current;
+      if (threadId !== null) {
+        armWatchdog(threadId);
+      }
+    },
+    [client, armWatchdog],
+  );
+
   const selectBot = useCallback(
     (botId: string) => {
       activateBot(botId, threadsRef.current);
     },
     [activateBot],
+  );
+
+  const selectTask = useCallback(
+    (taskId: string) => {
+      const task = tasksRef.current.find((item) => item.id === taskId) ?? null;
+      if (!task) {
+        return;
+      }
+      setSelectedTaskId(taskId);
+      setActiveThreadId(task.threadId ?? null);
+      setMessages([]);
+      if (task.threadId) {
+        client.send({ type: "thread.messages", threadId: task.threadId });
+      }
+    },
+    [client],
+  );
+
+  const cancelTask = useCallback(
+    (taskId: string) => {
+      client.send({ type: "task.cancel", taskId });
+    },
+    [client],
+  );
+
+  const loadApprovals = useCallback(
+    (limit?: number) => {
+      client.send({ type: "approvals.list", ...(limit ? { limit } : {}) });
+    },
+    [client],
+  );
+
+  const loadMemories = useCallback(
+    (scope?: string) => {
+      client.send({ type: "memory.list", ...(scope ? { scope } : {}) });
+    },
+    [client],
+  );
+
+  const removeMemory = useCallback(
+    (id: string) => {
+      client.send({ type: "memory.remove", id });
+    },
+    [client],
+  );
+
+  const consolidateMemories = useCallback(() => {
+    client.send({ type: "memory.consolidate" });
+  }, [client]);
+
+  const loadSoul = useCallback(
+    (botId?: string) => {
+      client.send({ type: "soul.get", ...(botId ? { botId } : {}) });
+    },
+    [client],
+  );
+
+  const revertSoul = useCallback(
+    (versionId: string, botId?: string) => {
+      client.send({
+        type: "soul.revert",
+        versionId,
+        ...(botId ? { botId } : {}),
+      });
+    },
+    [client],
   );
 
   const createBot = useCallback(
@@ -710,10 +1115,36 @@ export function useDaemon() {
     [client],
   );
 
-  const updateBotComputer = useCallback(
-    (botId: string, computer: ComputerKind) => {
+  const updateBot = useCallback(
+    (
+      botId: string,
+      patch: {
+        name?: string;
+        role?: string | null;
+        avatar?: string | null;
+        color?: string | null;
+        computer?: ComputerKind;
+        delegates?: boolean;
+        policy?: RolePolicy;
+      },
+    ) => {
       const requestId = `bot-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      client.send({ type: "bots.update", requestId, botId, computer });
+      client.send({ type: "bots.update", requestId, botId, ...patch });
+    },
+    [client],
+  );
+
+  const powerBot = useCallback(
+    (botId: string, on: boolean) => {
+      const requestId = `bot-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      client.send({ type: "bots.power", requestId, botId, on });
+    },
+    [client],
+  );
+
+  const refreshSandboxState = useCallback(
+    (botId: string) => {
+      client.send({ type: "sandbox.status", botId });
     },
     [client],
   );
@@ -722,6 +1153,14 @@ export function useDaemon() {
     (botId: string) => {
       const requestId = `bot-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       client.send({ type: "bots.delete", requestId, botId });
+    },
+    [client],
+  );
+
+  const resetBot = useCallback(
+    (botId: string) => {
+      const requestId = `bot-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      client.send({ type: "bots.reset", requestId, botId });
     },
     [client],
   );
@@ -744,7 +1183,10 @@ export function useDaemon() {
     (settings: {
       defaultModel?: ModelRef;
       requireApproval?: boolean;
+      policy?: PolicySettings;
+      policyPreset?: PolicyPresetId;
       harness?: { default: HarnessId };
+      decision?: DecisionSettingsPatch;
     }) => {
       client.send({ type: "settings.update", settings });
     },
@@ -786,6 +1228,25 @@ export function useDaemon() {
     setError(null);
   }, []);
 
+  const testDecision = useCallback((): Promise<DecisionTestResult> => {
+    const requestId = `decision-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return new Promise((resolve) => {
+      decisionTestRequests.current.set(requestId, resolve);
+      client.send({ type: "decision.test", requestId });
+      setTimeout(() => {
+        if (decisionTestRequests.current.has(requestId)) {
+          decisionTestRequests.current.delete(requestId);
+          resolve({
+            ok: false,
+            model: null,
+            latencyMs: null,
+            error: "timed out waiting for the daemon",
+          });
+        }
+      }, 15_000);
+    });
+  }, [client]);
+
   const streaming =
     activeThreadId !== null
       ? (streamingByThread[activeThreadId] ?? null)
@@ -804,14 +1265,31 @@ export function useDaemon() {
   return {
     status,
     bots,
+    tasks,
     threads,
     selectedBotId,
+    selectedTaskId,
+    selectTask,
+    cancelTask,
+    memories,
+    soul,
+    soulVersions,
+    lastConsolidation,
+    approvalRecords,
+    loadApprovals,
+    loadMemories,
+    removeMemory,
+    consolidateMemories,
+    loadSoul,
+    revertSoul,
     providers,
     presets,
     modelOptions,
     defaultModel,
     requireApproval,
+    policy,
     harness,
+    decision,
     codex,
     selectedModel,
     setSelectedModel,
@@ -820,19 +1298,26 @@ export function useDaemon() {
     streaming,
     error,
     toolActivity,
+    decisions,
     approvals,
+    challenges,
     sandboxStates,
     sendMessage,
     cancel,
     respondToApproval,
+    respondToChallenge,
     selectBot,
     createBot,
-    updateBotComputer,
+    updateBot,
+    powerBot,
+    refreshSandboxState,
     deleteBot,
+    resetBot,
     saveProvider,
     removeProvider,
     updateSettings,
     fetchModels,
+    testDecision,
     clearError,
   };
 }

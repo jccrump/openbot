@@ -4,10 +4,13 @@ Open-source Grok Bot-style agents that each own a computer — a Firecracker
 microVM or your Mac. Each agent can run commands, read and write files, drive a
 real browser, and show you its screen, with every action gated behind an
 approval you control. Bring any model: DeepSeek, OpenAI, OpenRouter, Groq, xAI,
-Google, Mistral, or a local model through Ollama or LM Studio. The built-in
-OpenBot harness is the primary path; an optional, experimental Codex harness can
-bring your ChatGPT subscription or drive non-OpenAI models through the local
-responses bridge.
+Google, Mistral, or a local model through Ollama or LM Studio. An optional Jev
+decision model (TypeSafe System One) verifies answers, drives multi-page
+browsing, screens untrusted page text, and routes each request to conversation,
+direct work, or the right project in a few hundred milliseconds. The
+built-in OpenBot harness is the primary path; an optional, experimental Codex
+harness can bring your ChatGPT subscription or drive non-OpenAI models through
+the local responses bridge.
 
 > **Status: early alpha.** The core loop works end to end on macOS Apple
 > Silicon, but this is a rough-edged first release. Read
@@ -95,6 +98,20 @@ and save. Keys typed into the app are stored in the daemon's SQLite database
 inside a `0700` data directory with the file at `0600`; env-var references keep
 the key out of the database entirely. See `.env.example` for the headless path.
 
+### Add the Jev decision model (optional)
+
+TypeSafe's Jev is a "System One" model that returns typed decisions instead of
+text. OpenBot uses it to verify browser-backed answers in a few hundred
+milliseconds, drive the multi-page `browse` tool, and screen untrusted page
+text for prompt injection, and decides whether each request is conversation,
+direct work, an existing project, or a new one. Get an early-access key, then
+either set `TYPESAFE_API_KEY` in `.env` (the daemon enables Jev automatically)
+or open **Settings → Decision model**, paste the key, and turn it on. The
+per-call timeout and the route / audit / browse / guardrail toggles live in the
+same section.
+Every Jev path falls back to the configured model when it is off,
+unauthenticated, borderline, or unreachable.
+
 ### Create an agent
 
 Press the **+** next to the sidebar search. Give it a name, optional role,
@@ -118,13 +135,18 @@ pnpm sandbox:deploy   # bundle the sandbox host service and start it in the VM
 ```
 
 The first `setup` downloads a kernel and rootfs and takes a few minutes.
-Run `sandbox:setup` again after guest-agent or desktop changes. It stamps the
+Run `sandbox:setup` again after guest-agent or desktop changes (including the
+desktop input packages xdotool and scrot). It stamps the
 base image with a content version; the next cold boot upgrades older agent
 images while preserving `/root`, `/home`, `/srv`, and workspace directories.
 The per-agent Chromium profile is stored beside the VM image, and the newest
 prior image is kept as a compressed recovery artifact.
 `pnpm sandbox:spike` boots a microVM and verifies exec over vsock; `pnpm
 sandbox:logs` shows the host service log; `pnpm sandbox:stop` shuts the VM down.
+If a site keeps serving a bot check even after you complete it in the screen
+panel, that agent's browser profile has been flagged: reset it with
+`pnpm browser:reset -- "<agent name>"` (keeps one backup; clears cookies and
+sign-ins for that agent), then retry.
 
 ### Chat, approve, watch
 
@@ -175,24 +197,56 @@ when the Codex CLI is on `PATH`.
 
 - **Chat** with streaming text, a three-dot typing bubble while the model is
   thinking (reasoning is hidden by default), message copy, per-agent threads
-  with last-message previews, and agent search in the sidebar.
+  with last-message previews, and agent search in the sidebar. Each assistant
+  turn groups its work into one collapsible **Working on it** row — with a live
+  animation, elapsed time, and action count while it runs — that expands to the
+  chronological list of tool calls, approvals, thinking, and Jev decisions
+  behind the final answer.
 - **Providers** as user data: add/edit/remove/enable, presets for nine
   providers, "fetch models" from any OpenAI-compatible `/models` endpoint, and
   live rebuilds without restarting the daemon.
-- **Agents**: create with name/role/avatar/color/model/computer, switch an
-  existing agent between Firecracker and This Mac, single thread per agent.
+- **Agents**: create with name/role/avatar/color/model/computer, single thread
+  per agent, and a centered **agent settings** modal from the gear button on
+  each sidebar row. The modal edits the name, role, icon, and color, switches
+  the agent between Firecracker and This Mac, and powers the microVM on and off
+  (with live boot state). It also holds the danger zone: **Start fresh** and
+  **Delete agent**, each behind its own confirmation dialog — Start fresh
+  deletes the chat history and workspace and rebuilds the computer from the
+  base image, then boots it again.
 - **Firecracker computers**: one microVM per agent with a versioned rootfs,
   persistent agent files and a per-agent Chromium profile, plus `shell`, `read_file`,
-  `write_file`, and a `browser` tool (goto, click, type, text, links, screenshot,
-  back, wait). Browser actions return bounded page text so models can collect
-  evidence without a separate read after every navigation.
+  `write_file`, a `browser` tool (goto, click, type, text, links, screenshot,
+  back, wait), a `desktop` tool that drives the live desktop itself (screenshot,
+  move, click, double click, click-and-drag, scroll, type, key, wait, window
+  list and activation), and a `browse` tool that drives multi-page research
+  itself when Jev is enabled. The pointer is drawn into desktop screenshots and
+  into the live screen stream, so you can always see where the model is
+  pointing. Browser actions return bounded page text so models can collect
+  evidence without a separate read after every navigation. When a site serves a
+  Cloudflare/Turnstile bot check, the agent waits briefly for it to clear, then
+  stops retrying and asks you to complete the check once in the live screen
+  panel; the persistent profile keeps the clearance for later runs.
 - **Local-Mac computers**: shell as your user and file tools confined to the
   agent's workspace, always approval-gated.
 - **Approvals** for every tool call, with approve/deny cards and denied actions
   reported back to the model.
 - **Live shared browser desktop** through Xvfb, Openbox, x11vnc, and noVNC.
-  Model browser actions and user takeover operate the same Chromium session;
-  browser-tool screenshots are also persisted as chat artifacts.
+  Each agent's desktop has a generated wallpaper, a taskbar with Files
+  (Thunar), Browser (Chromium), and Terminal launchers, and an open terminal;
+  the browser runs as a window so the desktop stays visible. The Browser
+  launcher opens the same persistent Chromium profile the model uses, or
+  focuses it when it is already open. Model browser and desktop actions and
+  user takeover operate the same Chromium session; browser and desktop
+  screenshots are also persisted as chat artifacts. The screen panel preview
+  is view-only; click it (or hover and press **Open**) to go full screen and
+  take over, and press Esc to return to view-only.
+- **Automatic vision handling**: a built-in model capability index knows which
+  models accept images (deepseek-flash, GPT-4o/5, Gemini, Claude, Qwen-VL,
+  LLaVA, and similar), and the browser and desktop tools send their screenshots
+  to those models in user messages so the model sees the screen it is
+  controlling. Text-only models get the metadata and the chat artifact instead
+  and never receive image content, so a request cannot fail on an image.
+  Only the latest screenshot is kept in history.
 - **Two harnesses**: the built-in OpenBot loop (primary, default, any
   OpenAI-compatible model) and the optional Codex harness driving the same VM
   over MCP — with a ChatGPT subscription or a non-OpenAI model through the
@@ -208,17 +262,33 @@ when the Codex CLI is on `PATH`.
   until a separate completion audit checks the original request, exact-source
   support, and honest unknowns; failed drafts go back to the same agent for
   more research or revision instead of reaching chat as confident guesses.
+- **Jev decision model (optional, early access)**: TypeSafe's System One model
+  returns typed decisions instead of text. When enabled, each request is
+  routed in ~100–500 ms to conversation (no tools), direct work, an existing
+  project, or a new one; browser-backed answers are audited (with the model
+  verifier as fallback); the `browse` tool follows links and stops when
+  evidence is sufficient under one approval; and untrusted page text is
+  screened for prompt injection in annotate or block mode. Configure it in
+  **Settings → Decision model** or with `TYPESAFE_API_KEY`.
 - **Themes**: light, dark, and follow-system, persisted per machine.
 - **Offline development** with the mock model and mock sandbox, plus
   `pnpm typecheck` and an end-to-end `pnpm smoke`.
 - **Deterministic real-model evaluations** for research quality, grounding,
   provenance, recovery, latency, tool use, and token cost. See
   [`evals/README.md`](evals/README.md) for the file-based pre/post-change
-  workflow.
+  workflow. Set `TYPESAFE_API_KEY` to evaluate the Jev paths; record a baseline
+  first, then compare with the same scenarios and repetition count.
 
 ## What is not ready yet
 
 Be honest with yourself about the following before filing issues:
+
+- **The lead/worker runtime is young.** The lead, persistent project managers,
+  worker sessions, task grants, memory, and the soul are implemented (see
+  ADR-015/016/017 in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)), but this is
+  an early alpha: routines and the approvals policy engine are not built, and
+  the runtime has only been exercised by the smoke test, the evals, and hand
+  testing.
 
 - **Image upgrades preserve the supported durable paths, not arbitrary system
   mutations.** Files under `/root`, `/home`, `/srv`, and the workspace
@@ -238,29 +308,43 @@ Be honest with yourself about the following before filing issues:
   DeepSeek key, including a tool call executed in the microVM; the ChatGPT
   quota-isolation rule (isolated `CODEX_HOME` for non-OpenAI providers) is
   covered by code and by that run, not by an automated test.
-- **Reasoning is hidden.** The daemon still streams `chat.reasoning`, but the UI
-  intentionally renders only a three-dot typing bubble; there is no setting to
-  show thinking yet.
-- **The browser tool only works on the microVM computer.** On This Mac it
-  returns a clear error.
+- **Reasoning is shown live, not persisted.** Reasoning deltas stream into the
+  expanded **Working on it** row while a run is in progress, but they are not
+  stored in the database, so history shows only tools, approvals, and Jev
+  decisions after the fact.
+- **Jev is optional and sends data to TypeSafe when enabled.** Page text,
+  answer drafts, and tool observations leave your machine for the decision
+  model. The key is stored like provider keys (SQLite `0600` or an environment
+  variable), and every path — routing included — falls back to the configured
+  model when Jev is off, unauthenticated, borderline, or erroring.
+- **The browser and desktop tools only work on the microVM computer.** On This
+  Mac they return a clear error.
 - **No per-bot egress allowlists.** Every microVM shares the host NAT; there is
   no firewall policy per agent.
-- **Browser and compute isolation are split.** Shell and file tools run in the
-  per-agent Firecracker microVM. Chromium runs as a per-agent unprivileged Linux
-  account with Chromium's sandbox enabled in the shared outer Lima VM so nested
-  virtualization cannot stall its timers. Profiles are separate, but browsers
-  do not have a separate kernel per agent.
+- **Browser, desktop, and compute isolation are split.** Shell and file tools
+  run in the per-agent Firecracker microVM. Chromium and the desktop
+  (Xvfb, Openbox, xterm, Thunar, driven by xdotool for the model) run in the
+  shared outer Lima VM so nested virtualization cannot stall browser timers.
+  Browser profiles are separate per agent, but browsers and desktops do not
+  have a separate kernel per agent.
 - **No snapshots, restore, or pause/resume.** VMs are booted fresh and keep
   their rootfs, but there is no snapshotting.
 - **No multi-user support.** The daemon binds `127.0.0.1` and trusts the local
   user; there is no auth layer.
 - **No mobile app.** Mac-first; mobile is a later thin client.
-- **No multi-agent collaboration.** No group chats, mentions, subagent
-  handoffs, or shared memory — each agent is independent.
-- **No memory.** Beyond thread history and compaction summaries, agents do not
-  remember anything across threads.
-- **No approvals inbox or policy engine.** Approvals are inline cards only, with
-  one global toggle.
+- **No group chats, mentions, or handoffs.** The lead routes work to
+  persistent project managers and they delegate to worker sessions, but agents
+  cannot talk to each other and project memory is not shared across projects.
+- **Memory and soul are new and unproven.** The lead keeps a versioned soul
+  and a SQLite memory store that a background reflection pass updates on its
+  own; the Memory panel lets you inspect, delete, and revert. Retrieval
+  quality depends on the embedding provider (with none configured it falls
+  back to hashed, keyword-ish embeddings), there is no memory editor, and
+  contradiction review is not implemented.
+- **The approvals policy engine is new.** Per-tool tiers, argument rules,
+  persisted decisions, timeouts, and an inbox exist (see ADR-018), but rule
+  authoring is a small regex editor, there are no policy presets, and the
+  engine has only been exercised by the smoke test and hand testing.
 - **No API keys in the macOS Keychain.** Keys live in the SQLite database
   (`0600`) or in environment variables.
 - **Single thread per agent.** There is no new-chat button, and thread search
@@ -270,13 +354,13 @@ Be honest with yourself about the following before filing issues:
 
 ## Roadmap
 
-1. **Multi-bot runtime** — DMs, group threads, mentions, handoffs, a shared
-   team scope, and a "chief of staff" pattern.
-2. **Routines** — record a trajectory, parameterize it, schedule it or trigger
-   on events.
-3. **Memory** — per-agent episodic log plus vector search in SQLite.
-4. **Approvals policy engine** — auto/ask/deny tiers per tool and action, with
-   an approvals inbox.
+1. **Routines** — a lead-owned scheduled spawn: record a trajectory,
+   parameterize it, schedule it or trigger on events; the lead watches each run
+   and summarizes the outcome.
+2. **Memory polish** — an embeddings setting in the UI, a real embedding
+   provider, contradiction review, and richer memory editing.
+3. **Policy polish** — presets, per-role policies, and egress allowlists tied
+   into the same engine.
 5. **Codex SDK provider** — ChatGPT sign-in inside the daemon with
    `@openai/codex-sdk`, mapping its stream into the OpenBot protocol.
 6. **Snapshots and restore** for microVMs, plus pause/resume.

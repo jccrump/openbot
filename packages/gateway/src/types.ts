@@ -6,9 +6,13 @@ export interface ToolCall {
   arguments: string;
 }
 
+export type ContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
 export interface ChatMessage {
   role: ChatRole;
-  content: string | null;
+  content: string | ContentPart[] | null;
   toolCalls?: ToolCall[];
   toolCallId?: string;
 }
