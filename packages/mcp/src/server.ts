@@ -226,5 +226,178 @@ server.registerTool(
   },
 );
 
+server.registerTool(
+  "browser_execute",
+  {
+    title: "Run browser JavaScript (CDP)",
+    description:
+      "Drive the browser by writing JavaScript against a persistent Chrome " +
+      "DevTools Protocol session. In scope: `session` (every CDP domain — " +
+      "session.Page, session.Runtime, session.DOM, session.Target, " +
+      "session.Network, ...) and `console`. Return a value to see it as JSON; " +
+      "console.log output comes back too. Screenshots taken with " +
+      "`await session.Page.captureScreenshot({format:'png'})` attach as images. " +
+      "The session persists across calls, so tabs, cookies, and sign-ins " +
+      "survive. Prefer this over the step-by-step browser tool for multi-step " +
+      "work: one snippet can navigate, wait, extract, click, and verify.",
+    inputSchema: {
+      code: z
+        .string()
+        .describe(
+          "JavaScript snippet. `session` (CDP) and `console` are in scope; " +
+            "`return` a value to see it as JSON.",
+        ),
+      description: z
+        .string()
+        .optional()
+        .describe("Clear, concise description of the snippet in 3-7 words."),
+      timeout: z
+        .number()
+        .optional()
+        .describe("Timeout in milliseconds (default 60000, max 300000)."),
+    },
+  },
+  async (args) => {
+    const parsed = await sandbox.browser(BOT_ID, {
+      action: "exec",
+      code: args.code,
+      timeoutMs: Math.min(Math.max(args.timeout ?? 60_000, 1_000), 300_000),
+    });
+    if (parsed.ok === false) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `browser_execute error: ${parsed.error ?? "unknown"}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+    const lines = [
+      `url: ${parsed.url ?? ""}\ntitle: ${parsed.title ?? ""}`,
+    ];
+    if (parsed.output?.trim()) {
+      lines.push(`console:\n${parsed.output.trimEnd()}`);
+    }
+    if (parsed.result && parsed.result !== "null") {
+      lines.push(`=> ${parsed.result}`);
+    }
+    const content: Array<
+      | { type: "text"; text: string }
+      | { type: "image"; data: string; mimeType: string }
+    > = [{ type: "text", text: lines.join("\n") }];
+    for (const screenshot of parsed.screenshots ?? []) {
+      content.push({
+        type: "image",
+        data: screenshot,
+        mimeType: "image/png",
+      });
+    }
+    return { content };
+  },
+);
+
+server.registerTool(
+  "desktop",
+  {
+    title: "Control the desktop",
+    description:
+      "Control the desktop GUI of the bot's computer directly with the mouse " +
+      "and keyboard: clicks, double clicks, click-and-drag, scrolling, typing, " +
+      "key presses, and window management. The screen is 1280x800; take a " +
+      "screenshot first and act on the coordinates you saw. Actions: " +
+      "screenshot, move (x, y), click (x, y, button, count), drag (fromX, " +
+      "fromY, toX, toY, button, durationMs), scroll (x, y, direction, amount), " +
+      "type (text), key (keys), wait (milliseconds), windows, activate (title).",
+    inputSchema: {
+      action: z.enum([
+        "screenshot",
+        "move",
+        "click",
+        "drag",
+        "scroll",
+        "type",
+        "key",
+        "wait",
+        "windows",
+        "activate",
+      ]),
+      x: z.number().optional().describe("Pointer x coordinate (0-1279)."),
+      y: z.number().optional().describe("Pointer y coordinate (0-799)."),
+      fromX: z.number().optional().describe("Drag start x coordinate."),
+      fromY: z.number().optional().describe("Drag start y coordinate."),
+      toX: z.number().optional().describe("Drag end x coordinate."),
+      toY: z.number().optional().describe("Drag end y coordinate."),
+      button: z.enum(["left", "middle", "right"]).optional(),
+      count: z.number().optional().describe("Click count, 1-3."),
+      direction: z.enum(["up", "down", "left", "right"]).optional(),
+      amount: z.number().optional().describe("Scroll steps, 1-50."),
+      durationMs: z.number().optional().describe("Drag duration."),
+      text: z.string().optional().describe("Text to type."),
+      keys: z.string().optional().describe("Key combination, such as alt+F4."),
+      milliseconds: z.number().optional().describe("Wait duration."),
+      title: z.string().optional().describe("Window title for activate."),
+      observe: z
+        .boolean()
+        .optional()
+        .describe("Capture a screenshot after the action (default true)."),
+    },
+  },
+  async (args) => {
+    const parsed = await sandbox.desktop(BOT_ID, {
+      action: args.action,
+      x: args.x,
+      y: args.y,
+      fromX: args.fromX,
+      fromY: args.fromY,
+      toX: args.toX,
+      toY: args.toY,
+      button: args.button,
+      count: args.count,
+      direction: args.direction,
+      amount: args.amount,
+      durationMs: args.durationMs,
+      text: args.text,
+      keys: args.keys,
+      milliseconds: args.milliseconds,
+      title: args.title,
+      screenshot: args.observe !== false,
+    });
+    if (parsed.ok === false) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `desktop error: ${parsed.error ?? "unknown"}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+    const lines = [parsed.detail ?? args.action];
+    if (parsed.width && parsed.height) {
+      lines.push(`screen: ${parsed.width}x${parsed.height}`);
+    }
+    if (parsed.cursor) {
+      lines.push(`pointer: ${parsed.cursor.x},${parsed.cursor.y}`);
+    }
+    if (parsed.window) {
+      lines.push(`active window: ${parsed.window}`);
+    }
+    const content: Array<
+      { type: "text"; text: string } | { type: "image"; data: string; mimeType: string }
+    > = [{ type: "text", text: lines.join("\n") }];
+    if (parsed.screenshot) {
+      content.push({
+        type: "image",
+        data: parsed.screenshot,
+        mimeType: "image/png",
+      });
+    }
+    return { content };
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);

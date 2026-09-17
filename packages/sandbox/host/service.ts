@@ -9,6 +9,7 @@ import {
   chmodSync,
   chownSync,
   closeSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   openSync,
@@ -22,12 +23,16 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { connect } from "node:net";
+import { deflateSync } from "node:zlib";
 import { WebSocket, WebSocketServer } from "ws";
 
 const FC_BIN = process.env.FIRECRACKER_BIN ?? "/usr/local/bin/firecracker";
 const FC_DIR = process.env.FC_DIR ?? "/var/lib/fc";
 const HOST_BROWSER_RUNTIME = join(FC_DIR, "openbot-browser-host");
 const HOST_BROWSER_SCRIPT = join(FC_DIR, "openbot/browser.js");
+const DESKTOP_ASSET_DIR = join(FC_DIR, "openbot");
+const WALLPAPER_PATH = join(DESKTOP_ASSET_DIR, "wallpaper.png");
+const CHROMIUM_ICON_PATH = join(DESKTOP_ASSET_DIR, "chromium.png");
 const BASE_ROOTFS = join(FC_DIR, "rootfs.ext4");
 const BASE_VERSION_FILE = join(FC_DIR, "rootfs.version");
 const KERNEL = join(FC_DIR, "vmlinux");
@@ -72,6 +77,7 @@ interface BrowserDesktopRecord {
   displayNumber: number;
   vncPort: number;
   children: ReturnType<typeof spawn>[];
+  panel: ReturnType<typeof spawn> | null;
 }
 
 interface BrowserIdentity {
@@ -204,6 +210,14 @@ function browserProfile(botId: string) {
 
 function browserLog(botId: string) {
   return join(vmDir(botId), "browser.log");
+}
+
+function launcherDir(botId: string) {
+  return join(vmDir(botId), "desktop-launchers");
+}
+
+function tint2ConfigPath(botId: string) {
+  return join(vmDir(botId), "desktop-tint2rc");
 }
 
 function vmVersionFile(botId: string) {
@@ -458,6 +472,49 @@ function statusOf(record: VmRecord) {
   };
 }
 
+// A host-service restart drops the in-memory VM records while the
+// firecracker processes keep running. Probe the API socket and re-adopt them
+// so status, screen capture, and VNC keep working without an action first.
+async function adoptVmIfRunning(botId: string): Promise<VmRecord | null> {
+  const existing = vms.get(botId);
+  if (existing) {
+    return existing;
+  }
+  if (!existsSync(apiSock(botId))) {
+    return null;
+  }
+  try {
+    await fcRequest(apiSock(botId), "GET", "/machine-config");
+  } catch {
+    return null;
+  }
+  let bootedAt: string | null = null;
+  try {
+    bootedAt = statSync(apiSock(botId)).mtime.toISOString();
+  } catch {
+    // best effort
+  }
+  const pidOutput = tryExec(
+    `pgrep -f ${JSON.stringify(`firecracker --api-sock ${apiSock(botId)}`)}`,
+  );
+  const pid = pidOutput ? Number(pidOutput.split("\n")[0]) : NaN;
+  const record: VmRecord = {
+    botId,
+    dir: vmDir(botId),
+    cid: nextCid++,
+    slot: nextSlot++,
+    network: null,
+    state: "running",
+    error: null,
+    bootedAt,
+    pid: Number.isFinite(pid) ? pid : null,
+    pendingUpgrade: null,
+  };
+  vms.set(botId, record);
+  log(`vm ${botId}: adopted running VM after restart`);
+  return record;
+}
+
 function fcRequest(
   sockPath: string,
   method: string,
@@ -514,11 +571,18 @@ interface AgentResult {
   stderr: string;
 }
 
+// The guest agent runs commands through /bin/sh; wrap them in bash so the
+// common bash-only constructs agents write (PIPESTATUS, [[ ]], arrays) work.
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 function vsockExec(
   udsPath: string,
   command: string,
   cwd: string,
   timeoutMs: number,
+  onChunk?: (stream: "stdout" | "stderr", data: string) => void,
 ): Promise<AgentResult> {
   return new Promise((resolve, reject) => {
     const socket = connect(udsPath);
@@ -570,13 +634,39 @@ function vsockExec(
       }
 
       if (phase === "response") {
-        const newline = buffer.indexOf("\n");
-        if (newline === -1) return;
-        const line = buffer.slice(0, newline);
-        try {
-          finish(null, JSON.parse(line) as AgentResult);
-        } catch {
-          finish(new Error(`bad agent response: ${line.slice(0, 200)}`));
+        let newline = buffer.indexOf("\n");
+        while (newline !== -1) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          newline = buffer.indexOf("\n");
+          if (!line.trim()) continue;
+          let payload: {
+            type?: string;
+            stream?: string;
+            data?: string;
+            exit?: number;
+            stdout?: string;
+            stderr?: string;
+          };
+          try {
+            payload = JSON.parse(line) as typeof payload;
+          } catch {
+            finish(new Error(`bad agent response: ${line.slice(0, 200)}`));
+            return;
+          }
+          if (payload.type === "chunk" && typeof payload.data === "string") {
+            onChunk?.(
+              payload.stream === "stderr" ? "stderr" : "stdout",
+              payload.data,
+            );
+            continue;
+          }
+          finish(null, {
+            exit: payload.exit ?? -1,
+            stdout: payload.stdout ?? "",
+            stderr: payload.stderr ?? "",
+          });
+          return;
         }
       }
     });
@@ -1047,11 +1137,283 @@ function stopBrowserDesktop(botId: string) {
   const desktop = browserDesktops.get(botId);
   browserDesktops.delete(botId);
   if (!desktop) return;
+  if (desktop.panel?.pid && desktop.panel.exitCode === null) {
+    desktop.panel.kill("SIGTERM");
+  }
   for (const child of [...desktop.children].reverse()) {
     if (child.pid && child.exitCode === null) child.kill("SIGTERM");
   }
+  // Xvfb is the last tracked child to go; the terminal and file manager are
+  // untracked but exit with the display they are connected to.
   rmSync(`/tmp/.X11-unix/X${desktop.displayNumber}`, { force: true });
   rmSync(`/tmp/.X${desktop.displayNumber}-lock`, { force: true });
+}
+
+function tint2Config(botId: string): string {
+  return `# OpenBot desktop panel
+rounded = 4
+border_width = 0
+background_color = #0d0f14 82
+border_color = #000000 0
+background_color_hover = #1a1e26 82
+background_color_pressed = #08090c 82
+
+# Task
+rounded = 4
+border_width = 1
+background_color = #ffffff 10
+border_color = #ffffff 16
+background_color_hover = #ffffff 18
+border_color_hover = #ffffff 32
+background_color_pressed = #ffffff 8
+border_color_pressed = #ffffff 32
+
+# Active task
+rounded = 4
+border_width = 1
+background_color = #2f6fed 46
+border_color = #6ea0f8 62
+background_color_hover = #2f6fed 56
+border_color_hover = #93c5fd 72
+background_color_pressed = #2f6fed 34
+border_color_pressed = #93c5fd 72
+
+# Tooltip
+rounded = 4
+border_width = 0
+background_color = #0d0f14 96
+border_color = #ffffff 0
+background_color_hover = #0d0f14 96
+background_color_pressed = #0d0f14 96
+
+panel_items = LTSC
+panel_size = 100% 32
+panel_margin = 0 0
+panel_padding = 6 0 6
+panel_background_id = 1
+panel_position = bottom center horizontal
+panel_layer = top
+panel_monitor = all
+strut_policy = follow_size
+panel_window_name = OpenBot
+disable_transparency = 1
+font_shadow = 0
+
+launcher_padding = 2 0 8
+launcher_background_id = 0
+launcher_icon_size = 20
+launcher_item_app = ${join(launcherDir(botId), "files.desktop")}
+launcher_item_app = ${join(launcherDir(botId), "terminal.desktop")}
+launcher_item_app = ${join(launcherDir(botId), "browser.desktop")}
+
+taskbar_mode = single_desktop
+taskbar_hide_if_empty = 0
+taskbar_padding = 0 0 4
+taskbar_background_id = 0
+taskbar_active_background_id = 0
+task_align = left
+task_text = 1
+task_icon = 1
+task_centered = 1
+task_maximum_size = 160 32
+task_padding = 4 2 6
+task_font_color = #e8e8ea 100
+task_background_id = 2
+task_active_background_id = 3
+task_urgent_background_id = 2
+task_iconified_background_id = 2
+mouse_left = toggle_iconify
+mouse_right = close
+mouse_scroll_up = toggle
+mouse_scroll_down = iconify
+
+time1_format = %H:%M
+time2_format = %A %d %B
+clock_font_color = #e8e8ea 100
+clock_padding = 6 0
+
+tooltip_show_timeout = 0.3
+tooltip_hide_timeout = 0.1
+tooltip_padding = 6 4
+tooltip_background_id = 4
+tooltip_font_color = #e8e8ea 100
+`;
+}
+
+const FILES_DESKTOP = `[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Files
+Comment=Browse this computer's files
+Exec=thunar /root
+Icon=system-file-manager
+Terminal=false
+Categories=System;FileManager;
+`;
+
+const TERMINAL_DESKTOP = `[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Terminal
+Comment=Open a terminal
+Exec=xterm -title Terminal -fa "DejaVu Sans Mono" -fs 11 -bg #101216 -fg #e6e6e6
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+`;
+
+function browserLauncherScript(botId: string): string {
+  const safeId = botId.replace(/[^a-zA-Z0-9_-]/g, "");
+  return `#!/usr/bin/env bash
+set -u
+# Open this agent's Chromium window, or focus it if it is already running.
+# The browser daemon owns the profile and launches Chromium on demand.
+BOT_ID='${safeId}'
+if ! xdotool search --onlyvisible --class chromium-browser >/dev/null 2>&1; then
+  curl -s -m 30 -X POST "http://127.0.0.1:4171/vms/$BOT_ID/browser" \\
+    -H 'content-type: application/json' -d '{"action":"text"}' >/dev/null 2>&1
+fi
+xdotool search --onlyvisible --class chromium-browser windowactivate --sync %@ >/dev/null 2>&1 || true
+`;
+}
+
+function browserDesktopEntry(botId: string): string {
+  return `[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Browser
+Comment=Open this agent's browser
+Exec=${join(launcherDir(botId), "browser.sh")}
+Icon=${CHROMIUM_ICON_PATH}
+Terminal=false
+Categories=Network;WebBrowser;
+`;
+}
+
+function crc32(buffer: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type: string, data: Buffer): Buffer {
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length, 0);
+  const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(body), 0);
+  return Buffer.concat([length, body, crc]);
+}
+
+function gradientWallpaper(
+  width: number,
+  height: number,
+  top: [number, number, number],
+  bottom: [number, number, number],
+): Buffer {
+  const raw = Buffer.alloc((width * 3 + 1) * height);
+  let offset = 0;
+  for (let y = 0; y < height; y += 1) {
+    raw[offset] = 0;
+    offset += 1;
+    const t = height === 1 ? 0 : y / (height - 1);
+    const red = Math.round(top[0] + (bottom[0] - top[0]) * t);
+    const green = Math.round(top[1] + (bottom[1] - top[1]) * t);
+    const blue = Math.round(top[2] + (bottom[2] - top[2]) * t);
+    for (let x = 0; x < width; x += 1) {
+      raw[offset] = red;
+      raw[offset + 1] = green;
+      raw[offset + 2] = blue;
+      offset += 3;
+    }
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", deflateSync(raw)),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+function installChromiumIcon(): void {
+  try {
+    const browsersDir = join(HOST_BROWSER_RUNTIME, "browsers");
+    const entry = readdirSync(browsersDir).find((name) =>
+      name.startsWith("chromium-"),
+    );
+    if (!entry) return;
+    const source = join(
+      browsersDir,
+      entry,
+      "chrome-linux",
+      "product_logo_48.png",
+    );
+    if (existsSync(source)) {
+      copyFileSync(source, CHROMIUM_ICON_PATH);
+    }
+  } catch {
+    // The icon is cosmetic; the launcher works without it.
+  }
+}
+
+function writeDesktopAssets(botId: string): void {
+  mkdirSync(DESKTOP_ASSET_DIR, { recursive: true });
+  if (!existsSync(WALLPAPER_PATH)) {
+    writeFileSync(
+      WALLPAPER_PATH,
+      gradientWallpaper(1280, 800, [15, 17, 23], [45, 50, 68]),
+    );
+  }
+  installChromiumIcon();
+  const dir = launcherDir(botId);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "files.desktop"), FILES_DESKTOP);
+  writeFileSync(join(dir, "terminal.desktop"), TERMINAL_DESKTOP);
+  const script = join(dir, "browser.sh");
+  writeFileSync(script, browserLauncherScript(botId));
+  chmodSync(script, 0o755);
+  writeFileSync(join(dir, "browser.desktop"), browserDesktopEntry(botId));
+  writeFileSync(tint2ConfigPath(botId), tint2Config(botId));
+}
+
+function desktopEnvironment(
+  botId: string,
+  display: string,
+): NodeJS.ProcessEnv {
+  const runtimeDir = join(vmDir(botId), "desktop-runtime");
+  mkdirSync(runtimeDir, { recursive: true });
+  chmodSync(runtimeDir, 0o700);
+  return {
+    ...process.env,
+    DISPLAY: display,
+    HOME: "/root",
+    XDG_CONFIG_HOME: join(vmDir(botId), "desktop-config"),
+    XDG_CACHE_HOME: join(vmDir(botId), "desktop-cache"),
+    XDG_RUNTIME_DIR: runtimeDir,
+  };
+}
+
+function startDesktopPanel(
+  botId: string,
+  display: string,
+): ReturnType<typeof spawn> {
+  const logFd = openSync(browserLog(botId), "a");
+  const panel = spawn("tint2", ["-c", tint2ConfigPath(botId)], {
+    stdio: ["ignore", logFd, logFd],
+    env: desktopEnvironment(botId, display),
+  });
+  closeSync(logFd);
+  return panel;
 }
 
 async function ensureBrowserDesktop(botId: string) {
@@ -1062,6 +1424,9 @@ async function ensureBrowserDesktop(botId: string) {
     existsSync(`/tmp/.X11-unix/X${existing.displayNumber}`) &&
     (await tcpReady("127.0.0.1", existing.vncPort))
   ) {
+    if (!existing.panel || existing.panel.exitCode !== null) {
+      existing.panel = startDesktopPanel(botId, existing.display);
+    }
     return existing;
   }
   stopBrowserDesktop(botId);
@@ -1070,16 +1435,11 @@ async function ensureBrowserDesktop(botId: string) {
   mkdirSync(vmDir(botId), { recursive: true });
   rmSync(`/tmp/.X11-unix/X${displayNumber}`, { force: true });
   rmSync(`/tmp/.X${displayNumber}-lock`, { force: true });
+  writeDesktopAssets(botId);
   const logFd = openSync(browserLog(botId), "a");
-  const desktopEnv = {
-    ...process.env,
-    DISPLAY: display,
-    HOME: "/root",
-    XDG_CONFIG_HOME: join(vmDir(botId), "desktop-config"),
-    XDG_CACHE_HOME: join(vmDir(botId), "desktop-cache"),
-  };
-  mkdirSync(desktopEnv.XDG_CONFIG_HOME, { recursive: true });
-  mkdirSync(desktopEnv.XDG_CACHE_HOME, { recursive: true });
+  const desktopEnv = desktopEnvironment(botId, display);
+  mkdirSync(desktopEnv.XDG_CONFIG_HOME as string, { recursive: true });
+  mkdirSync(desktopEnv.XDG_CACHE_HOME as string, { recursive: true });
 
   const xvfb = spawn(
     "Xvfb",
@@ -1103,6 +1463,32 @@ async function ensureBrowserDesktop(botId: string) {
     stdio: ["ignore", logFd, logFd],
     env: desktopEnv,
   });
+  spawn("feh", ["--bg-fill", WALLPAPER_PATH], {
+    stdio: ["ignore", logFd, logFd],
+    env: desktopEnv,
+  });
+  const panel = spawn("tint2", ["-c", tint2ConfigPath(botId)], {
+    stdio: ["ignore", logFd, logFd],
+    env: desktopEnv,
+  });
+  spawn(
+    "xterm",
+    [
+      "-title",
+      "Terminal",
+      "-geometry",
+      "100x24+24+64",
+      "-fa",
+      "DejaVu Sans Mono",
+      "-fs",
+      "11",
+      "-bg",
+      "#101216",
+      "-fg",
+      "#e6e6e6",
+    ],
+    { stdio: ["ignore", logFd, logFd], env: desktopEnv },
+  );
   const x11vnc = spawn(
     "x11vnc",
     [
@@ -1115,6 +1501,10 @@ async function ensureBrowserDesktop(botId: string) {
       "-rfbport",
       String(vncPort),
       "-nothreads",
+      // Draw the pointer into the framebuffer so viewers can see where the
+      // model (or the user) is pointing; noVNC only renders cursor shapes at
+      // the local pointer position otherwise.
+      "-nocursorshape",
       "-wait",
       "16",
       "-defer",
@@ -1126,7 +1516,7 @@ async function ensureBrowserDesktop(botId: string) {
   );
   children.push(openbox, x11vnc);
   closeSync(logFd);
-  const desktop = { display, displayNumber, vncPort, children };
+  const desktop = { display, displayNumber, vncPort, children, panel };
   browserDesktops.set(botId, desktop);
 
   const vncDeadline = Date.now() + 10_000;
@@ -1154,12 +1544,15 @@ function browserEnvironment(botId: string): NodeJS.ProcessEnv {
     XDG_CACHE_HOME: join(identity.home, ".cache"),
     DISPLAY: desktop.display,
     OPENBOT_BROWSER_DISPLAY: desktop.display,
-    OPENBOT_BROWSER_ENGINE: "chromium",
     OPENBOT_BROWSER_HEADLESS: "0",
     OPENBOT_BROWSER_PROFILE: browserProfile(botId),
     OPENBOT_BROWSER_RUNTIME: HOST_BROWSER_RUNTIME,
     OPENBOT_BROWSER_SOCKET: browserSocket(botId),
   };
+}
+
+function browserDaemonToken(botId: string) {
+  return `${HOST_BROWSER_SCRIPT} serve ${botId}`;
 }
 
 async function ensureBrowserDaemon(botId: string) {
@@ -1171,13 +1564,20 @@ async function ensureBrowserDaemon(botId: string) {
   mkdirSync(vmDir(botId), { recursive: true });
   const identity = prepareBrowserIdentity(botId);
   rmSync(browserSocket(botId), { force: true });
+  // A host-service restart leaves the previous daemon untracked. Kill it so
+  // the new process loads the current browser script instead of stale code.
+  spawnSync("pkill", ["-f", browserDaemonToken(botId)], { stdio: "ignore" });
   const logFd = openSync(browserLog(botId), "a");
-  const child = spawn("/usr/local/bin/node", [HOST_BROWSER_SCRIPT, "serve"], {
-    stdio: ["ignore", logFd, logFd],
-    env: browserEnvironment(botId),
-    uid: identity.uid,
-    gid: identity.gid,
-  });
+  const child = spawn(
+    "/usr/local/bin/node",
+    [HOST_BROWSER_SCRIPT, "serve", botId],
+    {
+      stdio: ["ignore", logFd, logFd],
+      env: browserEnvironment(botId),
+      uid: identity.uid,
+      gid: identity.gid,
+    },
+  );
   closeSync(logFd);
   browserDaemons.set(botId, child);
   child.once("exit", (code, signal) => {
@@ -1259,15 +1659,402 @@ async function runBrowserAction(
   });
 }
 
+const DESKTOP_WIDTH = 1280;
+const DESKTOP_HEIGHT = 800;
+const DESKTOP_BUTTONS: Record<string, number> = {
+  left: 1,
+  middle: 2,
+  right: 3,
+};
+const DESKTOP_SCROLL_BUTTONS: Record<string, number> = {
+  up: 4,
+  down: 5,
+  left: 6,
+  right: 7,
+};
+const DESKTOP_KEY_PATTERN = /^[A-Za-z0-9_+ -]+$/;
+const DESKTOP_MAX_TYPE_CHARS = 8_000;
+
+function xdotool(
+  env: NodeJS.ProcessEnv,
+  args: string[],
+  timeoutMs = 10_000,
+): { status: number | null; stdout: string; stderr: string } {
+  const result = spawnSync("xdotool", args, {
+    env,
+    encoding: "utf8",
+    timeout: timeoutMs,
+  });
+  return {
+    status: result.status,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? (result.error ? String(result.error) : ""),
+  };
+}
+
+function requireNumber(
+  value: unknown,
+  name: string,
+  maximum: number,
+): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`${name} must be a number`);
+  }
+  const rounded = Math.round(parsed);
+  if (rounded < 0 || rounded > maximum) {
+    throw new Error(`${name} must be between 0 and ${maximum}`);
+  }
+  return rounded;
+}
+
+function requireCount(value: unknown, fallback: number, maximum: number) {
+  if (value === undefined || value === null) return fallback;
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw new Error("count must be a number");
+  }
+  const rounded = Math.round(parsed);
+  if (rounded < 1 || rounded > maximum) {
+    throw new Error(`count must be between 1 and ${maximum}`);
+  }
+  return rounded;
+}
+
+function cursorPosition(
+  env: NodeJS.ProcessEnv,
+): { x: number; y: number } | null {
+  const result = xdotool(env, ["getmouselocation", "--shell"]);
+  if (result.status !== 0) return null;
+  const x = /X=(\d+)/.exec(result.stdout)?.[1];
+  const y = /Y=(\d+)/.exec(result.stdout)?.[1];
+  return x && y ? { x: Number(x), y: Number(y) } : null;
+}
+
+function activeWindowName(env: NodeJS.ProcessEnv): string | null {
+  const result = xdotool(env, ["getactivewindow", "getwindowname"]);
+  if (result.status !== 0) return null;
+  return result.stdout.trim() || null;
+}
+
+function visibleWindowTitles(env: NodeJS.ProcessEnv): string[] {
+  const result = xdotool(env, [
+    "search",
+    "--onlyvisible",
+    "--name",
+    ".*",
+    "getwindowname",
+    "%@",
+  ]);
+  if (result.status !== 0) return [];
+  return [
+    ...new Set(
+      result.stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function captureDesktop(botId: string, env: NodeJS.ProcessEnv): string {
+  const path = join(vmDir(botId), "desktop-screenshot.png");
+  rmSync(path, { force: true });
+  // -p draws the pointer into the capture so the model and the user can see
+  // where the pointer is.
+  const result = spawnSync("scrot", ["-p", "-o", path], {
+    env,
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  if (result.status !== 0 || !existsSync(path)) {
+    throw new Error(result.stderr?.trim() || "desktop screenshot failed");
+  }
+  return readFileSync(path).toString("base64");
+}
+
+async function runDesktopAction(
+  botId: string,
+  payload: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const startedAt = Date.now();
+  const action = typeof payload.action === "string" ? payload.action : "";
+  try {
+    if (!action) {
+      throw new Error("action is required");
+    }
+    const desktop = await ensureBrowserDesktop(botId);
+    const env = desktopEnvironment(botId, desktop.display);
+    let detail = "";
+
+    switch (action) {
+      case "screenshot": {
+        detail = "captured the desktop";
+        break;
+      }
+      case "move": {
+        const x = requireNumber(payload.x, "x", DESKTOP_WIDTH - 1);
+        const y = requireNumber(payload.y, "y", DESKTOP_HEIGHT - 1);
+        const result = xdotool(env, [
+          "mousemove",
+          "--sync",
+          String(x),
+          String(y),
+        ]);
+        if (result.status !== 0) {
+          throw new Error(result.stderr.trim() || "could not move the pointer");
+        }
+        detail = `moved the pointer to ${x},${y}`;
+        break;
+      }
+      case "click": {
+        const x = requireNumber(payload.x, "x", DESKTOP_WIDTH - 1);
+        const y = requireNumber(payload.y, "y", DESKTOP_HEIGHT - 1);
+        const buttonName = String(payload.button ?? "left");
+        const button = DESKTOP_BUTTONS[buttonName];
+        if (!button) {
+          throw new Error("button must be left, middle, or right");
+        }
+        const count = requireCount(payload.count, 1, 3);
+        const result = xdotool(env, [
+          "mousemove",
+          "--sync",
+          String(x),
+          String(y),
+          "click",
+          "--repeat",
+          String(count),
+          "--delay",
+          "60",
+          String(button),
+        ]);
+        if (result.status !== 0) {
+          throw new Error(result.stderr.trim() || "click failed");
+        }
+        detail = `${count > 1 ? `${count}x ` : ""}${buttonName} click at ${x},${y}`;
+        break;
+      }
+      case "drag": {
+        const fromX = requireNumber(payload.fromX, "fromX", DESKTOP_WIDTH - 1);
+        const fromY = requireNumber(payload.fromY, "fromY", DESKTOP_HEIGHT - 1);
+        const toX = requireNumber(payload.toX, "toX", DESKTOP_WIDTH - 1);
+        const toY = requireNumber(payload.toY, "toY", DESKTOP_HEIGHT - 1);
+        const buttonName = String(payload.button ?? "left");
+        const button = DESKTOP_BUTTONS[buttonName];
+        if (!button) {
+          throw new Error("button must be left, middle, or right");
+        }
+        const durationMs =
+          payload.durationMs === undefined
+            ? 400
+            : requireNumber(payload.durationMs, "durationMs", 5_000);
+        const steps = Math.max(4, Math.min(20, Math.round(durationMs / 40)));
+        const args = [
+          "mousemove",
+          "--sync",
+          String(fromX),
+          String(fromY),
+          "mousedown",
+          String(button),
+        ];
+        for (let step = 1; step <= steps; step += 1) {
+          const t = step / steps;
+          const x = Math.round(fromX + (toX - fromX) * t);
+          const y = Math.round(fromY + (toY - fromY) * t);
+          args.push(
+            "mousemove",
+            "--sync",
+            String(x),
+            String(y),
+            "sleep",
+            "0.03",
+          );
+        }
+        args.push("mouseup", String(button));
+        const result = xdotool(env, args, durationMs + 10_000);
+        if (result.status !== 0) {
+          throw new Error(result.stderr.trim() || "drag failed");
+        }
+        detail = `dragged the ${buttonName} button from ${fromX},${fromY} to ${toX},${toY}`;
+        break;
+      }
+      case "scroll": {
+        const x = requireNumber(payload.x, "x", DESKTOP_WIDTH - 1);
+        const y = requireNumber(payload.y, "y", DESKTOP_HEIGHT - 1);
+        const direction = String(payload.direction ?? "down");
+        const button = DESKTOP_SCROLL_BUTTONS[direction];
+        if (!button) {
+          throw new Error("direction must be up, down, left, or right");
+        }
+        const amount = requireCount(payload.amount, 3, 50);
+        const result = xdotool(env, [
+          "mousemove",
+          "--sync",
+          String(x),
+          String(y),
+          "click",
+          "--repeat",
+          String(amount),
+          "--delay",
+          "30",
+          String(button),
+        ]);
+        if (result.status !== 0) {
+          throw new Error(result.stderr.trim() || "scroll failed");
+        }
+        detail = `scrolled ${direction} ${amount} step${amount === 1 ? "" : "s"} at ${x},${y}`;
+        break;
+      }
+      case "type": {
+        const text = typeof payload.text === "string" ? payload.text : "";
+        if (!text) {
+          throw new Error("text is required");
+        }
+        if (text.length > DESKTOP_MAX_TYPE_CHARS) {
+          throw new Error(
+            `text is limited to ${DESKTOP_MAX_TYPE_CHARS} characters`,
+          );
+        }
+        const lines = text.split("\n");
+        for (let index = 0; index < lines.length; index += 1) {
+          const line = lines[index] ?? "";
+          if (line) {
+            const typed = xdotool(env, [
+              "type",
+              "--clearmodifiers",
+              "--delay",
+              "12",
+              "--",
+              line,
+            ]);
+            if (typed.status !== 0) {
+              throw new Error(typed.stderr.trim() || "typing failed");
+            }
+          }
+          if (index < lines.length - 1) {
+            const enter = xdotool(env, ["key", "--clearmodifiers", "Return"]);
+            if (enter.status !== 0) {
+              throw new Error(enter.stderr.trim() || "typing failed");
+            }
+          }
+        }
+        detail = `typed ${text.length} character${text.length === 1 ? "" : "s"}`;
+        break;
+      }
+      case "key": {
+        const keys = typeof payload.keys === "string" ? payload.keys.trim() : "";
+        if (!keys || keys.startsWith("-") || !DESKTOP_KEY_PATTERN.test(keys)) {
+          throw new Error(
+            "keys must be a key combination such as Return, alt+F4, or ctrl+shift+t",
+          );
+        }
+        const result = xdotool(env, ["key", "--clearmodifiers", keys]);
+        if (result.status !== 0) {
+          throw new Error(result.stderr.trim() || "key press failed");
+        }
+        detail = `pressed ${keys}`;
+        break;
+      }
+      case "wait": {
+        const milliseconds = requireNumber(payload.milliseconds, "milliseconds", 10_000);
+        await sleep(milliseconds);
+        detail = `waited ${milliseconds}ms`;
+        break;
+      }
+      case "windows": {
+        const titles = visibleWindowTitles(env);
+        detail = titles.length
+          ? `visible windows:\n${titles.map((title) => `- ${title}`).join("\n")}`
+          : "no visible windows";
+        break;
+      }
+      case "activate": {
+        const title = typeof payload.title === "string" ? payload.title.trim() : "";
+        if (!title) {
+          throw new Error("title is required");
+        }
+        const search = xdotool(env, ["search", "--onlyvisible", "--name", title]);
+        const ids = search.stdout
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean);
+        if (ids.length === 0) {
+          throw new Error(`no visible window matches: ${title}`);
+        }
+        const target = ids[ids.length - 1] as string;
+        const result = xdotool(env, ["windowactivate", "--sync", target]);
+        if (result.status !== 0) {
+          throw new Error(result.stderr.trim() || "could not activate the window");
+        }
+        detail = `activated ${activeWindowName(env) ?? title}`;
+        break;
+      }
+      default:
+        throw new Error(`unknown desktop action: ${action}`);
+    }
+
+    const observe = payload.screenshot === true || action === "screenshot";
+    const screenshot = observe ? captureDesktop(botId, env) : null;
+    return {
+      ok: true,
+      action,
+      detail,
+      width: DESKTOP_WIDTH,
+      height: DESKTOP_HEIGHT,
+      cursor: cursorPosition(env),
+      window: activeWindowName(env),
+      ...(screenshot ? { screenshot } : {}),
+      durationMs: Date.now() - startedAt,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      action,
+      error: (error as Error).message,
+      durationMs: Date.now() - startedAt,
+    };
+  }
+}
+
 function stopBrowser(botId: string) {
   const child = browserDaemons.get(botId);
   browserDaemons.delete(botId);
   if (child?.pid) {
     child.kill("SIGTERM");
   }
+  spawnSync("pkill", ["-f", browserDaemonToken(botId)], { stdio: "ignore" });
   spawnSync("pkill", ["-f", browserProfile(botId)], { stdio: "ignore" });
   rmSync(browserSocket(botId), { force: true });
   stopBrowserDesktop(botId);
+}
+
+// A site can flag a profile and serve it a bot check forever, even after the
+// user solves it. Moving the profile aside gives that agent a clean browser
+// while keeping one backup for recovery.
+function resetBrowserProfile(botId: string): {
+  botId: string;
+  backup: string | null;
+} {
+  stopBrowser(botId);
+  const profile = browserProfile(botId);
+  let backup: string | null = null;
+  if (existsSync(profile)) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const target = `${profile}.flagged-${stamp}`;
+    renameSync(profile, target);
+    backup = target;
+    const base = browserProfile(botId).split("/").pop() ?? "browser-profile";
+    const backups = readdirSync(vmDir(botId))
+      .filter((entry) => entry.startsWith(`${base}.flagged-`))
+      .sort()
+      .slice(0, -1);
+    for (const stale of backups) {
+      rmSync(join(vmDir(botId), stale), { recursive: true, force: true });
+    }
+  }
+  mkdirSync(profile, { recursive: true });
+  log(`browser ${botId}: profile reset${backup ? ` (backup ${backup})` : ""}`);
+  return { botId, backup };
 }
 
 async function stopVm(record: VmRecord) {
@@ -1303,6 +2090,9 @@ async function destroyVm(botId: string) {
     await stopVm(record);
     vms.delete(botId);
   }
+  // Worker sessions key their browser by task id and have no VM of their own,
+  // so the browser daemon and profile still need to be released here.
+  stopBrowser(botId);
   rmSync(vmDir(botId), { recursive: true, force: true });
   rmSync(browserRuntimeDir(botId), { recursive: true, force: true });
   browserIdentities.delete(botId);
@@ -1365,7 +2155,7 @@ const server = createServer(async (request, response) => {
     const action = parts[2];
 
     if (request.method === "GET" && action === "status") {
-      const record = vms.get(botId);
+      const record = await adoptVmIfRunning(botId);
       sendJson(
         response,
         200,
@@ -1393,6 +2183,7 @@ const server = createServer(async (request, response) => {
         command?: string;
         cwd?: string;
         timeoutMs?: number;
+        stream?: boolean;
       };
       if (!body.command || typeof body.command !== "string") {
         sendJson(response, 400, { error: "command is required" });
@@ -1401,9 +2192,36 @@ const server = createServer(async (request, response) => {
       const record = await ensureVm(botId);
       const timeoutMs = body.timeoutMs ?? DEFAULT_TIMEOUT_MS;
       const startedAt = Date.now();
+      if (body.stream) {
+        response.writeHead(200, {
+          "content-type": "application/x-ndjson",
+          "cache-control": "no-store",
+        });
+        const result = await vsockExec(
+          vsockSock(botId),
+          `bash -c ${shellQuote(body.command)}`,
+          body.cwd ?? "/",
+          timeoutMs,
+          (stream, data) => {
+            response.write(
+              JSON.stringify({ type: "chunk", stream, data }) + "\n",
+            );
+          },
+        );
+        response.end(
+          JSON.stringify({
+            type: "result",
+            exit: result.exit,
+            stdout: result.stdout,
+            stderr: result.stderr,
+            durationMs: Date.now() - startedAt,
+          }) + "\n",
+        );
+        return;
+      }
       const result = await vsockExec(
         vsockSock(botId),
-        body.command,
+        `bash -c ${shellQuote(body.command)}`,
         body.cwd ?? "/",
         timeoutMs,
       );
@@ -1416,6 +2234,11 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "POST" && action === "browser" && parts[3] === "reset") {
+      sendJson(response, 200, resetBrowserProfile(botId));
+      return;
+    }
+
     if (request.method === "POST" && action === "browser") {
       const body = (await readJsonBody(request)) as Record<string, unknown>;
       if (typeof body.action !== "string" || !body.action) {
@@ -1423,12 +2246,31 @@ const server = createServer(async (request, response) => {
         return;
       }
       await ensureVm(botId);
-      const timeoutMs =
-        typeof body.timeoutMs === "number"
-          ? Math.min(Math.max(body.timeoutMs, 1_000), 90_000)
-          : 75_000;
+      const isExec = body.action === "exec";
+      const requested =
+        typeof body.timeoutMs === "number" ? body.timeoutMs : undefined;
+      const timeoutMs = Math.min(
+        Math.max(requested ?? (isExec ? 60_000 : 75_000), 1_000),
+        isExec ? 300_000 : 90_000,
+      );
       const { timeoutMs: _ignored, ...payload } = body;
-      const result = await runBrowserAction(botId, payload, timeoutMs);
+      const result = await runBrowserAction(
+        botId,
+        isExec ? { ...payload, timeoutMs } : payload,
+        isExec ? timeoutMs + 15_000 : timeoutMs,
+      );
+      sendJson(response, 200, result);
+      return;
+    }
+
+    if (request.method === "POST" && action === "desktop") {
+      const body = (await readJsonBody(request)) as Record<string, unknown>;
+      if (typeof body.action !== "string" || !body.action) {
+        sendJson(response, 400, { error: "desktop action is required" });
+        return;
+      }
+      await ensureVm(botId);
+      const result = await runDesktopAction(botId, body);
       sendJson(response, 200, result);
       return;
     }
@@ -1477,22 +2319,30 @@ server.on("upgrade", (request, socket, head) => {
     return;
   }
   const botId = decodeURIComponent(match[1] ?? "");
-  const record = vms.get(botId);
-  if (!record || record.state !== "running") {
-    socket.write(
-      "HTTP/1.1 409 Conflict\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
-    );
-    socket.destroy();
-    return;
-  }
-  void ensureBrowserDesktop(botId)
+  void adoptVmIfRunning(botId)
+    .then((record) => {
+      if (!record || record.state !== "running") {
+        socket.write(
+          "HTTP/1.1 409 Conflict\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+        );
+        socket.destroy();
+        return null;
+      }
+      return ensureBrowserDesktop(botId);
+    })
     .then(() => {
+      if (socket.destroyed) {
+        return;
+      }
       vncWss.handleUpgrade(request, socket, head, (client) => {
         attachBrowserVnc(botId, client);
       });
     })
     .catch((error) => {
       log(`vnc ${botId}: browser desktop failed: ${(error as Error).message}`);
+      if (socket.destroyed) {
+        return;
+      }
       vncWss.handleUpgrade(request, socket, head, (client) => {
         attachVnc(botId, client);
       });

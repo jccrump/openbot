@@ -10,6 +10,8 @@ pnpm --dir "$REPO_DIR" --filter @openbot/sandbox build:host
 
 echo "== installing into $INSTANCE =="
 limactl shell "$INSTANCE" -- sudo install -m 0644 "$REPO_DIR/packages/sandbox/host/dist/service.mjs" /var/lib/fc/openbot/service.mjs
+limactl shell "$INSTANCE" -- sudo install -m 0644 "$REPO_DIR/packages/sandbox/host/dist/browser-harness.mjs" /var/lib/fc/openbot/browser-harness.mjs
+limactl shell "$INSTANCE" -- sudo install -m 0755 "$REPO_DIR/packages/sandbox/guest/browser.js" /var/lib/fc/openbot/browser.js
 limactl shell "$INSTANCE" -- sudo systemctl restart openbot-host
 sleep 1
 echo "service state: $(limactl shell "$INSTANCE" -- systemctl is-active openbot-host)"

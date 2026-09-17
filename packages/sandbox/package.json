@@ -9,7 +9,8 @@
   "types": "./src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build:host": "esbuild host/service.ts --bundle --platform=node --format=esm --target=node22 --banner:js=\"import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);\" --outfile=host/dist/service.mjs"
+    "build:host": "esbuild host/service.ts --bundle --platform=node --format=esm --target=node22 --banner:js=\"import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);\" --outfile=host/dist/service.mjs",
+    "build:browser": "esbuild host/vendor/browser-harness-js/index.ts --bundle --platform=node --format=esm --target=node22 --outfile=host/dist/browser-harness.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

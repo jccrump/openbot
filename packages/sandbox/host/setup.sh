@@ -32,6 +32,23 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq ca-certificates curl squashfs-tools e2fsprogs >/dev/null
 
+# The per-agent desktop shown in the app runs in this outer VM: Xvfb + openbox
+# with a tint2 panel, a terminal, a file manager, and a generated wallpaper.
+# xdotool drives that desktop for the model (clicks, drags, scrolls, keys) and
+# scrot captures it for screenshots.
+echo "== installing desktop packages =="
+apt-get install -y -qq \
+  xvfb openbox x11vnc xterm tint2 feh thunar \
+  x11-xserver-utils fonts-dejavu-core adwaita-icon-theme \
+  xdotool scrot >/dev/null
+
+# The agent browser disables the AutomationControlled blink feature so pages do
+# not see navigator.webdriver; Chromium shows a security warning bar for that
+# flag. This policy turns the warning off so the shared desktop stays clean.
+mkdir -p /etc/chromium/policies/managed
+printf '%s\n' '{"CommandLineFlagSecurityWarningsEnabled": false}' \
+  > /etc/chromium/policies/managed/openbot.json
+
 # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor by
 # default. Chromium needs them for its Linux sandbox when the per-agent browser
 # runs as an unprivileged service account.
@@ -164,6 +181,8 @@ echo "guest image version: $IMAGE_VERSION"
 umount /mnt/openbot-rootfs
 
 echo "== outer browser runtime =="
+# playwright-core is only the Chromium *binary* downloader now; the daemon
+# drives the browser over CDP through the vendored browser-harness session.
 HOST_BROWSER_DIR="$FC_DIR/openbot-browser-host"
 mkdir -p "$HOST_BROWSER_DIR" "$FC_DIR/openbot"
 if ! grep -qs "\"version\": \"$PLAYWRIGHT_CORE_VERSION\"" \
@@ -172,21 +191,23 @@ if ! grep -qs "\"version\": \"$PLAYWRIGHT_CORE_VERSION\"" \
     "$HOST_BROWSER_DIR"/.deps-installed-*
   npm install --prefix "$HOST_BROWSER_DIR" "playwright-core@$PLAYWRIGHT_CORE_VERSION" >/dev/null 2>&1
 fi
-if ! compgen -G "$HOST_BROWSER_DIR/browsers/firefox-*" >/dev/null; then
-  PLAYWRIGHT_BROWSERS_PATH="$HOST_BROWSER_DIR/browsers" \
-    node "$HOST_BROWSER_DIR/node_modules/playwright-core/cli.js" install firefox
-fi
 if ! compgen -G "$HOST_BROWSER_DIR/browsers/chromium-*" >/dev/null; then
   PLAYWRIGHT_BROWSERS_PATH="$HOST_BROWSER_DIR/browsers" \
     node "$HOST_BROWSER_DIR/node_modules/playwright-core/cli.js" install chromium
 fi
-HOST_DEPS_MARKER="$HOST_BROWSER_DIR/.deps-installed-$PLAYWRIGHT_CORE_VERSION-firefox-chromium"
+HOST_DEPS_MARKER="$HOST_BROWSER_DIR/.deps-installed-$PLAYWRIGHT_CORE_VERSION-chromium"
 if [ ! -f "$HOST_DEPS_MARKER" ]; then
   PLAYWRIGHT_BROWSERS_PATH="$HOST_BROWSER_DIR/browsers" \
-    node "$HOST_BROWSER_DIR/node_modules/playwright-core/cli.js" install-deps firefox chromium
+    node "$HOST_BROWSER_DIR/node_modules/playwright-core/cli.js" install-deps chromium
   touch "$HOST_DEPS_MARKER"
 fi
 install -m 0755 "$BROWSER_SRC" "$FC_DIR/openbot/browser.js"
+HARNESS_BUNDLE="$REPO_DIR/packages/sandbox/host/dist/browser-harness.mjs"
+if [ ! -f "$HARNESS_BUNDLE" ]; then
+  echo "missing $HARNESS_BUNDLE — run: pnpm --filter @openbot/sandbox build:browser" >&2
+  exit 1
+fi
+install -m 0644 "$HARNESS_BUNDLE" "$FC_DIR/openbot/browser-harness.mjs"
 
 echo "== sandbox host service =="
 mkdir -p /var/lib/fc/openbot /var/lib/fc/vms
