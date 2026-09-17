@@ -1,7 +1,7 @@
 vmType: vz
 arch: aarch64
-cpus: 4
-memory: 6GiB
+cpus: 8
+memory: 8GiB
 disk: 30GiB
 nestedVirtualization: true
 
@@ -12,6 +12,13 @@ images:
 mounts:
   - location: "~"
     writable: true
+
+# Keep the control plane reachable across host-service restarts. Relying on
+# Lima's dynamic port discovery can lose the forwarding rule when a listener
+# closes and reopens quickly during deployment.
+portForwards:
+  - guestPort: 4171
+    hostPort: 4171
 
 provision:
   - mode: system

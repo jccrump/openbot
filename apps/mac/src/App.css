@@ -1092,6 +1092,50 @@ body.resizing .screen-panel * {
   color: var(--text-muted);
 }
 
+.computer-menu-separator {
+  height: 1px;
+  margin: 4px 2px;
+  background: var(--border);
+}
+
+.computer-menu-item-danger {
+  color: var(--red);
+}
+
+.computer-menu-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 7px 9px;
+}
+
+.computer-menu-confirm-text {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.computer-menu-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.danger-button {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: none;
+  background: var(--red);
+  color: #fff;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.danger-button:hover {
+  opacity: 0.9;
+}
+
 .agent-row .computer-menu {
   position: fixed;
   top: auto;
@@ -1677,7 +1721,7 @@ body.resizing .screen-panel * {
 .settings-window {
   position: fixed;
   inset: 0;
-  z-index: 20;
+  z-index: 27;
   display: flex;
   background: var(--bg-chat);
 }

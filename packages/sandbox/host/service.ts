@@ -6,10 +6,13 @@ import {
   type ServerResponse,
 } from "node:http";
 import {
+  chmodSync,
+  chownSync,
   closeSync,
   existsSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -23,6 +26,8 @@ import { WebSocket, WebSocketServer } from "ws";
 
 const FC_BIN = process.env.FIRECRACKER_BIN ?? "/usr/local/bin/firecracker";
 const FC_DIR = process.env.FC_DIR ?? "/var/lib/fc";
+const HOST_BROWSER_RUNTIME = join(FC_DIR, "openbot-browser-host");
+const HOST_BROWSER_SCRIPT = join(FC_DIR, "openbot/browser.js");
 const BASE_ROOTFS = join(FC_DIR, "rootfs.ext4");
 const BASE_VERSION_FILE = join(FC_DIR, "rootfs.version");
 const KERNEL = join(FC_DIR, "vmlinux");
@@ -33,6 +38,8 @@ const VNC_VSOCK_PORT = 5900;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const BOOT_TIMEOUT_MS = 120_000;
 const VNC_READY_TIMEOUT_MS = 30_000;
+const VNC_BUFFER_HIGH_WATER_BYTES = 256 * 1024;
+const ROOTFS_BACKUP_RETENTION = 1;
 const NETWORK_ENABLED = process.env.OPENBOT_SANDBOX_NETWORK !== "false";
 const BOOT_ARGS =
   "console=ttyS0 reboot=k panic=1 init=/usr/local/bin/openbot-agent.py";
@@ -60,8 +67,25 @@ interface VmRecord {
   pendingUpgrade: RootfsUpgrade | null;
 }
 
+interface BrowserDesktopRecord {
+  display: string;
+  displayNumber: number;
+  vncPort: number;
+  children: ReturnType<typeof spawn>[];
+}
+
+interface BrowserIdentity {
+  user: string;
+  uid: number;
+  gid: number;
+  home: string;
+}
+
 const vms = new Map<string, VmRecord>();
 const ensures = new Map<string, Promise<VmRecord>>();
+const browserDaemons = new Map<string, ReturnType<typeof spawn>>();
+const browserDesktops = new Map<string, BrowserDesktopRecord>();
+const browserIdentities = new Map<string, BrowserIdentity>();
 let nextCid = 3;
 let nextSlot = 1;
 let uplinkInterface = "eth0";
@@ -166,6 +190,22 @@ function serialLog(botId: string) {
   return join(vmDir(botId), "serial.log");
 }
 
+function browserSocket(botId: string) {
+  return join(browserRuntimeDir(botId), "browser.sock");
+}
+
+function browserRuntimeDir(botId: string) {
+  return join("/run/openbot-browsers", safeVersion(botId));
+}
+
+function browserProfile(botId: string) {
+  return join(vmDir(botId), "browser-profile");
+}
+
+function browserLog(botId: string) {
+  return join(vmDir(botId), "browser.log");
+}
+
 function vmVersionFile(botId: string) {
   return join(vmDir(botId), "rootfs.version");
 }
@@ -203,7 +243,26 @@ function copySparse(source: string, destination: string) {
   execFileSync("cp", ["--sparse=always", source, destination]);
 }
 
+function pruneRootfsBackups(dir: string, keep = ROOTFS_BACKUP_RETENTION) {
+  const backups = readdirSync(dir)
+    .filter((name) => /^rootfs\.backup-.*\.ext4(?:\.gz)?$/.test(name))
+    .map((name) => {
+      const path = join(dir, name);
+      return { path, modifiedAt: statSync(path).mtimeMs };
+    })
+    .sort((left, right) => right.modifiedAt - left.modifiedAt);
+
+  for (const backup of backups.slice(keep)) {
+    rmSync(backup.path, { force: true });
+    log(`removed expired rootfs backup ${backup.path}`);
+  }
+}
+
 function requireImageCapacity(dir: string) {
+  // Image upgrades used to retain every prior base image indefinitely. Keep a
+  // single rollback point so routine image refreshes cannot fill the host and
+  // prevent the next VM from starting.
+  pruneRootfsBackups(dir);
   const filesystem = statfsSync(dir);
   const freeBytes = filesystem.bavail * filesystem.bsize;
   const baseBlocks = statSync(BASE_ROOTFS).blocks ?? 0;
@@ -375,6 +434,7 @@ function archivePreviousRootfs(upgrade: RootfsUpgrade) {
       log(
         `vm ${upgrade.botId}: prior image retained at ${upgrade.previousRootfs}.gz`,
       );
+      pruneRootfsBackups(vmDir(upgrade.botId));
       return;
     }
     log(
@@ -528,6 +588,7 @@ function vsockExec(
 function attachVnc(botId: string, client: WebSocket) {
   const socket = connect(vsockSock(botId));
   let pending = Buffer.alloc(0);
+  const pendingClient: Buffer[] = [];
   let handshake = false;
   let closed = false;
   let resumeTimer: ReturnType<typeof setInterval> | null = null;
@@ -558,14 +619,14 @@ function attachVnc(botId: string, client: WebSocket) {
         }
         return;
       }
-      if (client.bufferedAmount < 1_000_000) {
+      if (client.bufferedAmount < VNC_BUFFER_HIGH_WATER_BYTES) {
         if (resumeTimer) {
           clearInterval(resumeTimer);
           resumeTimer = null;
         }
         socket.resume();
       }
-    }, 25);
+    }, 5);
   };
 
   socket.on("connect", () => {
@@ -589,19 +650,29 @@ function attachVnc(botId: string, client: WebSocket) {
       handshake = true;
       socket.setTimeout(0);
       log(`vnc ${botId}: stream open`);
+      for (const payload of pendingClient.splice(0)) {
+        if (!socket.write(payload)) {
+          client.pause();
+          break;
+        }
+      }
       if (pending.length === 0) return;
       const rest = pending;
       pending = Buffer.alloc(0);
       client.send(rest, { binary: true }, (error) => {
         if (error) shutdown(1011, "client relay failed");
       });
-      if (client.bufferedAmount > 1_000_000) pauseUntilClientDrains();
+      if (client.bufferedAmount > VNC_BUFFER_HIGH_WATER_BYTES) {
+        pauseUntilClientDrains();
+      }
       return;
     }
     client.send(chunk, { binary: true }, (error) => {
       if (error) shutdown(1011, "client relay failed");
     });
-    if (client.bufferedAmount > 1_000_000) pauseUntilClientDrains();
+    if (client.bufferedAmount > VNC_BUFFER_HIGH_WATER_BYTES) {
+      pauseUntilClientDrains();
+    }
   });
 
   socket.on("drain", () => {
@@ -615,8 +686,92 @@ function attachVnc(botId: string, client: WebSocket) {
   });
 
   client.on("message", (data, isBinary) => {
-    if (closed || !handshake) return;
+    if (closed) return;
     const payload = isBinary ? (data as Buffer) : Buffer.from(String(data));
+    if (!handshake) {
+      pendingClient.push(payload);
+      return;
+    }
+    if (!socket.write(payload)) client.pause();
+  });
+  client.on("close", () => shutdown(1000, "client closed"));
+  client.on("error", () => shutdown(1011, "client websocket failed"));
+}
+
+function attachBrowserVnc(botId: string, client: WebSocket) {
+  const desktop = browserDesktops.get(botId);
+  if (!desktop) {
+    client.close(1013, "browser desktop unavailable");
+    return;
+  }
+  const socket = connect({ host: "127.0.0.1", port: desktop.vncPort });
+  const pendingClient: Buffer[] = [];
+  let connected = false;
+  let closed = false;
+  let resumeTimer: ReturnType<typeof setInterval> | null = null;
+
+  const shutdown = (code = 1011, reason = "browser vnc stream closed") => {
+    if (closed) return;
+    closed = true;
+    if (resumeTimer) clearInterval(resumeTimer);
+    socket.destroy();
+    try {
+      client.close(code, reason);
+    } catch {
+      // already closed
+    }
+  };
+
+  const pauseUntilClientDrains = () => {
+    socket.pause();
+    if (resumeTimer) return;
+    resumeTimer = setInterval(() => {
+      if (closed || client.readyState !== client.OPEN) {
+        if (resumeTimer) clearInterval(resumeTimer);
+        resumeTimer = null;
+        return;
+      }
+      if (client.bufferedAmount < VNC_BUFFER_HIGH_WATER_BYTES) {
+        if (resumeTimer) clearInterval(resumeTimer);
+        resumeTimer = null;
+        socket.resume();
+      }
+    }, 5);
+  };
+
+  socket.on("connect", () => {
+    connected = true;
+    socket.setNoDelay(true);
+    for (const payload of pendingClient.splice(0)) {
+      if (!socket.write(payload)) {
+        client.pause();
+        break;
+      }
+    }
+    log(`vnc ${botId}: browser desktop stream open`);
+  });
+  socket.on("data", (chunk: Buffer) => {
+    if (closed) return;
+    client.send(chunk, { binary: true }, (error) => {
+      if (error) shutdown(1011, "client relay failed");
+    });
+    if (client.bufferedAmount > VNC_BUFFER_HIGH_WATER_BYTES) {
+      pauseUntilClientDrains();
+    }
+  });
+  socket.on("drain", () => {
+    if (!closed) client.resume();
+  });
+  socket.on("error", () => shutdown(1011, "browser vnc unavailable"));
+  socket.on("close", () => shutdown(1011, "browser vnc stream closed"));
+
+  client.on("message", (data, isBinary) => {
+    if (closed) return;
+    const payload = isBinary ? (data as Buffer) : Buffer.from(String(data));
+    if (!connected) {
+      pendingClient.push(payload);
+      return;
+    }
     if (!socket.write(payload)) client.pause();
   });
   client.on("close", () => shutdown(1000, "client closed"));
@@ -805,7 +960,318 @@ function ensureVm(botId: string): Promise<VmRecord> {
   return pending;
 }
 
+function browserDisplayFor(botId: string) {
+  const record = vms.get(botId);
+  if (!record) throw new Error(`unknown vm: ${botId}`);
+  return {
+    displayNumber: 99 + record.slot,
+    display: `:${99 + record.slot}`,
+    vncPort: 5900 + record.slot,
+  };
+}
+
+function browserUserName(botId: string) {
+  const suffix = botId.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 16);
+  return `openbot-${suffix || "browser"}`;
+}
+
+function browserIdentity(botId: string): BrowserIdentity {
+  const existing = browserIdentities.get(botId);
+  if (existing) return existing;
+
+  const user = browserUserName(botId);
+  let uidResult = spawnSync("id", ["-u", user], { encoding: "utf8" });
+  if (uidResult.status !== 0) {
+    const created = spawnSync(
+      "useradd",
+      [
+        "--system",
+        "--no-create-home",
+        "--home-dir",
+        browserProfile(botId),
+        "--shell",
+        "/usr/sbin/nologin",
+        user,
+      ],
+      { encoding: "utf8" },
+    );
+    if (created.status !== 0) {
+      throw new Error(`could not create browser user: ${created.stderr.trim()}`);
+    }
+    uidResult = spawnSync("id", ["-u", user], { encoding: "utf8" });
+  }
+  const gidResult = spawnSync("id", ["-g", user], { encoding: "utf8" });
+  const uid = Number.parseInt(uidResult.stdout.trim(), 10);
+  const gid = Number.parseInt(gidResult.stdout.trim(), 10);
+  if (!Number.isInteger(uid) || !Number.isInteger(gid)) {
+    throw new Error(`could not resolve browser user: ${user}`);
+  }
+  const identity = { user, uid, gid, home: browserProfile(botId) };
+  browserIdentities.set(botId, identity);
+  return identity;
+}
+
+function prepareBrowserIdentity(botId: string) {
+  const identity = browserIdentity(botId);
+  mkdirSync(identity.home, { recursive: true });
+  const runtimeDir = browserRuntimeDir(botId);
+  mkdirSync(runtimeDir, { recursive: true });
+  chownSync(runtimeDir, identity.uid, identity.gid);
+  chmodSync(runtimeDir, 0o700);
+  const owned = spawnSync(
+    "chown",
+    ["-R", `${identity.uid}:${identity.gid}`, identity.home],
+    { encoding: "utf8" },
+  );
+  if (owned.status !== 0) {
+    throw new Error(`could not prepare browser profile: ${owned.stderr.trim()}`);
+  }
+  chmodSync(identity.home, 0o700);
+  return identity;
+}
+
+function tcpReady(host: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = connect({ host, port });
+    const finish = (ready: boolean) => {
+      socket.destroy();
+      resolve(ready);
+    };
+    socket.setTimeout(500, () => finish(false));
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
+}
+
+function stopBrowserDesktop(botId: string) {
+  const desktop = browserDesktops.get(botId);
+  browserDesktops.delete(botId);
+  if (!desktop) return;
+  for (const child of [...desktop.children].reverse()) {
+    if (child.pid && child.exitCode === null) child.kill("SIGTERM");
+  }
+  rmSync(`/tmp/.X11-unix/X${desktop.displayNumber}`, { force: true });
+  rmSync(`/tmp/.X${desktop.displayNumber}-lock`, { force: true });
+}
+
+async function ensureBrowserDesktop(botId: string) {
+  const existing = browserDesktops.get(botId);
+  if (
+    existing &&
+    existing.children.every((child) => child.exitCode === null) &&
+    existsSync(`/tmp/.X11-unix/X${existing.displayNumber}`) &&
+    (await tcpReady("127.0.0.1", existing.vncPort))
+  ) {
+    return existing;
+  }
+  stopBrowserDesktop(botId);
+
+  const { display, displayNumber, vncPort } = browserDisplayFor(botId);
+  mkdirSync(vmDir(botId), { recursive: true });
+  rmSync(`/tmp/.X11-unix/X${displayNumber}`, { force: true });
+  rmSync(`/tmp/.X${displayNumber}-lock`, { force: true });
+  const logFd = openSync(browserLog(botId), "a");
+  const desktopEnv = {
+    ...process.env,
+    DISPLAY: display,
+    HOME: "/root",
+    XDG_CONFIG_HOME: join(vmDir(botId), "desktop-config"),
+    XDG_CACHE_HOME: join(vmDir(botId), "desktop-cache"),
+  };
+  mkdirSync(desktopEnv.XDG_CONFIG_HOME, { recursive: true });
+  mkdirSync(desktopEnv.XDG_CACHE_HOME, { recursive: true });
+
+  const xvfb = spawn(
+    "Xvfb",
+    [display, "-screen", "0", "1280x800x24", "-nolisten", "tcp", "-ac", "-noreset"],
+    { stdio: ["ignore", logFd, logFd], env: desktopEnv },
+  );
+  const children = [xvfb];
+  const displayDeadline = Date.now() + 10_000;
+  while (!existsSync(`/tmp/.X11-unix/X${displayNumber}`)) {
+    if (xvfb.exitCode !== null || Date.now() >= displayDeadline) {
+      closeSync(logFd);
+      if (xvfb.pid && xvfb.exitCode === null) xvfb.kill("SIGKILL");
+      rmSync(`/tmp/.X11-unix/X${displayNumber}`, { force: true });
+      rmSync(`/tmp/.X${displayNumber}-lock`, { force: true });
+      throw new Error("browser display did not become ready");
+    }
+    await sleep(50);
+  }
+
+  const openbox = spawn("openbox", [], {
+    stdio: ["ignore", logFd, logFd],
+    env: desktopEnv,
+  });
+  const x11vnc = spawn(
+    "x11vnc",
+    [
+      "-display",
+      display,
+      "-forever",
+      "-shared",
+      "-nopw",
+      "-localhost",
+      "-rfbport",
+      String(vncPort),
+      "-nothreads",
+      "-wait",
+      "16",
+      "-defer",
+      "10",
+      "-speeds",
+      "lan",
+    ],
+    { stdio: ["ignore", logFd, logFd], env: desktopEnv },
+  );
+  children.push(openbox, x11vnc);
+  closeSync(logFd);
+  const desktop = { display, displayNumber, vncPort, children };
+  browserDesktops.set(botId, desktop);
+
+  const vncDeadline = Date.now() + 10_000;
+  while (!(await tcpReady("127.0.0.1", vncPort))) {
+    if (x11vnc.exitCode !== null || Date.now() >= vncDeadline) {
+      stopBrowserDesktop(botId);
+      throw new Error("browser VNC display did not become ready");
+    }
+    await sleep(50);
+  }
+  log(`browser ${botId}: desktop ready on ${display}, VNC ${vncPort}`);
+  return desktop;
+}
+
+function browserEnvironment(botId: string): NodeJS.ProcessEnv {
+  const desktop = browserDesktops.get(botId);
+  if (!desktop) throw new Error(`browser desktop is not running: ${botId}`);
+  const identity = browserIdentity(botId);
+  return {
+    ...process.env,
+    HOME: identity.home,
+    USER: identity.user,
+    LOGNAME: identity.user,
+    XDG_CONFIG_HOME: join(identity.home, ".config"),
+    XDG_CACHE_HOME: join(identity.home, ".cache"),
+    DISPLAY: desktop.display,
+    OPENBOT_BROWSER_DISPLAY: desktop.display,
+    OPENBOT_BROWSER_ENGINE: "chromium",
+    OPENBOT_BROWSER_HEADLESS: "0",
+    OPENBOT_BROWSER_PROFILE: browserProfile(botId),
+    OPENBOT_BROWSER_RUNTIME: HOST_BROWSER_RUNTIME,
+    OPENBOT_BROWSER_SOCKET: browserSocket(botId),
+  };
+}
+
+async function ensureBrowserDaemon(botId: string) {
+  await ensureBrowserDesktop(botId);
+  const existing = browserDaemons.get(botId);
+  if (existing?.pid && existing.exitCode === null && existsSync(browserSocket(botId))) {
+    return;
+  }
+  mkdirSync(vmDir(botId), { recursive: true });
+  const identity = prepareBrowserIdentity(botId);
+  rmSync(browserSocket(botId), { force: true });
+  const logFd = openSync(browserLog(botId), "a");
+  const child = spawn("/usr/local/bin/node", [HOST_BROWSER_SCRIPT, "serve"], {
+    stdio: ["ignore", logFd, logFd],
+    env: browserEnvironment(botId),
+    uid: identity.uid,
+    gid: identity.gid,
+  });
+  closeSync(logFd);
+  browserDaemons.set(botId, child);
+  child.once("exit", (code, signal) => {
+    if (browserDaemons.get(botId) === child) {
+      browserDaemons.delete(botId);
+    }
+    rmSync(browserSocket(botId), { force: true });
+    log(`browser ${botId}: daemon exited (${signal ?? code ?? "unknown"})`);
+  });
+  const deadline = Date.now() + 10_000;
+  while (!existsSync(browserSocket(botId))) {
+    if (child.exitCode !== null) {
+      throw new Error(`browser daemon exited during startup (${child.exitCode})`);
+    }
+    if (Date.now() >= deadline) {
+      child.kill("SIGKILL");
+      throw new Error("browser daemon did not become ready");
+    }
+    await sleep(50);
+  }
+  log(`browser ${botId}: daemon ready (pid ${child.pid})`);
+}
+
+async function runBrowserAction(
+  botId: string,
+  payload: Record<string, unknown>,
+  timeoutMs: number,
+): Promise<Record<string, unknown>> {
+  await ensureBrowserDaemon(botId);
+  const identity = browserIdentity(botId);
+  const startedAt = Date.now();
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      "/usr/local/bin/node",
+      [HOST_BROWSER_SCRIPT, "action", JSON.stringify(payload)],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: browserEnvironment(botId),
+        uid: identity.uid,
+        gid: identity.gid,
+      },
+    );
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) {
+        reject(error);
+        return;
+      }
+      try {
+        resolve({
+          ...(JSON.parse(stdout.trim()) as Record<string, unknown>),
+          durationMs: Date.now() - startedAt,
+        });
+      } catch {
+        reject(
+          new Error(
+            `invalid browser response: ${(stderr || stdout).slice(0, 400)}`,
+          ),
+        );
+      }
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(new Error(`browser action timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", (error) => finish(error));
+    child.on("exit", () => finish());
+  });
+}
+
+function stopBrowser(botId: string) {
+  const child = browserDaemons.get(botId);
+  browserDaemons.delete(botId);
+  if (child?.pid) {
+    child.kill("SIGTERM");
+  }
+  spawnSync("pkill", ["-f", browserProfile(botId)], { stdio: "ignore" });
+  rmSync(browserSocket(botId), { force: true });
+  stopBrowserDesktop(botId);
+}
+
 async function stopVm(record: VmRecord) {
+  stopBrowser(record.botId);
   const pid = record.pid;
   record.state = "stopped";
   record.pid = null;
@@ -838,6 +1304,12 @@ async function destroyVm(botId: string) {
     vms.delete(botId);
   }
   rmSync(vmDir(botId), { recursive: true, force: true });
+  rmSync(browserRuntimeDir(botId), { recursive: true, force: true });
+  browserIdentities.delete(botId);
+  const user = browserUserName(botId);
+  if (spawnSync("id", ["-u", user]).status === 0) {
+    spawnSync("userdel", [user], { stdio: "ignore" });
+  }
 }
 
 function readJsonBody(request: IncomingMessage): Promise<unknown> {
@@ -944,6 +1416,23 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "POST" && action === "browser") {
+      const body = (await readJsonBody(request)) as Record<string, unknown>;
+      if (typeof body.action !== "string" || !body.action) {
+        sendJson(response, 400, { error: "browser action is required" });
+        return;
+      }
+      await ensureVm(botId);
+      const timeoutMs =
+        typeof body.timeoutMs === "number"
+          ? Math.min(Math.max(body.timeoutMs, 1_000), 90_000)
+          : 75_000;
+      const { timeoutMs: _ignored, ...payload } = body;
+      const result = await runBrowserAction(botId, payload, timeoutMs);
+      sendJson(response, 200, result);
+      return;
+    }
+
     if (request.method === "POST" && action === "stop") {
       const record = vms.get(botId);
       if (record) {
@@ -996,14 +1485,24 @@ server.on("upgrade", (request, socket, head) => {
     socket.destroy();
     return;
   }
-  vncWss.handleUpgrade(request, socket, head, (client) => {
-    attachVnc(botId, client);
-  });
+  void ensureBrowserDesktop(botId)
+    .then(() => {
+      vncWss.handleUpgrade(request, socket, head, (client) => {
+        attachBrowserVnc(botId, client);
+      });
+    })
+    .catch((error) => {
+      log(`vnc ${botId}: browser desktop failed: ${(error as Error).message}`);
+      vncWss.handleUpgrade(request, socket, head, (client) => {
+        attachVnc(botId, client);
+      });
+    });
 });
 
 function cleanup() {
   try {
     execSync("pkill -f 'firecracker --api-sock' || true");
+    execSync("pkill -f '/var/lib/fc/openbot/browser.js' || true");
   } catch {
     // nothing running
   }
@@ -1025,6 +1524,9 @@ server.listen(PORT, "127.0.0.1", () => {
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     log("shutting down, stopping vms");
+    for (const botId of browserDaemons.keys()) {
+      stopBrowser(botId);
+    }
     for (const record of vms.values()) {
       if (record.pid) {
         try {

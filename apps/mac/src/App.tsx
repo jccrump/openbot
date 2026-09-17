@@ -344,6 +344,7 @@ export default function App() {
     top: number;
     left: number;
     width: number;
+    confirmDelete?: boolean;
   } | null>(null);
   const [screenOpen, setScreenOpen] = useState(storedScreenPanelOpen);
   const [screenPlaying, setScreenPlaying] = useState(true);
@@ -354,6 +355,9 @@ export default function App() {
   const [screenVmState, setScreenVmState] = useState<string | null>(null);
   const [screenError, setScreenError] = useState<string | null>(null);
   const [vncState, setVncState] = useState<VncState>("idle");
+  const [windowActive, setWindowActive] = useState(
+    () => !document.hidden && document.hasFocus(),
+  );
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   const bot =
@@ -391,7 +395,7 @@ export default function App() {
   const vncUrl = bot
     ? `${DAEMON_HTTP_URL.replace(/^http/, "ws")}/bots/${encodeURIComponent(bot.id)}/vnc`
     : "";
-  const canStream = Boolean(bot) && !isLocalBot(bot) && screenStatus !== "vm-off";
+  const canStream = Boolean(bot) && !isLocalBot(bot);
   const vncLive = vncState === "live";
   const vncActive = canStream && screenPlaying && screenOpen;
   const screenCaption = (() => {
@@ -418,6 +422,20 @@ export default function App() {
     }
     return screenMessage;
   })();
+
+  useEffect(() => {
+    const syncActivity = () => {
+      setWindowActive(!document.hidden && document.hasFocus());
+    };
+    document.addEventListener("visibilitychange", syncActivity);
+    window.addEventListener("focus", syncActivity);
+    window.addEventListener("blur", syncActivity);
+    return () => {
+      document.removeEventListener("visibilitychange", syncActivity);
+      window.removeEventListener("focus", syncActivity);
+      window.removeEventListener("blur", syncActivity);
+    };
+  }, []);
 
   useEffect(() => {
     if (!screenExpanded) {
@@ -495,6 +513,7 @@ export default function App() {
     if (
       !screenOpen ||
       !screenPlaying ||
+      !windowActive ||
       !bot ||
       bot.computer === "mac" ||
       vncLive
@@ -558,7 +577,7 @@ export default function App() {
       controller.abort();
       clearInterval(timer);
     };
-  }, [screenOpen, screenPlaying, bot, vncLive]);
+  }, [screenOpen, screenPlaying, windowActive, bot, vncLive]);
 
   useEffect(() => {
     const node = scrollRef.current;
@@ -755,6 +774,55 @@ export default function App() {
                           Runs commands directly on this Mac
                         </span>
                       </button>
+                      <div className="computer-menu-separator" />
+                      {computerMenu.confirmDelete ? (
+                        <div className="computer-menu-confirm">
+                          <p className="computer-menu-confirm-text">
+                            Delete {item.name}? Its computer and chat history
+                            are removed.
+                          </p>
+                          <div className="computer-menu-confirm-actions">
+                            <button
+                              className="ghost-button"
+                              onClick={() =>
+                                setComputerMenu((current) =>
+                                  current
+                                    ? { ...current, confirmDelete: false }
+                                    : current,
+                                )
+                              }
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              className="danger-button"
+                              onClick={() => {
+                                daemon.deleteBot(item.id);
+                                setComputerMenu(null);
+                              }}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <button
+                          role="menuitem"
+                          className="computer-menu-item computer-menu-item-danger"
+                          onClick={() =>
+                            setComputerMenu((current) =>
+                              current
+                                ? { ...current, confirmDelete: true }
+                                : current,
+                            )
+                          }
+                        >
+                          <span>Delete agent</span>
+                          <span className="computer-menu-sub">
+                            Removes its computer and chats
+                          </span>
+                        </button>
+                      )}
                     </div>
                   </>
                 )}
@@ -762,7 +830,9 @@ export default function App() {
             );
           })}
           {!sidebarCollapsed && visibleBots.length === 0 && (
-            <p className="sidebar-empty">No agents match your search.</p>
+            <p className="sidebar-empty">
+              {query ? "No agents match your search." : "No agents yet."}
+            </p>
           )}
         </div>
 

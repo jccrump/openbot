@@ -14,13 +14,14 @@ Single-user, Mac-first. Mobile is a later thin client.
 - **M0 (done):** monorepo, daemon, model gateway, SQLite persistence,
   WebSocket protocol, Mac UI, mock-provider smoke test.
 - **M1 (mostly done):** Lima + Firecracker sandbox host, one microVM per agent,
-  guest agent over vsock, shell/file/browser tools, approvals, local-Mac
+  guest agent over vsock, shell/file tools, host-routed browser tools,
+  approvals, local-Mac
   computer mode. Still missing: snapshots, per-bot egress policy, a polished
   base image.
 - **M2 (in progress):** browser automation with persistent sign-ins and
-  screenshots works. The live Openbox/tint2 desktop is delivered through
-  x11vnc, vsock, two localhost WebSocket relays, and noVNC; sign-in polish is
-  still incomplete.
+  screenshots works. The shared Chromium/Xvfb desktop is delivered through
+  x11vnc, two localhost WebSocket relays, and noVNC; the guest desktop remains
+  as a fallback. Sign-in polish is still incomplete.
 - **M3 (partial):** the optional Codex harness runs in the daemon and the
   Responses-to-Chat-Completions bridge drives non-OpenAI models (verified end
   to end with a real DeepSeek key, including a tool call in the microVM). The
@@ -49,9 +50,9 @@ nothing routes work between agents.
 |        | model gateway          | sandbox control                    |
 |        v                        v                                    |
 |  providers                 Lima VM (Linux, nested virtualization)     |
-|  (OpenAI-compatible,       +-- Firecracker microVM per agent          |
-|   Codex CLI + bridge)           guest agent: exec, files, VNC bridge  |
-|                                 Chromium over CDP + Openbox desktop    |
+|  (OpenAI-compatible,       +-- Chromium/Xvfb per agent (shared view)  |
+|   Codex CLI + bridge)      +-- Firecracker microVM per agent          |
+|                                 guest agent: exec, files, fallback VNC|
 +----------------------------------------------------------------------+
              | optional: Tailscale / Cloudflare Tunnel (planned)
              v
@@ -73,8 +74,8 @@ packages/core/             The daemon: config, SQLite store, agent loop,
                            compaction, harnesses, tools, WS server
 packages/mcp/              MCP server exposing a computer to Codex / any client
 packages/responses-bridge/ Responses API -> Chat Completions bridge for Codex
-packages/sandbox/          Sandbox client + Lima/Firecracker host service and
-                           guest agent/browser daemon
+packages/sandbox/          Sandbox client + Lima/Firecracker host service,
+                           host browser daemon, and guest agent
 scripts/                   smoke test, compaction demo, mock model, Codex wrapper
 docs/                      This document and screenshots
 .openbot-dev/              Dev data dir (gitignored)
@@ -95,6 +96,10 @@ docs/                      This document and screenshots
   output and screenshots; inline approval cards; a collapsible live noVNC
   screen panel with screenshot fallback and a draggable resizer; create-agent modal; and
   Settings.
+- Background or unfocused windows keep their RFB connection and last rendered
+  canvas warm, but hold framebuffer update requests, disable input, and suspend
+  screenshot polling. The pending update is released on focus, avoiding a new
+  handshake without creating background x11vnc encoding work.
 - Not present: approvals inbox, run log, routines browser, memory browser, and
   group chats.
 
@@ -272,22 +277,28 @@ Working recipe, validated on an M4 Pro (macOS 27, Lima 2.2.0):
 - A Lima VM (`packages/sandbox/host/lima.yaml`) with `vmType: vz` and
   `nestedVirtualization: true` exposes `/dev/kvm` on Apple Silicon (M3+).
 - Inside it: Firecracker v1.16.0 plus the Firecracker CI aarch64 kernel
-  (`vmlinux-5.10.239`) and Ubuntu 24.04 rootfs (squashfs converted to a 4 GiB
+  (`vmlinux-6.1.155`) and Ubuntu 24.04 rootfs (squashfs converted to a 4 GiB
   ext4). Node 22 is installed and the rootfs is provisioned with the guest
-  agent, the browser daemon, Playwright's Chromium plus its system
-  dependencies, and DNS resolvers.
+  agent, desktop stack, and standalone DNS resolvers.
 - The guest agent (`packages/sandbox/guest/agent.py`) runs as PID 1 via the
   `init=` boot arg and listens on vsock port 5000. It mounts /proc, /sys, and
   /dev itself, executes newline-delimited JSON requests
   (`{cmd, cwd?, timeout?}` to `{exit, stdout, stderr}`), and survives
   individual connection failures.
-- The browser daemon (`packages/sandbox/guest/browser.js`) starts at boot,
-  launches `chrome-headless-shell` once, holds a persistent CDP connection, and
-  serves browser actions over a Unix socket. That keeps per-action latency to a
-  few seconds instead of paying a Node + Chromium start per call. Measured:
-  first navigation after boot ~15–25 s, later actions 2–8 s. Design notes on
-  how production computer-use agents batch actions, combine DOM text with
-  screenshots, and budget observations are in
+- Browsers do not run inside nested Firecracker. Both Chromium and Firefox
+  repeatedly stalled there despite healthy networking, software rendering, and
+  a 6.1 kernel; the identical browser/rootfs loaded pages normally on the outer
+  Lima kernel. The sandbox host therefore launches one persistent Chromium
+  daemon and one Xvfb/x11vnc desktop per agent. Chromium runs under a dedicated
+  unprivileged Linux account with its sandbox enabled, while the profile and
+  Unix socket are private to that account. Warm actions typically complete in
+  tens to hundreds of milliseconds.
+- The live noVNC stream is the same outer X display Chromium renders into.
+  Model actions and manual takeover therefore share a page, cookies, focus, and
+  navigation history. The guest still owns shell/files and runs its lightweight
+  desktop as a fallback if the browser presentation layer cannot start. Design
+  notes on computer-use batching, DOM text, screenshots, and observation
+  budgets are in
   [research/computer-use.md](research/computer-use.md).
 - The desktop supervisor starts Xvfb at 1280x800, Openbox, tint2, xterm, and
   x11vnc. x11vnc listens only on guest loopback. The guest agent verifies an
@@ -304,18 +315,20 @@ esbuild into a single `service.mjs`, installed into the Lima VM at
   ensures, configures Firecracker through its API, and does not report
   `running` until both the exec agent and an RFB framebuffer are reachable
 - `POST /vms/:botId/exec` runs a command through the vsock agent
+- `POST /vms/:botId/browser` runs an action in the persistent per-agent browser
 - `POST /vms/:botId/stop` and `POST /vms/:botId/destroy`
 
 Per-agent state lives in `/var/lib/fc/vms/<botId>/` (rootfs copy and version,
-recovery images, `api.sock`, `vsock.sock`, `serial.log`). `sandbox:setup`
+newest recovery image, browser profile/log, `api.sock`, `vsock.sock`,
+`serial.log`). `sandbox:setup`
 hashes the managed guest payload into `/var/lib/fc/rootfs.version`. On a version
 mismatch, the host checks and mounts the stopped old image, creates a fresh
 rootfs from the base, copies durable data from `/root`, `/home`, `/srv`, and
 workspace directories, boots and checks the new desktop, then gzip-compresses
 the old rootfs as a recovery artifact. A failed boot rolls back atomically and
-keeps the failed image for diagnosis. Low disk space fails before copying, and
-partial first-boot copies are removed. Recovery artifacts are never pruned
-automatically.
+keeps the failed image for diagnosis. Low disk space fails before copying,
+partial first-boot copies are removed, and successful upgrades retain only the
+newest compressed rollback image.
 
 The host exposes RFB only as `ws://127.0.0.1:4171/vms/:id/vnc`; the daemon
 validates the bot and browser origin and relays it as
@@ -331,9 +344,12 @@ pass.
 offline. There is **no per-bot egress policy**: every VM shares the same NAT
 and can reach anything the host can.
 
-**One microVM per agent.** Each agent gets its own kernel, persistent durable
-data, browser profile, and sign-ins. Image-upgrade rollback exists; general
-user snapshots, pause/resume, and point-in-time restore do not.
+**One microVM per agent.** Each agent gets its own kernel and persistent durable
+data, plus a separate outer-browser profile and Linux account for sign-ins.
+Deleting an agent aborts its active runs,
+deletes its threads and messages, removes its local workspace, and destroys its
+VM (`POST /vms/:botId/destroy`). Image-upgrade rollback exists; general user
+snapshots, pause/resume, and point-in-time restore do not.
 
 ### Tools and approvals
 
@@ -342,14 +358,35 @@ The daemon exposes four tools to any model that supports function calling:
 - `shell` — run a command on the agent's computer
 - `read_file` — read a file from the agent's computer
 - `write_file` — write a file, creating parent directories
-- `browser` — drive the real browser: `goto`, `click`, `type`, `text`,
-  `screenshot`, `back`, `wait`. Cookies and sign-ins persist in the browser
-  profile between calls, and screenshots are saved as artifacts and rendered in
-  the chat and screen panel.
+- `browser` — drive the real browser: `goto`, `click`, `type`, `text`, `links`,
+  `screenshot`, `back`, `wait`. Navigation and interaction actions include a
+  bounded text observation of the resulting page; `links` returns link labels
+  and URLs. Cookies and sign-ins persist in the browser profile between calls,
+  and screenshots are saved as artifacts and rendered in the chat and screen
+  panel. Every result is labeled with a stable per-run observation ID and a
+  coarse source type (`direct-page`, `search-results`, `blocked-or-missing`, or
+  `failed`) before it is returned to the model and persisted.
 
 Tool activity is streamed to the app (`tool.start`, `tool.result`) and
 persisted on the assistant message as `toolCalls`, so the next turn rebuilds a
 correct assistant/tool-call/tool-result history for the provider.
+
+The built-in agent loop is completion-driven. Every model-requested tool call
+is executed and returned to the model, and the loop continues until the model
+emits a response with no more tool calls. There is no fixed round or action
+count. The user can cancel the run, each provider round and tool action has its
+own timeout, and connection failures after tool activity persist an honest
+incomplete response instead of treating progress narration as success.
+
+When a run used the browser, the first proposed final answer is buffered rather
+than shown immediately. The daemon builds a bounded evidence ledger from the
+persisted observations and asks the same configured model to audit the draft
+against the original user request. The verifier must keep claims bound to the
+exact entity and source that support them. A passing draft is released to chat;
+a rejected draft and its concrete gaps are returned privately to the executor,
+which may browse again or revise unknown claims before another audit. Invalid or
+unavailable verifier output fails open so a provider formatting problem cannot
+strand an otherwise completed run.
 
 Approvals gate execution. With `requireApproval` on (default), the daemon emits
 `approval.request` and waits; the app shows a card with the exact command and
@@ -385,7 +422,7 @@ Client to server:
 - `chat.send` — `{ botId, threadId?, text, model? }`
 - `chat.cancel` — `{ runId }`
 - `thread.list`, `thread.messages`
-- `bots.create`, `bots.update`
+- `bots.create`, `bots.update`, `bots.delete`
 - `provider.upsert`, `provider.remove`, `provider.fetchModels`
 - `settings.update` — default model, approval toggle, harness
 - `approval.respond`
@@ -401,7 +438,8 @@ Server to client:
 - `tool.start`, `tool.result` — live tool activity for the transcript cards
 - `approval.request` — asks the user to approve a tool action
 - `sandbox.state` — agent computer state (stopped, booting, running, error)
-- `bot.created`, `bot.updated`, `providers.updated`, `provider.models`
+- `bot.created`, `bot.updated`, `bot.deleted`, `providers.updated`,
+  `provider.models`
 
 Every message is defined once in `packages/protocol` with Zod and validated on
 both sides.
@@ -428,17 +466,17 @@ Planned additions: `runs` (journal), `routines`, `memory`, `approvals`,
 - Single-user: the daemon binds `127.0.0.1` only. There is no authentication
   layer; anything that can reach the loopback port is trusted. Remote/mobile
   access would go through Tailscale or a Cloudflare Tunnel, never a public port.
-- x11vnc has no password because it is reachable only on guest loopback and
-  through the VM's vsock. The sandbox host and daemon WebSockets are also
-  loopback-only; this is a local-user trust boundary, not multi-user auth.
+- x11vnc has no password because it is reachable only on the outer Lima
+  loopback. The sandbox host and daemon WebSockets are also loopback-only; this
+  is a local-user trust boundary, not multi-user auth.
 - Provider keys live in the SQLite database (`0600` file in a `0700` directory)
   or in environment variables referenced by name. The macOS Keychain is
   planned, not implemented. Keys are never logged.
-- Firecracker microVMs are the isolation boundary for cloud models; agents can
-  only touch their own VM.
-- Chromium runs as root with `--no-sandbox` inside that boundary. A browser
-  compromise can own the guest, so the VM and approval boundary remain
-  security-critical.
+- Firecracker microVMs isolate shell and file execution for cloud models.
+- Chromium runs under a dedicated per-agent Linux account with Chromium's
+  namespace sandbox enabled in the shared outer Lima VM. Profiles and runtime
+  sockets are owner-only, but browser processes do not have per-agent kernels;
+  Lima remains the outer containment boundary for browser compromise.
 - This Mac agents run as the user. The only boundary is the workspace path
   check for file tools plus mandatory approvals for every action.
 - There are no per-bot egress allowlists and no snapshots before risky
@@ -515,6 +553,25 @@ tool.
 old messages into a model-written summary that stays in the transcript as a
 normal assistant message. This keeps provider history valid (no dangling tool
 calls) and keeps the summary visible in the UI rather than hidden state.
+
+**ADR-012: Tool tasks are completion-driven.** Research and multi-site work can
+legitimately need more than a handful of browser actions, so action counts are
+not a completion signal. Browser navigation returns page evidence in the same
+action and the model continues until it chooses to answer. Cancellation,
+per-operation timeouts, and honest failure recovery contain real failures. The
+default system prompt is a small general contract about completing the request,
+binding facts to their evidence, separating verification from inference, and
+returning the useful result to chat.
+
+**ADR-013: Verify browser-backed answers against an evidence ledger.** Prompt
+instructions alone do not prevent a weaker model from combining a price from
+one product, pickup language from another, and a nearby store into a false local
+availability claim. Browser outputs therefore become numbered, source-typed
+observations. The harness holds the draft, runs a separate evidence-grounded
+completion audit, and returns gaps to the executor until it can either support
+the claim or label it unknown. The verifier is intentionally separate from the
+compact general system prompt so research-specific quality control does not grow
+that prompt into a catalog of situations.
 
 ## Running it
 

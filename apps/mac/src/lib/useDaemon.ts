@@ -333,6 +333,62 @@ export function useDaemon() {
           );
           break;
         }
+        case "bot.deleted": {
+          const removedThreadIds = new Set(
+            threadsRef.current
+              .filter((thread) => thread.botId === message.botId)
+              .map((thread) => thread.id),
+          );
+          const remainingBots = botsRef.current.filter(
+            (bot) => bot.id !== message.botId,
+          );
+          const remainingThreads = threadsRef.current.filter(
+            (thread) => thread.botId !== message.botId,
+          );
+          setBots(remainingBots);
+          setThreads(remainingThreads);
+          setSandboxStates((current) => {
+            if (!(message.botId in current)) {
+              return current;
+            }
+            const next = { ...current };
+            delete next[message.botId];
+            return next;
+          });
+          if (removedThreadIds.size > 0) {
+            for (const threadId of removedThreadIds) {
+              disarmWatchdog(threadId);
+            }
+            setStreamingByThread((current) => {
+              const next = { ...current };
+              for (const threadId of removedThreadIds) {
+                delete next[threadId];
+              }
+              return next;
+            });
+            setToolActivity((current) =>
+              current.filter((item) => !removedThreadIds.has(item.threadId)),
+            );
+            setApprovals((current) =>
+              current.filter((item) => !removedThreadIds.has(item.threadId)),
+            );
+          }
+          if (selectedBotIdRef.current === message.botId) {
+            const next = remainingBots[0] ?? null;
+            if (next) {
+              activateBot(next.id, remainingThreads, next);
+            } else {
+              setSelectedBotId(null);
+              setActiveThreadId(null);
+              setMessages([]);
+              setSelectedModel(null);
+              try {
+                localStorage.removeItem(SELECTED_BOT_KEY);
+              } catch {}
+            }
+          }
+          break;
+        }
         case "providers.updated": {
           setProviders(message.providers);
           setDefaultModel(message.defaultModel);
@@ -662,6 +718,14 @@ export function useDaemon() {
     [client],
   );
 
+  const deleteBot = useCallback(
+    (botId: string) => {
+      const requestId = `bot-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      client.send({ type: "bots.delete", requestId, botId });
+    },
+    [client],
+  );
+
   const saveProvider = useCallback(
     (provider: ProviderInput) => {
       client.send({ type: "provider.upsert", provider });
@@ -764,6 +828,7 @@ export function useDaemon() {
     selectBot,
     createBot,
     updateBotComputer,
+    deleteBot,
     saveProvider,
     removeProvider,
     updateSettings,

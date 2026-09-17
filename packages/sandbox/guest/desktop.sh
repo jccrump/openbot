@@ -59,7 +59,7 @@ fi
 xterm -title "Terminal" -geometry 100x24+24+64 -fa "DejaVu Sans Mono" -fs 10 &
 
 x11vnc -display :99 -forever -shared -nopw -localhost -rfbport 5900 \
-  -wait 20 -defer 20 -speeds lan \
+  -nothreads -wait 16 -defer 10 -speeds lan \
   -o /tmp/openbot-x11vnc.log &
 PIDS+=("$!")
 

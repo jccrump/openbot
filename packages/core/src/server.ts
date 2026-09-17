@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createReadStream, existsSync } from "node:fs";
+import { createReadStream, existsSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
@@ -77,9 +77,11 @@ export interface Daemon {
 
 const DEFAULT_MODEL_KEY = "defaultModel";
 const REQUIRE_APPROVAL_KEY = "requireApproval";
+const VNC_BUFFER_HIGH_WATER_BYTES = 256 * 1024;
 
 export function createDaemon(options: DaemonOptions): Daemon {
   const runs = new Map<string, AbortController>();
+  const runBots = new Map<string, string>();
   const pending = new Set<Promise<void>>();
 
   const artifactsDir = join(options.config.dataDir, "artifacts");
@@ -361,34 +363,51 @@ export function createDaemon(options: DaemonOptions): Daemon {
         to.send(data, { binary: isBinary }, (error) => {
           if (error) shutdown(1011, "vnc relay failed");
         });
-        if (to.bufferedAmount > 1_000_000) from.pause();
+        if (to.bufferedAmount > VNC_BUFFER_HIGH_WATER_BYTES) from.pause();
       });
     };
+
+    const pendingToUpstream: Array<{
+      data: WebSocket.RawData;
+      isBinary: boolean;
+    }> = [];
+    client.on("message", (data, isBinary) => {
+      if (upstream.readyState !== WebSocket.OPEN) {
+        pendingToUpstream.push({ data, isBinary });
+        return;
+      }
+      upstream.send(data, { binary: isBinary }, (error) => {
+        if (error) shutdown(1011, "vnc relay failed");
+      });
+      if (upstream.bufferedAmount > VNC_BUFFER_HIGH_WATER_BYTES) client.pause();
+    });
 
     upstream.on("open", () => {
       if (connectTimer) {
         clearTimeout(connectTimer);
         connectTimer = null;
       }
+      for (const message of pendingToUpstream.splice(0)) {
+        upstream.send(message.data, { binary: message.isBinary });
+      }
       relay(upstream, client);
-      relay(client, upstream);
       drainTimer = setInterval(() => {
         if (closed) return;
         if (
           client.isPaused &&
           upstream.readyState === upstream.OPEN &&
-          upstream.bufferedAmount < 1_000_000
+          upstream.bufferedAmount < VNC_BUFFER_HIGH_WATER_BYTES
         ) {
           client.resume();
         }
         if (
           upstream.isPaused &&
           client.readyState === client.OPEN &&
-          client.bufferedAmount < 1_000_000
+          client.bufferedAmount < VNC_BUFFER_HIGH_WATER_BYTES
         ) {
           upstream.resume();
         }
-      }, 25);
+      }, 5);
     });
     upstream.on("unexpected-response", (_request, response) => {
       shutdown(1013, `sandbox host rejected vnc (${response.statusCode})`);
@@ -510,6 +529,39 @@ export function createDaemon(options: DaemonOptions): Daemon {
           });
           return;
         }
+        case "bots.delete": {
+          const bot = options.store.getBot(message.botId);
+          if (!bot) {
+            send({ type: "chat.error", message: `unknown bot: ${message.botId}` });
+            return;
+          }
+          for (const [runId, botId] of runBots) {
+            if (botId === message.botId) {
+              runs.get(runId)?.abort();
+            }
+          }
+          screenCache.delete(message.botId);
+          screenInFlight.delete(message.botId);
+          options.store.deleteBot(message.botId);
+          rmSync(join(options.config.dataDir, "workspaces", message.botId), {
+            recursive: true,
+            force: true,
+          });
+          broadcast({
+            type: "bot.deleted",
+            requestId: message.requestId,
+            botId: message.botId,
+          });
+          const sandbox = options.sandbox;
+          if (sandbox) {
+            void sandbox.destroy(message.botId).catch((error) => {
+              console.error(
+                `failed to destroy VM for deleted bot ${message.botId}: ${(error as Error).message}`,
+              );
+            });
+          }
+          return;
+        }
         case "thread.list":
           send({ type: "threads", threads: options.store.listThreads() });
           return;
@@ -618,6 +670,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
           const runId = randomUUID();
           const controller = new AbortController();
           runs.set(runId, controller);
+          runBots.set(runId, message.botId);
 
           const harness = readHarnessSettings();
           const run = harness.default === "codex" ? runCodexTurn : runAgent;
@@ -642,6 +695,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
             })
             .finally(() => {
               runs.delete(runId);
+              runBots.delete(runId);
               pending.delete(task);
             });
 

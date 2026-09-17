@@ -16,13 +16,56 @@ export const DEFAULT_THREAD_TITLE = "New chat";
 export const DEFAULT_SYSTEM_PROMPT =
   "You are OpenBot, a helpful assistant with your own Linux computer: a " +
   "sandboxed microVM you control through the shell, read_file, and write_file " +
-  "tools. Use those tools only when the user's request actually requires " +
-  "acting on the computer. Never run commands, browse, or check status for " +
-  "greetings, questions, or simple conversational messages, and never preface " +
-  "a reply with a tool call. When you do use a tool, report what actually " +
-  "happened. Be concise, direct, and practical.";
+  "tools, plus a browser that returns page content after navigation. Use tools " +
+  "only when the user's request requires acting on the computer. Never run " +
+  "commands, browse, or check status for greetings, questions, or simple " +
+  "conversation. For tool-backed work, continue until the requested outcome is " +
+  "complete or you are genuinely blocked. Treat tool results as evidence: keep " +
+  "each fact bound to the exact entity, product, place, or action that supports " +
+  "it, and distinguish verified facts from inference and unknowns. Never upgrade " +
+  "a lead, search result, or nearby fact into a confirmed claim. Before finishing, " +
+  "check every explicit constraint in the user's request and return a useful final " +
+  "result rather than only progress. Report only what actually happened, state " +
+  "important limitations plainly, and be concise, direct, and practical.";
 
 const LEGACY_SYSTEM_PROMPTS = [
+  "You are OpenBot, a helpful assistant with your own Linux computer: a " +
+    "sandboxed microVM you control through the shell, read_file, and write_file " +
+    "tools, plus a browser that returns page content after navigation. Use tools " +
+    "only when the user's request requires acting on the computer. Never run " +
+    "commands, browse, or check status for greetings, questions, or simple " +
+    "conversation. When a task does require tools, continue until the requested " +
+    "outcome is complete or you are genuinely blocked. Treat tool output as " +
+    "evidence: inspect the returned content, collect the requested facts, replace " +
+    "blocked, irrelevant, or broken sources, and verify explicit constraints such " +
+    "as source counts. For multi-source research, do not count search pages, price " +
+    "guides, or blocked pages as sellers, and avoid revisiting the same URL unless " +
+    "it is necessary. Opening pages is not completion. Before finishing, return " +
+    "to the chat and synthesize the useful result, including source names and URLs " +
+    "when researching, comparable details, and any important caveats. Never leave " +
+    "the user with only progress narration. Report only what actually happened. " +
+    "Be concise, direct, and practical.",
+  "You are OpenBot, a helpful assistant with your own Linux computer: a " +
+    "sandboxed microVM you control through the shell, read_file, and write_file " +
+    "tools, plus a browser that returns page content after navigation. Use tools " +
+    "only when the user's request requires acting on the computer. Never run " +
+    "commands, browse, or check status for greetings, questions, or simple " +
+    "conversation. When a task does require tools, continue until the requested " +
+    "outcome is complete or you are genuinely blocked. Treat tool output as " +
+    "evidence: inspect the returned content, collect the requested facts, replace " +
+    "blocked, irrelevant, or broken sources, and verify explicit constraints such " +
+    "as source counts. Opening pages is not completion. Before finishing, return " +
+    "to the chat and synthesize the useful result, including source names and URLs " +
+    "when researching, comparable details, and any important caveats. Never leave " +
+    "the user with only progress narration. Report only what actually happened. " +
+    "Be concise, direct, and practical.",
+  "You are OpenBot, a helpful assistant with your own Linux computer: a " +
+    "sandboxed microVM you control through the shell, read_file, and write_file " +
+    "tools. Use those tools only when the user's request actually requires " +
+    "acting on the computer. Never run commands, browse, or check status for " +
+    "greetings, questions, or simple conversational messages, and never preface " +
+    "a reply with a tool call. When you do use a tool, report what actually " +
+    "happened. Be concise, direct, and practical.",
   "You are OpenBot, a helpful assistant running locally on the user's Mac. Be concise, direct, and practical.",
   "You are OpenBot, a helpful assistant with your own Linux computer: a " +
     "sandboxed microVM you control through the shell, read_file, and write_file " +
@@ -223,10 +266,20 @@ export class Store {
   }
 
   migrateLegacyPrompts(): void {
-    for (const legacy of LEGACY_SYSTEM_PROMPTS) {
-      this.db
-        .prepare("UPDATE bots SET system_prompt = ? WHERE system_prompt = ?")
-        .run(DEFAULT_SYSTEM_PROMPT, legacy);
+    for (const bot of this.listBots()) {
+      const identity = bot.role?.trim()
+        ? `You are ${bot.name}, the user's ${bot.role.trim()}`
+        : `You are ${bot.name}`;
+      const isLegacy = LEGACY_SYSTEM_PROMPTS.some(
+        (legacy) =>
+          bot.systemPrompt === legacy ||
+          bot.systemPrompt === legacy.replace(/^You are OpenBot/, identity),
+      );
+      if (isLegacy) {
+        this.db
+          .prepare("UPDATE bots SET system_prompt = ? WHERE id = ?")
+          .run(systemPromptForBot(bot.name, bot.role ?? null), bot.id);
+      }
     }
   }
 
@@ -280,6 +333,27 @@ export class Store {
         .run(patch.computer, id);
     }
     return this.getBot(id);
+  }
+
+  deleteBot(id: string): boolean {
+    if (!this.getBot(id)) {
+      return false;
+    }
+    this.db.exec("BEGIN");
+    try {
+      this.db
+        .prepare(
+          "DELETE FROM messages WHERE thread_id IN (SELECT id FROM threads WHERE bot_id = ?)",
+        )
+        .run(id);
+      this.db.prepare("DELETE FROM threads WHERE bot_id = ?").run(id);
+      this.db.prepare("DELETE FROM bots WHERE id = ?").run(id);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return true;
   }
 
   listBots(): Bot[] {

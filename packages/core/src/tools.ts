@@ -275,7 +275,9 @@ interface BrowserActionOutcome {
   durationMs: number;
 }
 
-const SCREEN_CAPTURE_TIMEOUT_MS = 30_000;
+const SCREEN_CAPTURE_TIMEOUT_MS = 15_000;
+const SCREENSHOT_COMMAND =
+  "rm -f /tmp/openbot-screen.png && DISPLAY=:99 scrot -o /tmp/openbot-screen.png && base64 -w0 /tmp/openbot-screen.png";
 
 async function runBrowserAction(
   sandbox: SandboxBackend,
@@ -284,48 +286,48 @@ async function runBrowserAction(
   timeoutMs: number,
 ): Promise<BrowserActionOutcome> {
   const startedAt = Date.now();
-  const result = await sandbox.exec(botId, {
-    command: `/usr/local/bin/node /usr/local/bin/openbot-browser.js action ${shellQuote(JSON.stringify(payload))}`,
-    cwd: "/root",
+  const response = await sandbox.browser(botId, {
+    action: String(payload.action ?? ""),
+    ...(typeof payload.url === "string" ? { url: payload.url } : {}),
+    ...(typeof payload.selector === "string"
+      ? { selector: payload.selector }
+      : {}),
+    ...(typeof payload.text === "string" ? { text: payload.text } : {}),
+    ...(typeof payload.submit === "boolean" ? { submit: payload.submit } : {}),
+    ...(typeof payload.milliseconds === "number"
+      ? { milliseconds: payload.milliseconds }
+      : {}),
     timeoutMs,
   });
-  let parsed: BrowserResult | null = null;
-  try {
-    parsed = JSON.parse(result.stdout.trim()) as BrowserResult;
-  } catch {
-    parsed = null;
-  }
-  return { parsed, result, durationMs: Date.now() - startedAt };
+  const result: ExecResult = {
+    exit: response.ok ? 0 : 1,
+    stdout: JSON.stringify(response),
+    stderr: response.ok ? "" : response.error ?? "browser action failed",
+    durationMs: response.durationMs,
+  };
+  return {
+    parsed: response as BrowserResult,
+    result,
+    durationMs: Date.now() - startedAt,
+  };
 }
 
 export async function captureScreen(
   sandbox: SandboxBackend,
   botId: string,
 ): Promise<Buffer> {
-  let outcome = await runBrowserAction(
-    sandbox,
-    botId,
-    { action: "screenshot" },
-    SCREEN_CAPTURE_TIMEOUT_MS,
-  );
-  if (!outcome.parsed?.screenshot) {
-    await runBrowserAction(
-      sandbox,
-      botId,
-      { action: "goto", url: "about:blank" },
-      SCREEN_CAPTURE_TIMEOUT_MS,
-    );
-    outcome = await runBrowserAction(
-      sandbox,
-      botId,
-      { action: "screenshot" },
-      SCREEN_CAPTURE_TIMEOUT_MS,
+  const result = await sandbox.exec(botId, {
+    command: SCREENSHOT_COMMAND,
+    cwd: "/root",
+    timeoutMs: SCREEN_CAPTURE_TIMEOUT_MS,
+  });
+  const encoded = result.stdout.replace(/\s+/g, "");
+  if (result.exit !== 0 || !encoded) {
+    throw new Error(
+      result.stderr.trim() || `desktop screen capture failed (${result.exit})`,
     );
   }
-  if (!outcome.parsed?.screenshot) {
-    throw new Error(outcome.parsed?.error ?? "screen capture failed");
-  }
-  return Buffer.from(outcome.parsed.screenshot, "base64");
+  return Buffer.from(encoded, "base64");
 }
 
 const browserTool: Tool = {
@@ -333,16 +335,30 @@ const browserTool: Tool = {
     name: "browser",
     description:
       "Control the web browser on your computer. The browser keeps cookies and " +
-      "sign-ins between calls. Actions: goto (url), click (selector), type " +
-      "(selector, text, submit), text (optional selector, returns page text), " +
-      "screenshot (returns a picture of the page), back, wait (selector or " +
-      "milliseconds).",
+      "sign-ins between calls. Navigation and interaction actions return the " +
+      "current page text automatically, so inspect that evidence before taking " +
+      "the next step; do not immediately call text unless you need a focused " +
+      "selector or content beyond the returned preview. Actions: goto (url), " +
+      "click (selector), type (selector, " +
+      "text, submit), text (optional selector), links (optional selector, returns " +
+      "link labels and URLs), screenshot (returns a picture), back, wait " +
+      "(selector or milliseconds). For research, collect facts from each page " +
+      "and replace blocked, broken, or irrelevant sources before answering.",
     parameters: {
       type: "object",
       properties: {
         action: {
           type: "string",
-          enum: ["goto", "click", "type", "text", "screenshot", "back", "wait"],
+          enum: [
+            "goto",
+            "click",
+            "type",
+            "text",
+            "links",
+            "screenshot",
+            "back",
+            "wait",
+          ],
         },
         url: { type: "string", description: "URL for the goto action." },
         selector: {
@@ -393,7 +409,7 @@ const browserTool: Tool = {
         submit: args.submit,
         milliseconds: args.milliseconds,
       },
-      240_000,
+      75_000,
     );
 
     if (!parsed) {

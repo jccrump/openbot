@@ -43,6 +43,7 @@ const SUMMARIZER_SYSTEM_PROMPT =
   "details that are not in the transcript.";
 
 const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
+  "deepseek-flash": 128_000,
   "deepseek-v4-flash": 128_000,
   "deepseek-v4-pro": 128_000,
   "deepseek/deepseek-v4-flash": 128_000,

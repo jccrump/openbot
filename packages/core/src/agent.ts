@@ -34,6 +34,15 @@ import {
   type Tool,
   type ToolContext,
 } from "./tools";
+import {
+  annotateBrowserObservation,
+  buildCompletionAuditRequest,
+  buildVerificationFeedback,
+  COMPLETION_VERIFIER_SYSTEM_PROMPT,
+  parseCompletionAudit,
+  shouldAuditCompletion,
+  type CompletionAudit,
+} from "./task-harness";
 
 export interface AgentDeps {
   store: Store;
@@ -57,7 +66,7 @@ export interface AgentInput {
   model?: ModelRef;
 }
 
-const MAX_STEPS = 8;
+const PROVIDER_STEP_TIMEOUT_MS = 60_000;
 
 function addUsage(
   total: TokenUsage | null,
@@ -67,6 +76,48 @@ function addUsage(
     inputTokens: (total?.inputTokens ?? 0) + usage.inputTokens,
     outputTokens: (total?.outputTokens ?? 0) + usage.outputTokens,
   };
+}
+
+async function auditCompletion(input: {
+  provider: ChatProvider;
+  model: string;
+  userRequest: string;
+  candidate: string;
+  records: ToolCallRecord[];
+  signal: AbortSignal;
+}): Promise<{
+  audit: CompletionAudit | null;
+  raw: string;
+  usage: TokenUsage | null;
+}> {
+  let raw = "";
+  let usage: TokenUsage | null = null;
+  const providerSignal = AbortSignal.any([
+    input.signal,
+    AbortSignal.timeout(PROVIDER_STEP_TIMEOUT_MS),
+  ]);
+  for await (const event of input.provider.chat({
+    model: input.model,
+    messages: [
+      { role: "system", content: COMPLETION_VERIFIER_SYSTEM_PROMPT },
+      {
+        role: "user",
+        content: buildCompletionAuditRequest(
+          input.userRequest,
+          input.candidate,
+          input.records,
+        ),
+      },
+    ],
+    signal: providerSignal,
+  })) {
+    if (event.type === "text_delta") {
+      raw += event.text;
+    } else if (event.type === "usage") {
+      usage = addUsage(usage, event.usage);
+    }
+  }
+  return { audit: parseCompletionAudit(raw), raw, usage };
 }
 
 function buildHistory(
@@ -107,7 +158,15 @@ async function executeToolCall(
   emit: (message: ServerMessage) => void,
   signal: AbortSignal,
   requireApproval: boolean,
+  browserObservationIndex: number | null,
 ): Promise<ToolCallRecord> {
+  console.info("tool.start", {
+    runId: ids.runId,
+    threadId: ids.threadId,
+    botId: context.botId,
+    callId: call.id,
+    name: call.name,
+  });
   emit({
     type: "tool.start",
     runId: ids.runId,
@@ -163,6 +222,14 @@ async function executeToolCall(
     artifacts = result.artifacts ?? null;
   }
 
+  if (browserObservationIndex !== null) {
+    output = annotateBrowserObservation(
+      output,
+      ok,
+      browserObservationIndex,
+    );
+  }
+
   emit({
     type: "tool.result",
     runId: ids.runId,
@@ -172,6 +239,16 @@ async function executeToolCall(
     output,
     durationMs: executionMs,
     artifacts,
+  });
+  console.info("tool.result", {
+    runId: ids.runId,
+    threadId: ids.threadId,
+    botId: context.botId,
+    callId: call.id,
+    name: call.name,
+    ok,
+    durationMs: executionMs,
+    ...(ok ? {} : { error: output.slice(0, 300) }),
   });
 
   return {
@@ -356,6 +433,37 @@ export async function runAgent(
   let finalText = "";
   let turnUsage: TokenUsage | null = null;
   let overflowRetried = false;
+  let browserObservationCount = 0;
+  let unverifiedDraftHeld = false;
+
+  const persistAssistant = (messageContent: string): Message => {
+    const message = deps.store.addMessage({
+      id: assistantMessageId,
+      threadId: thread.id,
+      role: "assistant",
+      content: messageContent,
+      model,
+      toolCalls: records.length ? records : null,
+      usage: turnUsage,
+    });
+    const refreshed = deps.store.touchThread(thread.id);
+    if (refreshed) {
+      emit({ type: "thread.upserted", thread: refreshed });
+    }
+    return message;
+  };
+
+  const toolRecoveryText = (error: unknown): string => {
+    const last = records.at(-1);
+    const reason = (error as Error).message || String(error);
+    if (!last) {
+      return content;
+    }
+    if (!last.ok) {
+      return `I couldn't complete the task because the ${last.name} tool failed: ${last.output}`;
+    }
+    return `The ${last.name} action completed, but I couldn't finish the task because the model connection failed: ${reason}. The completed tool results are preserved in this chat.`;
+  };
 
   const overflowError = (detail: string) => {
     emit({
@@ -369,28 +477,35 @@ export async function runAgent(
   };
 
   try {
-    for (let step = 0; step < MAX_STEPS; step += 1) {
+    for (let step = 0; ; step += 1) {
       const contentBeforeStep = content;
       let stepText = "";
       let pendingCalls: ToolCall[] = [];
+      const holdStepText = shouldAuditCompletion(records);
 
       try {
+        const providerSignal = AbortSignal.any([
+          signal,
+          AbortSignal.timeout(PROVIDER_STEP_TIMEOUT_MS),
+        ]);
         for await (const event of provider.chat({
           model: model.model,
           messages: working,
           ...(definitions.length ? { tools: definitions } : {}),
-          signal,
+          signal: providerSignal,
         })) {
           if (event.type === "text_delta") {
             stepText += event.text;
             content += event.text;
-            emit({
-              type: "chat.delta",
-              runId,
-              threadId: thread.id,
-              messageId: assistantMessageId,
-              text: event.text,
-            });
+            if (!holdStepText) {
+              emit({
+                type: "chat.delta",
+                runId,
+                threadId: thread.id,
+                messageId: assistantMessageId,
+                text: event.text,
+              });
+            }
           } else if (event.type === "reasoning_delta") {
             emit({
               type: "chat.reasoning",
@@ -451,6 +566,74 @@ export async function runAgent(
       finalText = stepText;
 
       if (pendingCalls.length === 0) {
+        if (shouldAuditCompletion(records) && finalText.trim()) {
+          unverifiedDraftHeld = true;
+          let audited: Awaited<ReturnType<typeof auditCompletion>> | null = null;
+          try {
+            audited = await auditCompletion({
+              provider,
+              model: model.model,
+              userRequest: input.text,
+              candidate: finalText,
+              records,
+              signal,
+            });
+          } catch (error) {
+            if (signal.aborted) {
+              throw error;
+            }
+            console.warn(
+              `completion audit failed: ${(error as Error).message}`,
+            );
+          }
+          if (audited?.usage) {
+            turnUsage = addUsage(turnUsage, audited.usage);
+          }
+          if (!audited?.audit) {
+            if (audited) {
+              console.warn(
+                `completion audit returned invalid output: ${audited.raw.slice(0, 300)}`,
+              );
+            }
+            if (holdStepText) {
+              emit({
+                type: "chat.delta",
+                runId,
+                threadId: thread.id,
+                messageId: assistantMessageId,
+                text: finalText,
+              });
+            }
+            unverifiedDraftHeld = false;
+            break;
+          }
+          console.info("completion.audit", {
+            runId,
+            threadId: thread.id,
+            botId: bot.id,
+            verdict: audited.audit.verdict,
+            issues: audited.audit.issues,
+          });
+          if (audited.audit.verdict === "continue") {
+            working.push({ role: "assistant", content: finalText });
+            working.push({
+              role: "user",
+              content: buildVerificationFeedback(audited.audit),
+            });
+            finalText = "";
+            continue;
+          }
+          unverifiedDraftHeld = false;
+          if (holdStepText) {
+            emit({
+              type: "chat.delta",
+              runId,
+              threadId: thread.id,
+              messageId: assistantMessageId,
+              text: finalText,
+            });
+          }
+        }
         break;
       }
 
@@ -487,6 +670,7 @@ export async function runAgent(
           emit,
           signal,
           requireApproval,
+          call.name === "browser" ? browserObservationCount++ : null,
         );
         records.push(record);
         working.push({
@@ -498,17 +682,12 @@ export async function runAgent(
     }
   } catch (error) {
     if (signal.aborted) {
-      if (content.length > 0) {
-        deps.store.addMessage({
-          id: assistantMessageId,
-          threadId: thread.id,
-          role: "assistant",
-          content,
-          model,
-          toolCalls: records.length ? records : null,
-          usage: turnUsage,
-        });
-        deps.store.touchThread(thread.id);
+      if (content.length > 0 || records.length > 0) {
+        persistAssistant(
+          unverifiedDraftHeld
+            ? "The action was cancelled before I could produce a verified final answer. The completed tool results are preserved in this chat."
+            : content || "The action was cancelled.",
+        );
       }
       emit({
         type: "chat.error",
@@ -516,6 +695,11 @@ export async function runAgent(
         threadId: thread.id,
         message: "cancelled",
       });
+      return;
+    }
+    if (records.length > 0) {
+      const message = persistAssistant(toolRecoveryText(error));
+      emit({ type: "chat.done", runId, threadId: thread.id, message });
       return;
     }
     emit({
@@ -527,18 +711,12 @@ export async function runAgent(
     return;
   }
 
-  const message = deps.store.addMessage({
-    id: assistantMessageId,
-    threadId: thread.id,
-    role: "assistant",
-    content: finalText || content,
-    model,
-    toolCalls: records.length ? records : null,
-    usage: turnUsage,
-  });
-  const refreshed = deps.store.touchThread(thread.id);
-  if (refreshed) {
-    emit({ type: "thread.upserted", thread: refreshed });
-  }
+  const message = persistAssistant(
+    finalText ||
+      content ||
+      (records.length > 0
+        ? toolRecoveryText(new Error("the model returned no final response"))
+        : "I couldn't produce a response."),
+  );
   emit({ type: "chat.done", runId, threadId: thread.id, message });
 }

@@ -27,3 +27,4 @@ data/
 
 # Tooling artifacts
 .playwright-mcp/
+evals/results/

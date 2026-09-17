@@ -1,4 +1,6 @@
 import type {
+  BrowserActionRequest,
+  BrowserActionResult,
   ExecRequest,
   ExecResult,
   SandboxBackend,
@@ -36,8 +38,24 @@ export class HttpSandboxBackend implements SandboxBackend {
     });
   }
 
+  browser(
+    botId: string,
+    request: BrowserActionRequest,
+  ): Promise<BrowserActionResult> {
+    return this.request(`/vms/${encodeURIComponent(botId)}/browser`, {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+  }
+
   stop(botId: string): Promise<SandboxStatus> {
     return this.request(`/vms/${encodeURIComponent(botId)}/stop`, {
+      method: "POST",
+    });
+  }
+
+  destroy(botId: string): Promise<SandboxStatus> {
+    return this.request(`/vms/${encodeURIComponent(botId)}/destroy`, {
       method: "POST",
     });
   }

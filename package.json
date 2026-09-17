@@ -25,6 +25,8 @@
     "sandbox:spike": "limactl shell openbot-fc -- sudo bash $PWD/packages/sandbox/host/spike.sh",
     "vnc:smoke": "node scripts/vnc-smoke.mjs",
     "typecheck": "pnpm -r typecheck",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "eval:validate": "node scripts/eval-validate.mjs",
+    "eval": "node scripts/eval.mjs"
   }
 }

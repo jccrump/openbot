@@ -51,15 +51,6 @@ async function runCommand(
   };
 }
 
-interface BrowserResult {
-  ok?: boolean;
-  error?: string;
-  url?: string;
-  title?: string;
-  text?: string;
-  screenshot?: string;
-}
-
 const server = new McpServer(
   { name: "openbot-sandbox", version: "0.1.0" },
   {
@@ -172,15 +163,18 @@ server.registerTool(
     title: "Control the web browser",
     description:
       "Control the browser on the bot's computer. The browser keeps cookies " +
-      "and sign-ins between calls. Actions: goto (url), click (selector), " +
-      "type (selector, text, submit), text (optional selector), screenshot " +
-      "(returns an image), back, wait (selector or milliseconds).",
+      "and sign-ins between calls. Navigation and interaction actions return " +
+      "the current page text automatically. Actions: goto (url), click " +
+      "(selector), type (selector, text, submit), text (optional selector), " +
+      "links (optional selector, returns labels and URLs), screenshot (returns " +
+      "an image), back, wait (selector or milliseconds).",
     inputSchema: {
       action: z.enum([
         "goto",
         "click",
         "type",
         "text",
+        "links",
         "screenshot",
         "back",
         "wait",
@@ -193,33 +187,15 @@ server.registerTool(
     },
   },
   async (args) => {
-    const payload = JSON.stringify({
+    const parsed = await sandbox.browser(BOT_ID, {
       action: args.action,
       url: args.url,
       selector: args.selector,
       text: args.text,
       submit: args.submit,
       milliseconds: args.milliseconds,
+      timeoutMs: 75_000,
     });
-    const result = await sandbox.exec(BOT_ID, {
-      command: `/usr/local/bin/node /usr/local/bin/openbot-browser.js action ${shellQuote(payload)}`,
-      cwd: "/root",
-      timeoutMs: MAX_TIMEOUT_SECONDS * 1000,
-    });
-
-    let parsed: BrowserResult | null = null;
-    try {
-      parsed = JSON.parse(result.stdout.trim()) as BrowserResult;
-    } catch {
-      parsed = null;
-    }
-
-    if (!parsed) {
-      return {
-        content: [{ type: "text", text: truncate(formatExec(result)) }],
-        isError: true,
-      };
-    }
     if (parsed.ok === false) {
       return {
         content: [

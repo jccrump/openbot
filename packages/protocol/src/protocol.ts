@@ -37,6 +37,11 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     computer: ComputerKindSchema.optional(),
   }),
   z.object({
+    type: z.literal("bots.delete"),
+    requestId: z.string(),
+    botId: z.string(),
+  }),
+  z.object({
     type: z.literal("chat.send"),
     botId: z.string(),
     threadId: z.string().optional(),
@@ -104,7 +109,7 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
           default: HarnessIdSchema.optional(),
         })
         .optional(),
-    }),
+      }),
   }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessageSchema>;
@@ -131,6 +136,11 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("bot.updated"),
     requestId: z.string(),
     bot: BotSchema,
+  }),
+  z.object({
+    type: z.literal("bot.deleted"),
+    requestId: z.string(),
+    botId: z.string(),
   }),
   z.object({
     type: z.literal("providers.updated"),

@@ -11,7 +11,12 @@ TINT2_SRC="$REPO_DIR/packages/sandbox/guest/tint2rc"
 IMAGE_SCHEMA_VERSION="2"
 
 FC_VERSION="${FC_VERSION:-v1.16.0}"
+KERNEL_VERSION="${KERNEL_VERSION:-6.1.155}"
 NODE_VERSION="${NODE_VERSION:-v22.23.2}"
+# Keep the browser runtime on the version validated against the nested ARM64 VM.
+# Playwright 1.63's Chrome-for-Testing 153 build can spin during headed startup
+# without ever exposing its automation transport in this environment.
+PLAYWRIGHT_CORE_VERSION="${PLAYWRIGHT_CORE_VERSION:-1.62.1}"
 ARCH="${ARCH:-aarch64}"
 FC_DIR="${FC_DIR:-/var/lib/fc}"
 ROOTFS_SIZE="${ROOTFS_SIZE:-4G}"
@@ -27,6 +32,13 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq ca-certificates curl squashfs-tools e2fsprogs >/dev/null
 
+# Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor by
+# default. Chromium needs them for its Linux sandbox when the per-agent browser
+# runs as an unprivileged service account.
+printf 'kernel.apparmor_restrict_unprivileged_userns=0\n' \
+  > /etc/sysctl.d/99-openbot-browser-sandbox.conf
+sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 >/dev/null
+
 mkdir -p "$FC_DIR"
 cd "$FC_DIR"
 
@@ -40,11 +52,17 @@ fi
 firecracker --version
 
 echo "== kernel =="
-if [ ! -f vmlinux ]; then
-  KKEY=$(curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min?prefix=firecracker-ci/v1.13/${ARCH}/vmlinux-5.10&list-type=2" \
-    | grep -oP "(?<=<Key>)(firecracker-ci/v1.13/${ARCH}/vmlinux-5\.10\.[0-9]+)(?=</Key>)" | sort -V | tail -1)
+if [ ! -f vmlinux ] || [ "$(cat vmlinux.version 2>/dev/null || true)" != "$KERNEL_VERSION" ]; then
+  KKEY=$(curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min?prefix=firecracker-ci/v1.15/${ARCH}/vmlinux-${KERNEL_VERSION}&list-type=2" \
+    | grep -oP "(?<=<Key>)(firecracker-ci/v1.15/${ARCH}/vmlinux-${KERNEL_VERSION})(?=</Key>)" | tail -1)
+  test -n "$KKEY"
   echo "downloading $KKEY"
-  curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min/${KKEY}" -o vmlinux
+  curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min/${KKEY}" -o vmlinux.next
+  if [ -f vmlinux ]; then
+    cp --reflink=auto --sparse=always vmlinux vmlinux.backup
+  fi
+  mv vmlinux.next vmlinux
+  printf '%s\n' "$KERNEL_VERSION" > vmlinux.version
 fi
 ls -lh vmlinux
 
@@ -78,7 +96,6 @@ if mountpoint -q /mnt/openbot-rootfs; then
 fi
 mount -o loop rootfs.ext4 /mnt/openbot-rootfs
 install -m 0755 "$AGENT_SRC" /mnt/openbot-rootfs/usr/local/bin/openbot-agent.py
-install -m 0755 "$BROWSER_SRC" /mnt/openbot-rootfs/usr/local/bin/openbot-browser.js
 install -m 0755 "$DESKTOP_SRC" /mnt/openbot-rootfs/usr/local/bin/openbot-desktop.sh
 install -m 0755 "$WALLPAPER_SRC" /mnt/openbot-rootfs/usr/local/bin/openbot-wallpaper.py
 install -d /mnt/openbot-rootfs/root/.config/tint2
@@ -93,37 +110,8 @@ if [ ! -x /mnt/openbot-rootfs/usr/local/bin/node ]; then
   tar -xzf /tmp/node.tar.gz -C /mnt/openbot-rootfs/usr/local --strip-components=1
 fi
 /mnt/openbot-rootfs/usr/local/bin/node --version
-
-BROWSER_DIR=/mnt/openbot-rootfs/opt/openbot-browser
-mkdir -p "$BROWSER_DIR"
-if [ ! -d "$BROWSER_DIR/node_modules/playwright-core" ]; then
-  echo "== installing playwright-core into rootfs =="
-  npm install --prefix "$BROWSER_DIR" playwright-core >/dev/null 2>&1
-fi
-if [ ! -d "$BROWSER_DIR/browsers" ]; then
-  echo "== downloading chromium for linux-arm64 =="
-  PLAYWRIGHT_BROWSERS_PATH="$BROWSER_DIR/browsers" node "$BROWSER_DIR/node_modules/playwright-core/cli.js" install chromium
-fi
-
-if [ ! -f "$BROWSER_DIR/.deps-installed-v2" ]; then
-  echo "== installing chromium system deps into rootfs =="
-  mkdir -p /mnt/openbot-rootfs/tmp \
-    /mnt/openbot-rootfs/var/cache/apt/archives/partial \
-    /mnt/openbot-rootfs/var/lib/apt/lists/partial \
-    /mnt/openbot-rootfs/var/log/apt \
-    /mnt/openbot-rootfs/etc/apt/apt.conf.d
-  chmod 1777 /mnt/openbot-rootfs/tmp
-  printf 'Dpkg::Options::="--force-confdef";\nDpkg::Options::="--force-confold";\n' > /mnt/openbot-rootfs/etc/apt/apt.conf.d/99openbot
-  mount --bind /dev /mnt/openbot-rootfs/dev
-  mount -t proc proc /mnt/openbot-rootfs/proc
-  mount -t sysfs sys /mnt/openbot-rootfs/sys
-  cp /etc/resolv.conf /mnt/openbot-rootfs/etc/resolv.conf
-  chroot /mnt/openbot-rootfs /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; cd /opt/openbot-browser && PLAYWRIGHT_BROWSERS_PATH=/opt/openbot-browser/browsers node node_modules/playwright-core/cli.js install-deps chromium"
-  touch "$BROWSER_DIR/.deps-installed-v2"
-  umount /mnt/openbot-rootfs/sys /mnt/openbot-rootfs/proc /mnt/openbot-rootfs/dev
-fi
-
-rm -rf "$BROWSER_DIR"/browsers/chromium_headless_shell-*
+rm -rf /mnt/openbot-rootfs/opt/openbot-browser
+rm -f /mnt/openbot-rootfs/usr/local/bin/openbot-browser.js
 
 if [ ! -x /mnt/openbot-rootfs/usr/bin/python3 ]; then
   echo "== installing python3 into rootfs via chroot =="
@@ -157,17 +145,48 @@ if [ ! -x /mnt/openbot-rootfs/usr/bin/scrot ]; then
   umount /mnt/openbot-rootfs/sys /mnt/openbot-rootfs/proc /mnt/openbot-rootfs/dev
 fi
 
+# chroot package installation temporarily borrows the Lima host resolver. The
+# microVM has no systemd-resolved service, so always restore a standalone DNS
+# configuration before sealing the image.
+rm -f /mnt/openbot-rootfs/etc/resolv.conf
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /mnt/openbot-rootfs/etc/resolv.conf
+
 (/mnt/openbot-rootfs/usr/bin/x11vnc -version 2>&1 | head -1) || true
 
 IMAGE_CONTENT_HASH="$({
-  printf '%s\n' "$IMAGE_SCHEMA_VERSION"
-  sha256sum "$AGENT_SRC" "$BROWSER_SRC" "$DESKTOP_SRC" "$WALLPAPER_SRC" "$TINT2_SRC"
+  printf '%s\n' "$IMAGE_SCHEMA_VERSION" "$NODE_VERSION" "$PLAYWRIGHT_CORE_VERSION"
+  sha256sum "$AGENT_SRC" "$DESKTOP_SRC" "$WALLPAPER_SRC" "$TINT2_SRC"
 } | sha256sum | awk '{print $1}')"
 IMAGE_VERSION="v${IMAGE_SCHEMA_VERSION}-${IMAGE_CONTENT_HASH}"
 printf '%s\n' "$IMAGE_VERSION" > /mnt/openbot-rootfs/etc/openbot-image-version
 printf '%s\n' "$IMAGE_VERSION" > "$FC_DIR/rootfs.version"
 echo "guest image version: $IMAGE_VERSION"
 umount /mnt/openbot-rootfs
+
+echo "== outer browser runtime =="
+HOST_BROWSER_DIR="$FC_DIR/openbot-browser-host"
+mkdir -p "$HOST_BROWSER_DIR" "$FC_DIR/openbot"
+if ! grep -qs "\"version\": \"$PLAYWRIGHT_CORE_VERSION\"" \
+  "$HOST_BROWSER_DIR/node_modules/playwright-core/package.json"; then
+  rm -rf "$HOST_BROWSER_DIR/node_modules" "$HOST_BROWSER_DIR/browsers" \
+    "$HOST_BROWSER_DIR"/.deps-installed-*
+  npm install --prefix "$HOST_BROWSER_DIR" "playwright-core@$PLAYWRIGHT_CORE_VERSION" >/dev/null 2>&1
+fi
+if ! compgen -G "$HOST_BROWSER_DIR/browsers/firefox-*" >/dev/null; then
+  PLAYWRIGHT_BROWSERS_PATH="$HOST_BROWSER_DIR/browsers" \
+    node "$HOST_BROWSER_DIR/node_modules/playwright-core/cli.js" install firefox
+fi
+if ! compgen -G "$HOST_BROWSER_DIR/browsers/chromium-*" >/dev/null; then
+  PLAYWRIGHT_BROWSERS_PATH="$HOST_BROWSER_DIR/browsers" \
+    node "$HOST_BROWSER_DIR/node_modules/playwright-core/cli.js" install chromium
+fi
+HOST_DEPS_MARKER="$HOST_BROWSER_DIR/.deps-installed-$PLAYWRIGHT_CORE_VERSION-firefox-chromium"
+if [ ! -f "$HOST_DEPS_MARKER" ]; then
+  PLAYWRIGHT_BROWSERS_PATH="$HOST_BROWSER_DIR/browsers" \
+    node "$HOST_BROWSER_DIR/node_modules/playwright-core/cli.js" install-deps firefox chromium
+  touch "$HOST_DEPS_MARKER"
+fi
+install -m 0755 "$BROWSER_SRC" "$FC_DIR/openbot/browser.js"
 
 echo "== sandbox host service =="
 mkdir -p /var/lib/fc/openbot /var/lib/fc/vms

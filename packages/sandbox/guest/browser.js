@@ -1,26 +1,28 @@
 #!/usr/bin/env node
 const fs = require("node:fs");
-const http = require("node:http");
 const net = require("node:net");
-const { spawn, execFileSync } = require("node:child_process");
+const { execFileSync } = require("node:child_process");
 
-const BROWSERS_ROOT = "/opt/openbot-browser/browsers";
-const PLAYWRIGHT_CORE = "/opt/openbot-browser/node_modules/playwright-core";
-const SOCKET_PATH = "/tmp/openbot-browser.sock";
-const CDP_PORT = 9222;
-const CDP_URL = `http://127.0.0.1:${CDP_PORT}`;
-const USER_DATA_DIR = "/root/.openbot-chrome";
+const BROWSER_RUNTIME =
+  process.env.OPENBOT_BROWSER_RUNTIME || "/opt/openbot-browser";
+const BROWSERS_ROOT = `${BROWSER_RUNTIME}/browsers`;
+const PLAYWRIGHT_CORE = `${BROWSER_RUNTIME}/node_modules/playwright-core`;
+const SOCKET_PATH = process.env.OPENBOT_BROWSER_SOCKET || "/tmp/openbot-browser.sock";
+const USER_DATA_DIR =
+  process.env.OPENBOT_BROWSER_PROFILE || "/root/.openbot-firefox";
+const HEADLESS = process.env.OPENBOT_BROWSER_HEADLESS === "1";
+const DISPLAY_NAME = process.env.OPENBOT_BROWSER_DISPLAY || ":99";
+const BROWSER_ENGINE =
+  process.env.OPENBOT_BROWSER_ENGINE === "chromium" ? "chromium" : "firefox";
 const MAX_TEXT = 8000;
-const LOCK_DIR = "/tmp/openbot-chrome.lock";
-const CHROME_LOG = "/tmp/openbot-chrome.log";
-const LOCK_DEADLINE_MS = 120_000;
-const DISPLAY_DEADLINE_MS = 120_000;
-const CHROME_START_DEADLINE_MS = 300_000;
-const CDP_PROBE_TIMEOUT_MS = 3_000;
-const PAGE_TIMEOUT_MS = 60_000;
+const MAX_OBSERVATION_TEXT = 6000;
+const DISPLAY_DEADLINE_MS = 10_000;
+const BROWSER_START_TIMEOUT_MS = Number(
+  process.env.OPENBOT_BROWSER_START_TIMEOUT_MS || 30_000,
+);
+const PAGE_TIMEOUT_MS = 30_000;
+const DAEMON_ACTION_TIMEOUT_MS = 70_000;
 
-const DISPLAY = ":99";
-const DISPLAY_SOCKET = "/tmp/.X11-unix/X99";
 const MODE = process.argv[2] === "serve" ? "serve" : "action";
 
 function log(message) {
@@ -31,7 +33,26 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function findChromeBinary() {
+function findFirefoxBinary() {
+  try {
+    for (const entry of fs.readdirSync(BROWSERS_ROOT)) {
+      if (!entry.startsWith("firefox-")) {
+        continue;
+      }
+      const candidate = `${BROWSERS_ROOT}/${entry}/firefox/firefox`;
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  } catch {
+    // fall through to Playwright's Firefox executable
+  }
+  process.env.PLAYWRIGHT_BROWSERS_PATH = BROWSERS_ROOT;
+  const { firefox } = require(PLAYWRIGHT_CORE);
+  return firefox.executablePath();
+}
+
+function findChromiumBinary() {
   try {
     for (const entry of fs.readdirSync(BROWSERS_ROOT)) {
       if (!entry.startsWith("chromium-")) {
@@ -45,7 +66,7 @@ function findChromeBinary() {
       }
     }
   } catch {
-    // fall through to playwright's chromium
+    // fall through to Playwright's Chromium executable
   }
   process.env.PLAYWRIGHT_BROWSERS_PATH = BROWSERS_ROOT;
   const { chromium } = require(PLAYWRIGHT_CORE);
@@ -55,175 +76,186 @@ function findChromeBinary() {
 async function waitForDisplay() {
   const deadline = Date.now() + DISPLAY_DEADLINE_MS;
   while (Date.now() < deadline) {
-    if (fs.existsSync(DISPLAY_SOCKET)) {
-      return;
+    if (DISPLAY_NAME.startsWith(":")) {
+      const displayNumber = Number.parseInt(DISPLAY_NAME.slice(1), 10);
+      if (
+        Number.isInteger(displayNumber) &&
+        fs.existsSync(`/tmp/.X11-unix/X${displayNumber}`)
+      ) {
+        return;
+      }
+    } else {
+      const match = /^(.*):(\d+)$/.exec(DISPLAY_NAME);
+      if (match && (await tcpReachable(match[1], 6000 + Number(match[2])))) {
+        return;
+      }
     }
-    await sleep(200);
+    await sleep(100);
   }
-  throw new Error("X display did not become ready");
+  throw new Error(`X display ${DISPLAY_NAME} did not become ready`);
 }
 
-function cdpAlive() {
+function tcpReachable(host, port) {
   return new Promise((resolve) => {
-    const request = http.get(
-      `${CDP_URL}/json/version`,
-      { timeout: CDP_PROBE_TIMEOUT_MS },
-      (response) => {
-        response.resume();
-        resolve(response.statusCode === 200);
-      },
-    );
-    request.on("error", () => resolve(false));
-    request.on("timeout", () => {
-      request.destroy();
-      resolve(false);
-    });
+    const socket = net.createConnection({ host, port });
+    const finish = (ready) => {
+      socket.destroy();
+      resolve(ready);
+    };
+    socket.setTimeout(500, () => finish(false));
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
   });
 }
 
-async function withLock(fn) {
-  const deadline = Date.now() + LOCK_DEADLINE_MS;
-  while (true) {
-    try {
-      fs.mkdirSync(LOCK_DIR);
-      break;
-    } catch {
-      try {
-        const age = Date.now() - fs.statSync(LOCK_DIR).mtimeMs;
-        if (age > LOCK_DEADLINE_MS) {
-          fs.rmSync(LOCK_DIR, { recursive: true, force: true });
-          continue;
-        }
-      } catch {
-        // lock vanished, retry
-      }
-      if (Date.now() > deadline) {
-        throw new Error("timed out waiting for the chrome start lock");
-      }
-      await sleep(500);
-    }
-  }
+function killStaleBrowser() {
   try {
-    return await fn();
-  } finally {
-    fs.rmSync(LOCK_DIR, { recursive: true, force: true });
-  }
-}
-
-function killStaleChrome() {
-  try {
-    execFileSync("pkill", ["-f", "remote-debugging-port=9222"], {
+    execFileSync("pkill", ["-TERM", "-f", USER_DATA_DIR], {
       stdio: "ignore",
     });
   } catch {
     // nothing to kill
   }
-}
-
-function spawnChrome() {
-  const binary = findChromeBinary();
-  const logFd = fs.openSync(CHROME_LOG, "a");
-  const child = spawn(
-    binary,
-    [
-      `--remote-debugging-port=${CDP_PORT}`,
-      `--user-data-dir=${USER_DATA_DIR}`,
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-background-networking",
-      "--disable-component-update",
-      "--disable-sync",
-      "--disable-default-apps",
-      "--disable-backgrounding-occluded-windows",
-      "--password-store=basic",
-      "--use-mock-keychain",
-      "--window-position=0,0",
-      "--window-size=1280,800",
-      "--start-maximized",
-      "about:blank",
-    ],
-    {
-      detached: true,
-      stdio: ["ignore", logFd, logFd],
-      env: { ...process.env, DISPLAY },
-    },
-  );
-  fs.closeSync(logFd);
-  child.unref();
-  return child;
-}
-
-async function ensureChrome() {
-  if (await cdpAlive()) {
-    return;
-  }
-  await withLock(async () => {
-    if (await cdpAlive()) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      execFileSync("pgrep", ["-f", USER_DATA_DIR], {
+        stdio: "ignore",
+      });
+    } catch {
       return;
     }
-    killStaleChrome();
-    await sleep(500);
-    await waitForDisplay();
-    const deadline = Date.now() + CHROME_START_DEADLINE_MS;
-    while (Date.now() < deadline) {
-      const child = spawnChrome();
-      let exited = false;
-      child.on("exit", () => {
-        exited = true;
-      });
-      while (Date.now() < deadline) {
-        if (await cdpAlive()) {
-          return;
-        }
-        if (exited) {
-          break;
-        }
-        await sleep(1000);
-      }
-      if (Date.now() >= deadline) {
-        break;
-      }
-      log("chrome exited during startup; restarting it");
-      killStaleChrome();
-      await sleep(1000);
-    }
-    throw new Error("chromium did not start");
-  });
+    execFileSync("sleep", ["0.15"]);
+  }
+  try {
+    execFileSync("pkill", ["-KILL", "-f", USER_DATA_DIR], {
+      stdio: "ignore",
+    });
+  } catch {
+    // already gone
+  }
 }
 
-async function connect() {
+function clearProfileLock() {
+  for (const name of [".parentlock", "lock"]) {
+    try {
+      fs.rmSync(`${USER_DATA_DIR}/${name}`, { force: true });
+    } catch {
+      // best effort
+    }
+  }
+}
+
+async function launchSession() {
+  const startedAt = Date.now();
+  if (!HEADLESS) {
+    await waitForDisplay();
+  }
+  killStaleBrowser();
+  clearProfileLock();
   process.env.PLAYWRIGHT_BROWSERS_PATH = BROWSERS_ROOT;
-  const { chromium } = require(PLAYWRIGHT_CORE);
-  const browser = await chromium.connectOverCDP(CDP_URL);
-  const context = browser.contexts()[0] ?? (await browser.newContext());
+  const playwright = require(PLAYWRIGHT_CORE);
+  const browserType = playwright[BROWSER_ENGINE];
+  const binary =
+    BROWSER_ENGINE === "chromium" ? findChromiumBinary() : findFirefoxBinary();
+  log(`launching ${binary}`);
+  let context;
+  try {
+    context = await browserType.launchPersistentContext(USER_DATA_DIR, {
+      executablePath: binary,
+      headless: HEADLESS,
+      ...(BROWSER_ENGINE === "chromium" ? { chromiumSandbox: true } : {}),
+      viewport: HEADLESS ? { width: 1280, height: 800 } : null,
+      timeout: BROWSER_START_TIMEOUT_MS,
+      env: {
+        ...process.env,
+        ...(HEADLESS ? {} : { DISPLAY: DISPLAY_NAME }),
+        LIBGL_ALWAYS_SOFTWARE: "1",
+        MOZ_AVOID_OPENGL_ALTOGETHER: "1",
+      },
+      args:
+        BROWSER_ENGINE === "chromium"
+          ? [
+              "--disable-gpu",
+              "--disable-dev-shm-usage",
+              "--hide-crash-restore-bubble",
+              "--window-size=1280,800",
+            ]
+          : HEADLESS
+            ? []
+            : ["--width=1280", "--height=800"],
+      ...(BROWSER_ENGINE === "firefox"
+        ? {
+            firefoxUserPrefs: {
+              "browser.shell.checkDefaultBrowser": false,
+              "browser.startup.page": 0,
+              "browser.tabs.warnOnClose": false,
+              "gfx.webrender.all": false,
+              "gfx.webrender.software": true,
+              "layers.acceleration.disabled": true,
+              "media.hardware-video-decoding.enabled": false,
+              "webgl.disabled": true,
+            },
+          }
+        : {}),
+    });
+  } catch (error) {
+    killStaleBrowser();
+    clearProfileLock();
+    const message = error && error.message ? error.message : String(error);
+    log(`launch failed after ${Date.now() - startedAt}ms: ${message}`);
+    throw new Error(
+      `browser unavailable: ${BROWSER_ENGINE} did not become ready within ${Math.round(BROWSER_START_TIMEOUT_MS / 1000)} seconds. The failed process was cleaned up; do not retry this browser action in the same turn.`,
+    );
+  }
   const page = context.pages()[0] ?? (await context.newPage());
   page.setDefaultTimeout(PAGE_TIMEOUT_MS);
-  return { browser, page };
+  page.setDefaultNavigationTimeout(PAGE_TIMEOUT_MS);
+  log(`ready in ${Date.now() - startedAt}ms`);
+  return { context, page };
 }
 
 async function performAction(page, action) {
+  const observe = async (maxLength = MAX_OBSERVATION_TEXT) => {
+    try {
+      const text = await page.innerText("body");
+      return text.slice(0, maxLength);
+    } catch {
+      return "";
+    }
+  };
+  const pageState = async () => ({
+    url: page.url(),
+    title: await page.title(),
+    text: await observe(),
+  });
+  const settle = async () => {
+    await page
+      .waitForLoadState("domcontentloaded", { timeout: 2_000 })
+      .catch(() => {});
+    await page.waitForTimeout(150);
+  };
+
   switch (action.action) {
     case "goto": {
       await page.goto(action.url, { waitUntil: "domcontentloaded" });
-      return { url: page.url(), title: await page.title() };
+      return pageState();
     }
     case "back": {
       await page.goBack({ waitUntil: "domcontentloaded" });
-      return { url: page.url(), title: await page.title() };
+      return pageState();
     }
     case "click": {
       await page.click(action.selector);
-      return { url: page.url(), title: await page.title() };
+      await settle();
+      return pageState();
     }
     case "type": {
       await page.fill(action.selector, action.text ?? "");
       if (action.submit) {
         await page.keyboard.press("Enter");
+        await settle();
       }
-      return { url: page.url(), title: await page.title() };
+      return pageState();
     }
     case "text": {
       const text = action.selector
@@ -241,10 +273,34 @@ async function performAction(page, action) {
       } else {
         await page.waitForTimeout(Math.min(action.milliseconds ?? 1000, 30_000));
       }
-      return { url: page.url(), title: await page.title() };
+      return pageState();
+    }
+    case "links": {
+      const root = action.selector
+        ? page.locator(action.selector)
+        : page.locator("body");
+      const links = await root.locator("a[href]").evaluateAll((elements) =>
+        elements
+          .map((element) => ({
+            text: (element.innerText || element.getAttribute("aria-label") || "")
+              .replace(/\s+/g, " ")
+              .trim(),
+            href: element.href,
+          }))
+          .filter((link) => link.href && link.text)
+          .slice(0, 100),
+      );
+      return {
+        url: page.url(),
+        title: await page.title(),
+        text: links
+          .map((link) => `${link.text} — ${link.href}`)
+          .join("\n")
+          .slice(0, MAX_TEXT),
+      };
     }
     case "screenshot": {
-      const buffer = await page.screenshot({ type: "png" });
+      const buffer = await page.screenshot({ type: "png", timeout: 15_000 });
       return {
         url: page.url(),
         title: await page.title(),
@@ -267,11 +323,30 @@ async function serve() {
   let opening = null;
 
   const openSession = async () => {
-    await ensureChrome();
-    const opened = await connect();
+    const opened = await launchSession();
     session = opened;
-    log("ready");
+    opened.context.on("close", () => {
+      if (session?.context === opened.context) {
+        session = null;
+      }
+      log("browser context closed");
+    });
     return opened;
+  };
+
+  const resetSession = async (reason) => {
+    const current = session;
+    session = null;
+    if (current) {
+      try {
+        await Promise.race([current.context.close(), sleep(3_000)]);
+      } catch {
+        // The process cleanup below is authoritative.
+      }
+    }
+    killStaleBrowser();
+    clearProfileLock();
+    log(`session reset: ${reason}`);
   };
 
   const getSession = async () => {
@@ -286,36 +361,43 @@ async function serve() {
     return opening;
   };
 
+  let queue = Promise.resolve();
+
   const server = net.createServer((socket) => {
     let buffer = "";
-    let busy = false;
-    socket.on("data", async (chunk) => {
+    socket.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
-      if (busy) {
-        return;
-      }
-      const newline = buffer.indexOf("\n");
-      if (newline === -1) {
-        return;
-      }
-      const line = buffer.slice(0, newline);
-      buffer = buffer.slice(newline + 1);
-      busy = true;
-      let response;
-      try {
-        const action = JSON.parse(line);
-        const current = await getSession();
-        const result = await performAction(current.page, action);
-        response = { ok: true, ...result };
-      } catch (error) {
-        const message = error && error.message ? error.message : String(error);
-        response = { ok: false, error: message };
-        if (/Target closed|Browser closed|disconnected|Protocol error/i.test(message)) {
-          session = null;
+      let newline;
+      while ((newline = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (!line.trim()) {
+          continue;
         }
+        queue = queue.then(async () => {
+          let response;
+          try {
+            const action = JSON.parse(line);
+            const current = await getSession();
+            const result = await performAction(current.page, action);
+            response = { ok: true, ...result };
+          } catch (error) {
+            const message = error && error.message ? error.message : String(error);
+            response = { ok: false, error: message };
+            if (
+              /browser unavailable|Target closed|Browser closed|disconnected|Protocol error/i.test(
+                message,
+              )
+            ) {
+              await resetSession(message.slice(0, 160));
+            }
+          }
+          if (socket.destroyed) {
+            return;
+          }
+          socket.write(JSON.stringify(response) + "\n");
+        });
       }
-      busy = false;
-      socket.write(JSON.stringify(response) + "\n");
     });
     socket.on("error", () => {
       // client went away
@@ -323,9 +405,8 @@ async function serve() {
   });
   server.listen(SOCKET_PATH);
   log("listening");
-  getSession().catch((error) => {
-    log(`chrome warm-up failed: ${error && error.message ? error.message : error}`);
-  });
+  // The browser is started lazily on the first action. A warm-up at boot keeps
+  // the whole microVM busy while the desktop is otherwise idle.
 }
 
 function callDaemon(payload, waitMs = 30_000) {
@@ -340,7 +421,7 @@ function callDaemon(payload, waitMs = 30_000) {
         const error = new Error("timeout talking to the browser daemon");
         error.daemonReachable = connected;
         reject(error);
-      }, 200_000);
+      }, DAEMON_ACTION_TIMEOUT_MS);
 
       socket.on("connect", () => {
         connected = true;
@@ -372,14 +453,19 @@ function callDaemon(payload, waitMs = 30_000) {
 }
 
 async function runInline(payload) {
-  await ensureChrome();
-  const session = await connect();
+  const session = await launchSession();
   try {
     const result = await performAction(session.page, payload);
     return { ok: true, ...result };
   } catch (error) {
     const message = error && error.message ? error.message : String(error);
     return { ok: false, error: message };
+  } finally {
+    try {
+      await session.context.close();
+    } catch {
+      killStaleBrowser();
+    }
   }
 }
 

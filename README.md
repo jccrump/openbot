@@ -100,8 +100,9 @@ the key out of the database entirely. See `.env.example` for the headless path.
 Press the **+** next to the sidebar search. Give it a name, optional role,
 avatar, and color, pick a model, and choose its computer:
 
-- **Firecracker microVM** — an isolated Linux computer with its own kernel,
-  filesystem, and browser profile. Requires the sandbox below.
+- **Firecracker microVM** — an isolated Linux computer with its own kernel and
+  filesystem, plus a persistent per-agent browser profile presented in the same
+  live desktop. Requires the sandbox below.
 - **This Mac** — commands run directly on your Mac as your user, restricted to
   the agent's workspace for file tools, and always approval-gated.
 
@@ -119,9 +120,9 @@ pnpm sandbox:deploy   # bundle the sandbox host service and start it in the VM
 The first `setup` downloads a kernel and rootfs and takes a few minutes.
 Run `sandbox:setup` again after guest-agent or desktop changes. It stamps the
 base image with a content version; the next cold boot upgrades older agent
-images while preserving `/root` (including the Chromium profile), `/home`,
-`/srv`, and workspace directories. The prior image is kept as a compressed
-recovery artifact instead of being silently deleted.
+images while preserving `/root`, `/home`, `/srv`, and workspace directories.
+The per-agent Chromium profile is stored beside the VM image, and the newest
+prior image is kept as a compressed recovery artifact.
 `pnpm sandbox:spike` boots a microVM and verifies exec over vsock; `pnpm
 sandbox:logs` shows the host service log; `pnpm sandbox:stop` shuts the VM down.
 
@@ -135,6 +136,11 @@ appear in the chat, while the screen panel on the right shows the live desktop
 and falls back to the latest captured screenshot if VNC is unavailable. A
 toggle in Settings turns the approval gate off for trusted work (local-Mac
 tools always ask).
+
+OpenBot keeps the live desktop connection warm while its window is unfocused,
+but holds framebuffer update requests and disables input until the window is
+active again. This avoids reconnect latency without letting an old tab quietly
+consume the agent's CPU or make takeover input lag.
 
 ### Codex harness (optional, experimental)
 
@@ -176,25 +182,39 @@ when the Codex CLI is on `PATH`.
 - **Agents**: create with name/role/avatar/color/model/computer, switch an
   existing agent between Firecracker and This Mac, single thread per agent.
 - **Firecracker computers**: one microVM per agent with a versioned rootfs,
-  persistent agent files and Chromium profile, plus `shell`, `read_file`,
-  `write_file`, and a `browser` tool (goto, click, type, text, screenshot,
-  back, wait).
+  persistent agent files and a per-agent Chromium profile, plus `shell`, `read_file`,
+  `write_file`, and a `browser` tool (goto, click, type, text, links, screenshot,
+  back, wait). Browser actions return bounded page text so models can collect
+  evidence without a separate read after every navigation.
 - **Local-Mac computers**: shell as your user and file tools confined to the
   agent's workspace, always approval-gated.
 - **Approvals** for every tool call, with approve/deny cards and denied actions
   reported back to the model.
-- **Live desktop** through Xvfb, Openbox/tint2, x11vnc, vsock, and noVNC. The
-  screen panel is interactive, and browser-tool screenshots are still persisted
-  as chat artifacts and used as a fallback.
+- **Live shared browser desktop** through Xvfb, Openbox, x11vnc, and noVNC.
+  Model browser actions and user takeover operate the same Chromium session;
+  browser-tool screenshots are also persisted as chat artifacts.
 - **Two harnesses**: the built-in OpenBot loop (primary, default, any
   OpenAI-compatible model) and the optional Codex harness driving the same VM
   over MCP — with a ChatGPT subscription or a non-OpenAI model through the
   responses bridge.
 - **Automatic conversation compaction** in the daemon when a thread approaches
   the model's context window, with an overflow retry path.
+- **Completion-driven tool tasks** with no fixed round/action count. Runs stop
+  when the model returns its answer or the user cancels; per-operation timeouts
+  and honest failure recovery contain actual stalls without cutting off useful
+  research.
+- **Evidence-grounded browser completion**: browser results receive stable
+  observation IDs and source-quality labels. A browser-backed draft is held
+  until a separate completion audit checks the original request, exact-source
+  support, and honest unknowns; failed drafts go back to the same agent for
+  more research or revision instead of reaching chat as confident guesses.
 - **Themes**: light, dark, and follow-system, persisted per machine.
 - **Offline development** with the mock model and mock sandbox, plus
   `pnpm typecheck` and an end-to-end `pnpm smoke`.
+- **Deterministic real-model evaluations** for research quality, grounding,
+  provenance, recovery, latency, tool use, and token cost. See
+  [`evals/README.md`](evals/README.md) for the file-based pre/post-change
+  workflow.
 
 ## What is not ready yet
 
@@ -203,8 +223,7 @@ Be honest with yourself about the following before filing issues:
 - **Image upgrades preserve the supported durable paths, not arbitrary system
   mutations.** Files under `/root`, `/home`, `/srv`, and the workspace
   directories migrate; hand-edited files elsewhere in the guest OS may be
-  replaced by the new base. Compressed recovery images accumulate until you
-  remove them manually.
+  replaced by the new base. Only the newest compressed recovery image is kept.
 - **Routines and the scheduler are not implemented.** The Routines section in
   the right panel is a labeled placeholder.
 - **The Marketplace row is a placeholder** and is disabled.
@@ -226,9 +245,11 @@ Be honest with yourself about the following before filing issues:
   returns a clear error.
 - **No per-bot egress allowlists.** Every microVM shares the host NAT; there is
   no firewall policy per agent.
-- **Chromium runs as root with `--no-sandbox` inside the microVM.** Firecracker
-  is the isolation boundary; do not treat the guest's Chrome process as a
-  second sandbox.
+- **Browser and compute isolation are split.** Shell and file tools run in the
+  per-agent Firecracker microVM. Chromium runs as a per-agent unprivileged Linux
+  account with Chromium's sandbox enabled in the shared outer Lima VM so nested
+  virtualization cannot stall its timers. Profiles are separate, but browsers
+  do not have a separate kernel per agent.
 - **No snapshots, restore, or pause/resume.** VMs are booted fresh and keep
   their rootfs, but there is no snapshotting.
 - **No multi-user support.** The daemon binds `127.0.0.1` and trusts the local

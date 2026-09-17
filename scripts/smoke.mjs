@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -21,6 +21,8 @@ function readBody(request) {
     request.on("end", () => resolvePromise(body));
   });
 }
+
+let completionAuditCalls = 0;
 
 const mockModelServer = createServer(async (request, response) => {
   if (request.method === "GET" && request.url?.endsWith("/models")) {
@@ -54,15 +56,143 @@ const mockModelServer = createServer(async (request, response) => {
     response.end();
   };
 
-  const wantsTool =
+  const lastUser = [...messages]
+    .reverse()
+    .find((message) => message.role === "user");
+  const lastUserContent =
+    typeof lastUser?.content === "string" ? lastUser.content : "";
+
+  if (lastUserContent.startsWith("[OpenBot completion audit]")) {
+    completionAuditCalls += 1;
+    const needsRepair = lastUserContent.includes(
+      "This item is definitely locally in stock.",
+    );
+    write({
+      choices: [
+        {
+          delta: {
+            content: JSON.stringify(
+              needsRepair
+                ? {
+                    verdict: "continue",
+                    issues: [
+                      "The exact product's local inventory is not supported by the page observation.",
+                    ],
+                    instructions:
+                      "State that local stock was not verified, or gather direct inventory evidence.",
+                  }
+                : { verdict: "pass", issues: [], instructions: "" },
+            ),
+          },
+        },
+      ],
+    });
+    finish();
+    return;
+  }
+
+  if (
+    lastUserContent.startsWith(
+      "[OpenBot verification feedback - continue the original task]",
+    )
+  ) {
+    write({
+      choices: [
+        {
+          delta: {
+            content:
+              "The page confirms the listed item, but its local inventory was not verified.",
+          },
+        },
+      ],
+    });
+    finish();
+    return;
+  }
+
+  const isLongResearchTest =
+    lastUserContent.startsWith("long-research:");
+
+  if (
+    isLongResearchTest &&
+    Array.isArray(parsed.tools) &&
+    (last?.role === "user" || last?.role === "tool")
+  ) {
+    const lastUserIndex = messages.findLastIndex(
+      (message) => message.role === "user",
+    );
+    const completedCalls = messages
+      .slice(lastUserIndex + 1)
+      .filter(
+        (message) => message.role === "assistant" && message.tool_calls?.length,
+      ).length;
+    if (completedCalls >= 20) {
+      write({
+        choices: [
+          {
+            delta: {
+              content:
+                "Final comparison synthesized from the collected seller evidence.",
+            },
+          },
+        ],
+      });
+      finish();
+      return;
+    }
+    const args = JSON.stringify({
+      action: "goto",
+      url: `https://seller-${completedCalls + 1}.example/item`,
+    });
+    write({
+      choices: [
+        {
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: `call_research_${completedCalls + 1}`,
+                type: "function",
+                function: { name: "browser", arguments: args },
+              },
+            ],
+          },
+        },
+      ],
+    });
+    write({ choices: [{ delta: {}, finish_reason: "tool_calls" }] });
+    response.write("data: [DONE]\n\n");
+    response.end();
+    return;
+  }
+
+  const requestedTool =
     Array.isArray(parsed.tools) &&
     last?.role === "user" &&
-    typeof last.content === "string" &&
-    last.content.startsWith("run:");
+    typeof last.content === "string"
+      ? last.content.startsWith("run:")
+        ? {
+            name: "shell",
+            args: { command: last.content.slice(4).trim() },
+          }
+        : last.content.startsWith("browse:")
+          ? {
+              name: "browser",
+              args: { action: "goto", url: last.content.slice(7).trim() },
+            }
+          : last.content.startsWith("audit-repair:")
+            ? {
+                name: "browser",
+                args: {
+                  action: "goto",
+                  url: last.content.slice("audit-repair:".length).trim(),
+                },
+              }
+          : null
+      : null;
 
-  if (wantsTool) {
-    const command = last.content.slice(4).trim();
-    const args = JSON.stringify({ command });
+  if (requestedTool) {
+    const args = JSON.stringify(requestedTool.args);
     write({
       choices: [
         {
@@ -72,7 +202,10 @@ const mockModelServer = createServer(async (request, response) => {
                 index: 0,
                 id: "call_mock_1",
                 type: "function",
-                function: { name: "shell", arguments: args.slice(0, 5) },
+                function: {
+                  name: requestedTool.name,
+                  arguments: args.slice(0, 5),
+                },
               },
             ],
           },
@@ -95,6 +228,15 @@ const mockModelServer = createServer(async (request, response) => {
   }
 
   if (last?.role === "tool") {
+    if (lastUserContent.startsWith("audit-repair:")) {
+      write({
+        choices: [
+          { delta: { content: "This item is definitely locally in stock." } },
+        ],
+      });
+      finish();
+      return;
+    }
     write({
       choices: [
         { delta: { content: `Done. ${String(last.content).split("\n")[0]}` } },
@@ -104,9 +246,6 @@ const mockModelServer = createServer(async (request, response) => {
     return;
   }
 
-  const lastUser = [...messages]
-    .reverse()
-    .find((message) => message.role === "user");
   write({
     choices: [{ delta: { content: `Mock reply to: ${lastUser?.content ?? ""}` } }],
   });
@@ -119,6 +258,8 @@ const SCREEN_PNG = Buffer.from(
 );
 
 const executedCommands = [];
+const browserActions = [];
+const destroyedVms = [];
 const mockSandboxServer = createServer(async (request, response) => {
   const url = request.url ?? "";
   response.setHeader("content-type", "application/json");
@@ -130,6 +271,22 @@ const mockSandboxServer = createServer(async (request, response) => {
 
   const rawBody = request.method === "POST" ? await readBody(request) : "";
   const body = rawBody ? JSON.parse(rawBody) : {};
+
+  if (url.endsWith("/destroy")) {
+    const match = /^\/vms\/([^/]+)\/destroy$/.exec(url);
+    const botId = decodeURIComponent(match?.[1] ?? "");
+    destroyedVms.push(botId);
+    response.end(
+      JSON.stringify({
+        botId,
+        state: "stopped",
+        cid: null,
+        bootedAt: null,
+        error: null,
+      }),
+    );
+    return;
+  }
 
   if (url.endsWith("/ensure") || url.endsWith("/status")) {
     response.end(
@@ -144,7 +301,33 @@ const mockSandboxServer = createServer(async (request, response) => {
     return;
   }
 
+  if (url.endsWith("/browser")) {
+    browserActions.push(body);
+    response.end(
+      JSON.stringify({
+        ok: true,
+        url: body.url ?? "about:blank",
+        title: body.url === "https://example.com" ? "Example Domain" : "",
+        text: `Seller evidence from ${body.url ?? "about:blank"}`,
+        durationMs: 5,
+      }),
+    );
+    return;
+  }
+
   if (url.endsWith("/exec")) {
+    if (typeof body.command === "string" && body.command.includes("scrot")) {
+      response.end(
+        JSON.stringify({
+          exit: 0,
+          stdout: SCREEN_PNG.toString("base64"),
+          stderr: "",
+          durationMs: 4,
+        }),
+      );
+      return;
+    }
+
     if (
       typeof body.command === "string" &&
       body.command.includes("openbot-browser.js")
@@ -383,6 +566,11 @@ try {
   assert.equal(hello.providers[0].id, "deepseek");
   assert.ok(hello.presets.length >= 5, "expected provider presets");
   assert.equal(hello.requireApproval, true);
+  assert.match(
+    hello.bots[0].systemPrompt,
+    /Never upgrade a lead, search result, or nearby fact/,
+    "new bots should receive the compact evidence-oriented prompt",
+  );
   const botId = hello.bots[0].id;
 
   socket.send(JSON.stringify({ type: "chat.send", botId, text: "hello there" }));
@@ -412,6 +600,94 @@ try {
   assert.equal(approvedDone.message.toolCalls[0].name, "shell");
   assert.equal(approvedDone.message.toolCalls[0].ok, true);
   assert.deepEqual(executedCommands, ["uname -a"]);
+
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId,
+      text: "browse: https://example.com",
+    }),
+  );
+  const browserApproval = await waitFor("approval.request");
+  assert.equal(browserApproval.name, "browser");
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: browserApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const browserResult = await waitFor("tool.result");
+  assert.equal(browserResult.ok, true);
+  assert.match(browserResult.output, /title: Example Domain/);
+  const browserDone = await waitFor("chat.done");
+  assert.equal(browserDone.message.toolCalls[0].name, "browser");
+  assert.equal(browserActions.length, 1);
+  assert.equal(browserActions[0].action, "goto");
+  assert.equal(browserActions[0].url, "https://example.com");
+  assert.equal(browserActions[0].timeoutMs, 75000);
+  assert.match(
+    browserResult.output,
+    /\[evidence browser-001; source=direct-page\]/,
+  );
+  assert.match(browserResult.output, /Seller evidence from/);
+  assert.equal(completionAuditCalls, 1);
+
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId,
+      text: "long-research: compare sellers and return a final answer",
+    }),
+  );
+  for (let index = 0; index < 20; index += 1) {
+    const researchApproval = await waitFor("approval.request");
+    assert.equal(researchApproval.name, "browser");
+    socket.send(
+      JSON.stringify({
+        type: "approval.respond",
+        requestId: researchApproval.requestId,
+        decision: "approve",
+      }),
+    );
+    const researchResult = await waitFor("tool.result");
+    assert.equal(researchResult.ok, true);
+  }
+  const researchDone = await waitFor("chat.done");
+  assert.equal(researchDone.message.toolCalls.length, 20);
+  assert.equal(
+    researchDone.message.content,
+    "Final comparison synthesized from the collected seller evidence.",
+    "research must be allowed to continue beyond the old fixed tool-round ceiling",
+  );
+  assert.equal(completionAuditCalls, 2);
+
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId,
+      text: "audit-repair: https://example.com/product",
+    }),
+  );
+  const repairApproval = await waitFor("approval.request");
+  assert.equal(repairApproval.name, "browser");
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: repairApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  await waitFor("tool.result");
+  const repairedDone = await waitFor("chat.done");
+  assert.equal(repairedDone.message.toolCalls.length, 1);
+  assert.match(repairedDone.message.content, /local inventory was not verified/i);
+  assert.doesNotMatch(repairedDone.message.content, /definitely locally in stock/i);
+  assert.equal(
+    completionAuditCalls,
+    4,
+    "the verifier should reject the unsupported draft and approve the revision",
+  );
 
   socket.send(JSON.stringify({ type: "thread.list" }));
   const threadList = await waitFor("threads");
@@ -449,7 +725,7 @@ try {
   const assistantWithTools = history.messages.filter(
     (message) => message.role === "assistant" && message.toolCalls?.length,
   );
-  assert.equal(assistantWithTools.length, 2, "tool runs persist on assistant messages");
+  assert.equal(assistantWithTools.length, 5, "tool runs persist on assistant messages");
 
   const screenResponse = await fetch(
     `http://127.0.0.1:${daemonPort}/bots/${botId}/screen`,
@@ -588,6 +864,64 @@ try {
   );
   await waitFor("providers.updated");
 
+  const localWorkspace = join(dataDir, "workspaces", localBotId);
+  assert.ok(
+    existsSync(localWorkspace),
+    "local bot workspace should exist before deletion",
+  );
+  socket.send(
+    JSON.stringify({
+      type: "bots.delete",
+      requestId: "bot-delete-1",
+      botId: localBotId,
+    }),
+  );
+  const deleted = await waitFor("bot.deleted");
+  assert.equal(deleted.botId, localBotId);
+  assert.equal(
+    existsSync(localWorkspace),
+    false,
+    "local bot workspace should be removed on deletion",
+  );
+  for (
+    let attempt = 0;
+    attempt < 100 && destroyedVms.length === 0;
+    attempt += 1
+  ) {
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+  }
+  assert.deepEqual(
+    destroyedVms,
+    [localBotId],
+    "deleting an agent should destroy its VM",
+  );
+
+  socket.send(JSON.stringify({ type: "thread.list" }));
+  const afterDelete = await waitFor("threads");
+  assert.equal(
+    afterDelete.threads.some((thread) => thread.botId === localBotId),
+    false,
+    "deleted bot threads should be removed",
+  );
+  socket.send(
+    JSON.stringify({
+      type: "bots.delete",
+      requestId: "bot-delete-2",
+      botId: localBotId,
+    }),
+  );
+  const deleteError = await waitFor("chat.error");
+  assert.match(deleteError.message, /unknown bot/, "deleted bot should be gone");
+  socket.send(
+    JSON.stringify({ type: "thread.messages", threadId: localDone.threadId }),
+  );
+  const deletedHistory = await waitFor("thread.messages");
+  assert.equal(
+    deletedHistory.messages.length,
+    0,
+    "deleted bot messages should be removed",
+  );
+
   socket.send(
     JSON.stringify({
       type: "provider.upsert",
@@ -657,7 +991,7 @@ try {
   assert.match(error.message, /unknown provider: nope/);
 
   console.log(
-    `SMOKE OK — text chat, single thread per bot, approved shell tool (${executedCommands[0]}), denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), provider CRUD, settings, error path`,
+    `SMOKE OK — text chat, single thread per bot, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path`,
   );
 } finally {
   socket?.close();

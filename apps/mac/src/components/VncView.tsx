@@ -1,7 +1,74 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import RFB from "@novnc/novnc";
 
 export type VncState = "idle" | "connecting" | "live" | "down";
+
+type RfbSocket = object;
+type FramebufferUpdateRequest = (
+  socket: RfbSocket,
+  incremental: boolean,
+  x?: number,
+  y?: number,
+  width?: number,
+  height?: number,
+) => void;
+type RfbWithSocket = RFB & { _sock?: RfbSocket };
+type RfbConstructorWithMessages = typeof RFB & {
+  messages?: { fbUpdateRequest?: FramebufferUpdateRequest };
+};
+
+const heldSockets = new WeakSet<RfbSocket>();
+const pendingUpdates = new WeakMap<
+  RfbSocket,
+  { receiver: unknown; args: Parameters<FramebufferUpdateRequest> }
+>();
+let frameHoldInstalled = false;
+
+function installFrameHold() {
+  if (frameHoldInstalled) return true;
+  const messages = (RFB as RfbConstructorWithMessages).messages;
+  const original = messages?.fbUpdateRequest;
+  if (!messages || !original) return false;
+
+  messages.fbUpdateRequest = function (
+    this: unknown,
+    ...args: Parameters<FramebufferUpdateRequest>
+  ) {
+    const socket = args[0];
+    if (heldSockets.has(socket)) {
+      pendingUpdates.set(socket, { receiver: this, args });
+      return;
+    }
+    original.apply(this, args);
+  };
+  frameHoldInstalled = true;
+  return true;
+}
+
+function setFrameHeld(client: RFB, held: boolean) {
+  if (!installFrameHold()) return;
+  const socket = (client as RfbWithSocket)._sock;
+  if (!socket) return;
+
+  if (held) {
+    heldSockets.add(socket);
+    return;
+  }
+
+  heldSockets.delete(socket);
+  const pending = pendingUpdates.get(socket);
+  if (!pending) return;
+  pendingUpdates.delete(socket);
+  const send = (RFB as RfbConstructorWithMessages).messages?.fbUpdateRequest;
+  send?.apply(pending.receiver, pending.args);
+}
+
+function clearFrameHold(client: RFB) {
+  const socket = (client as RfbWithSocket)._sock;
+  if (!socket) return;
+  heldSockets.delete(socket);
+  pendingUpdates.delete(socket);
+}
 
 export function VncView({
   url,
@@ -13,12 +80,40 @@ export function VncView({
   onState: (state: VncState) => void;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const clientRef = useRef<RFB | null>(null);
   const stateRef = useRef(onState);
+  const [pageInteractive, setPageInteractive] = useState(
+    () => !document.hidden && document.hasFocus(),
+  );
+  const interactiveRef = useRef(pageInteractive);
+  interactiveRef.current = pageInteractive;
   stateRef.current = onState;
+
+  useEffect(() => {
+    const syncActivity = () => {
+      setPageInteractive(!document.hidden && document.hasFocus());
+    };
+    document.addEventListener("visibilitychange", syncActivity);
+    window.addEventListener("focus", syncActivity);
+    window.addEventListener("blur", syncActivity);
+    return () => {
+      document.removeEventListener("visibilitychange", syncActivity);
+      window.removeEventListener("focus", syncActivity);
+      window.removeEventListener("blur", syncActivity);
+    };
+  }, []);
+
+  useEffect(() => {
+    const client = clientRef.current;
+    if (!client) return;
+    client.viewOnly = !pageInteractive;
+    setFrameHeld(client, !pageInteractive);
+  }, [pageInteractive]);
 
   useEffect(() => {
     const target = containerRef.current;
     if (!active || !target) {
+      stateRef.current("idle");
       return;
     }
     let disposed = false;
@@ -30,7 +125,7 @@ export function VncView({
       if (disposed || retryTimer !== null) {
         return;
       }
-      const baseDelay = Math.min(1000 * 2 ** retryAttempt, 15_000);
+      const baseDelay = Math.min(1000 * 2 ** retryAttempt, 5_000);
       const jitter = Math.floor(Math.random() * 500);
       retryAttempt += 1;
       retryTimer = window.setTimeout(() => {
@@ -53,18 +148,27 @@ export function VncView({
         scheduleReconnect();
         return;
       }
-      rfb.viewOnly = false;
+      rfb.viewOnly = !interactiveRef.current;
       rfb.scaleViewport = true;
       rfb.resizeSession = false;
+      // A little compression keeps full-screen updates out of the relay
+      // buffers without making the small guest spend heavily on encoding.
+      rfb.qualityLevel = 6;
+      rfb.compressionLevel = 1;
       rfb.background = "#141417";
       client = rfb;
+      clientRef.current = rfb;
+      setFrameHeld(rfb, !interactiveRef.current);
       rfb.addEventListener("connect", () => {
         if (!disposed) {
           retryAttempt = 0;
+          setFrameHeld(rfb, !interactiveRef.current);
           stateRef.current("live");
         }
       });
       rfb.addEventListener("disconnect", () => {
+        clearFrameHold(rfb);
+        if (clientRef.current === rfb) clientRef.current = null;
         if (disposed) {
           return;
         }
@@ -88,7 +192,9 @@ export function VncView({
       if (retryTimer !== null) {
         window.clearTimeout(retryTimer);
       }
+      if (client) clearFrameHold(client);
       client?.disconnect();
+      if (clientRef.current === client) clientRef.current = null;
       client = null;
       target.replaceChildren();
       stateRef.current("idle");
