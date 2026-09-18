@@ -217,6 +217,9 @@ export function openDatabase(dataDir: string): DatabaseSync {
   if (!botColumnNames.has("policy")) {
     db.exec("ALTER TABLE bots ADD COLUMN policy TEXT NOT NULL DEFAULT 'inherit'");
   }
+  if (!botColumnNames.has("effort")) {
+    db.exec("ALTER TABLE bots ADD COLUMN effort TEXT");
+  }
 
   const taskColumns = db
     .prepare("PRAGMA table_info(tasks)")

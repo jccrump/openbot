@@ -110,7 +110,12 @@ export function VncView({
   useEffect(() => {
     const client = clientRef.current;
     if (!client) return;
-    client.viewOnly = !(pageInteractive && interactive);
+    // Interaction follows the expanded state only. Gating it on
+    // document.hasFocus() made the full-screen KVM dead in the desktop
+    // webview, where focus reporting is unreliable.
+    client.viewOnly = !interactive;
+    // Only take over the pointer when the user can actually interact.
+    (client as RFB & { showDotCursor: boolean }).showDotCursor = interactive;
     setFrameHeld(client, !pageInteractive);
   }, [pageInteractive, interactive]);
 
@@ -152,9 +157,15 @@ export function VncView({
         scheduleReconnect();
         return;
       }
-      rfb.viewOnly = !(interactiveRef.current && viewInteractiveRef.current);
+      rfb.viewOnly = !viewInteractiveRef.current;
       rfb.scaleViewport = true;
       rfb.resizeSession = false;
+      // x11vnc runs with -nocursorshape, so no cursor image ever arrives and
+      // noVNC hides the local pointer (cursor: none). The dot cursor keeps a
+      // visible pointer, but only while the screen is interactive (expanded):
+      // the inline preview stays a plain preview with the normal cursor.
+      (rfb as RFB & { showDotCursor: boolean }).showDotCursor =
+        viewInteractiveRef.current;
       // A little compression keeps full-screen updates out of the relay
       // buffers without making the small guest spend heavily on encoding.
       rfb.qualityLevel = 6;

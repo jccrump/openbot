@@ -208,7 +208,7 @@ function renderTranscript(messages: Message[]): string {
 
 async function summarize(
   provider: ChatProvider,
-  model: string,
+  model: ModelRef,
   transcript: string,
   userMessage: string | undefined,
   signal: AbortSignal | undefined,
@@ -217,11 +217,12 @@ async function summarize(
     ? `${transcript}\n\nAdditional context from the user for this summary:\n${userMessage}`
     : transcript;
   const request: ChatRequest = {
-    model,
+    model: model.model,
     messages: [
       { role: "system", content: SUMMARIZER_SYSTEM_PROMPT },
       { role: "user", content },
     ],
+    ...(model.effort ? { reasoningEffort: model.effort } : {}),
     ...(signal ? { signal } : {}),
   };
 
@@ -270,7 +271,7 @@ export async function compactThread(
   const tokensBefore = estimateMessagesTokens(messages) + systemTokens;
   const { text, usage } = await summarize(
     input.provider,
-    input.model.model,
+    input.model,
     renderTranscript(span.toCompact),
     input.userMessage,
     input.signal,

@@ -247,6 +247,14 @@ when the Codex CLI is on `PATH`.
   controlling. Text-only models get the metadata and the chat artifact instead
   and never receive image content, so a request cannot fail on an image.
   Only the latest screenshot is kept in history.
+- **Reasoning effort**: pick how hard a model should think before answering.
+  The composer's model and effort menus change the agent's own model, so the
+  choice is stored with the agent and survives a refresh or relaunch; the
+  agent settings modal sets the effort for the same agent. It is sent to
+  OpenAI-compatible providers as `reasoning_effort`. DeepSeek accepts
+  `none`/`low`/`high`/`max` (its `minimal` maps to low and `medium` to high),
+  OpenAI accepts `minimal`/`low`/`medium`/`high`, and the default leaves the
+  provider's own setting untouched.
 - **Two harnesses**: the built-in OpenBot loop (primary, default, any
   OpenAI-compatible model) and the optional Codex harness driving the same VM
   over MCP — with a ChatGPT subscription or a non-OpenAI model through the
@@ -284,11 +292,11 @@ when the Codex CLI is on `PATH`.
 Be honest with yourself about the following before filing issues:
 
 - **The lead/worker runtime is young.** The lead, persistent project managers,
-  worker sessions, task grants, memory, and the soul are implemented (see
-  ADR-015/016/017 in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)), but this is
-  an early alpha: routines and the approvals policy engine are not built, and
-  the runtime has only been exercised by the smoke test, the evals, and hand
-  testing.
+  worker sessions, on-demand team building (ADR-019), task grants, memory, and
+  the soul are implemented (see ADR-015/016/017/019 in
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)), but this is an early alpha:
+  routines are not built, and the runtime has only been exercised by the smoke
+  test, the evals, and hand testing.
 
 - **Image upgrades preserve the supported durable paths, not arbitrary system
   mutations.** Files under `/root`, `/home`, `/srv`, and the workspace

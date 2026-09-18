@@ -28,7 +28,18 @@ export interface ChatRequest {
   messages: ChatMessage[];
   tools?: ToolDefinition[];
   signal?: AbortSignal;
+  /** Sent as `reasoning_effort`; unset keeps the provider default. */
+  reasoningEffort?: ReasoningEffort;
 }
+
+/** Mirrors ReasoningEffortSchema in @openbot/protocol. */
+export type ReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "max";
 
 export interface TokenUsage {
   inputTokens: number;

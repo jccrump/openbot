@@ -8,16 +8,29 @@ const MAX_WIDTH = 960;
 export function PanelResizer({ active }: { active: boolean }) {
   const [dragging, setDragging] = useState(false);
 
-  useEffect(() => {
+  // Apply the stored width, clamped to what this window can actually fit so a
+  // panel sized on a large window cannot swallow the chat on a small one.
+  const applyStoredWidth = () => {
     try {
       const stored = Number(localStorage.getItem(SCREEN_WIDTH_KEY));
-      if (stored >= MIN_WIDTH) {
-        document.documentElement.style.setProperty(
-          "--screen-width",
-          `${stored}px`,
-        );
+      if (!(stored >= MIN_WIDTH)) {
+        return;
       }
+      const max = Math.max(
+        MIN_WIDTH,
+        Math.min(MAX_WIDTH, window.innerWidth - MIN_CHAT_WIDTH),
+      );
+      document.documentElement.style.setProperty(
+        "--screen-width",
+        `${Math.min(stored, max)}px`,
+      );
     } catch {}
+  };
+
+  useEffect(() => {
+    applyStoredWidth();
+    window.addEventListener("resize", applyStoredWidth);
+    return () => window.removeEventListener("resize", applyStoredWidth);
   }, []);
 
   useEffect(() => {

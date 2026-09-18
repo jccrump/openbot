@@ -68,6 +68,9 @@ export function createOpenAICompatibleProvider(
         }));
         body.tool_choice = "auto";
       }
+      if (request.reasoningEffort) {
+        body.reasoning_effort = request.reasoningEffort;
+      }
 
       const response = await fetch(url, {
         method: "POST",

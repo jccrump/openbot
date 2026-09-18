@@ -255,6 +255,7 @@ export class Reflector {
     for await (const event of provider.chat({
       model: bot.model.model,
       messages,
+      ...(bot.model.effort ? { reasoningEffort: bot.model.effort } : {}),
       signal: AbortSignal.timeout(MODEL_TIMEOUT_MS),
     })) {
       if (event.type === "text_delta") {

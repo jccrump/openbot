@@ -13,6 +13,7 @@ import type {
   Message,
   MessageRole,
   ModelRef,
+  ReasoningEffort,
   RolePolicy,
   SoulContent,
   SoulVersion,
@@ -59,7 +60,10 @@ export const DEFAULT_LEAD_SYSTEM_PROMPT =
   "ask_project; if none matches, create_project and then ask_project. Never " +
   "do a project's work yourself: route it and let the manager report back. " +
   "Use spawn_worker directly only for one-off work that does not belong to a " +
-  "project. Write each request so the manager can act without this " +
+  "project. When no existing role fits the work, create_worker adds a " +
+  "persistent teammate and then you delegate to it; check list_roles first " +
+  "and reuse the roles the team already has. Write each request so the " +
+  "manager can act without this " +
   "conversation: what the user wants, constraints, and the deliverable. " +
   "Delegate when work is long, parallel, or risky so you stay responsive; do " +
   "quick lookups and direct answers yourself. Never wait for work with sleep " +
@@ -171,6 +175,7 @@ interface BotRow {
   system_prompt: string;
   provider: string;
   model: string;
+  effort?: string | null;
   created_at: string;
   kind?: string | null;
   role?: string | null;
@@ -430,12 +435,32 @@ function slugify(value: string): string {
   );
 }
 
+const REASONING_EFFORTS = new Set<string>([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "max",
+]);
+
+function toEffort(value: string | null | undefined): ReasoningEffort | undefined {
+  return value && REASONING_EFFORTS.has(value)
+    ? (value as ReasoningEffort)
+    : undefined;
+}
+
 function toBot(row: BotRow): Bot {
+  const effort = toEffort(row.effort);
   return {
     id: row.id,
     name: row.name,
     systemPrompt: row.system_prompt,
-    model: { provider: row.provider, model: row.model },
+    model: {
+      provider: row.provider,
+      model: row.model,
+      ...(effort ? { effort } : {}),
+    },
     createdAt: row.created_at,
     kind:
       row.kind === "lead"
@@ -648,7 +673,7 @@ export class Store {
     };
     this.db
       .prepare(
-        "INSERT INTO bots (id, name, system_prompt, provider, model, created_at, kind, role, avatar, color, computer, delegates, policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO bots (id, name, system_prompt, provider, model, effort, created_at, kind, role, avatar, color, computer, delegates, policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         bot.id,
@@ -656,6 +681,7 @@ export class Store {
         bot.systemPrompt,
         bot.model.provider,
         bot.model.model,
+        bot.model.effort ?? null,
         bot.createdAt,
         bot.kind,
         bot.role ?? null,
@@ -678,6 +704,7 @@ export class Store {
       computer?: string | null;
       delegates?: boolean;
       policy?: RolePolicy;
+      model?: ModelRef;
     },
   ): Bot | null {
     const existing = this.getBot(id);
@@ -695,6 +722,11 @@ export class Store {
     }
     if (patch.policy !== undefined) {
       fields.push(["policy", patch.policy]);
+    }
+    if (patch.model !== undefined) {
+      fields.push(["provider", patch.model.provider]);
+      fields.push(["model", patch.model.model]);
+      fields.push(["effort", patch.model.effort ?? null]);
     }
     for (const [column, value] of fields) {
       this.db

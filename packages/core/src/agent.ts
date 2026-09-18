@@ -6,6 +6,7 @@ import {
   type ChatMessage,
   type ChatProvider,
   type ContentPart,
+  type ReasoningEffort,
   type TokenUsage,
   type ToolCall,
   type ToolDefinition,
@@ -169,6 +170,7 @@ function abortFallback<T>(signal: AbortSignal, value: T): Promise<T> {
 async function auditCompletion(input: {
   provider: ChatProvider;
   model: string;
+  reasoningEffort?: ReasoningEffort;
   userRequest: string;
   candidate: string;
   records: ToolCallRecord[];
@@ -197,6 +199,9 @@ async function auditCompletion(input: {
         ),
       },
     ],
+    ...(input.reasoningEffort
+      ? { reasoningEffort: input.reasoningEffort }
+      : {}),
     signal: providerSignal,
   })) {
     if (event.type === "text_delta") {
@@ -1004,6 +1009,7 @@ export async function runAgent(
           model: model.model,
           messages: working,
           ...(definitions.length ? { tools: definitions } : {}),
+          ...(model.effort ? { reasoningEffort: model.effort } : {}),
           signal: providerSignal,
         })) {
           if (event.type === "text_delta") {
@@ -1165,6 +1171,7 @@ export async function runAgent(
               audited = await auditCompletion({
                 provider,
                 model: model.model,
+                ...(model.effort ? { reasoningEffort: model.effort } : {}),
                 userRequest: input.text,
                 candidate: finalText,
                 records,

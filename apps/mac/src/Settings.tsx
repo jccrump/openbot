@@ -11,7 +11,9 @@ import type {
   ProviderInfo,
   ProviderPreset,
 } from "@openbot/protocol";
+import type { Bot } from "@openbot/protocol";
 import { HarnessLogo, ProviderLogo } from "./components/ProviderLogo";
+import { avatarColor, COMPUTER_LABEL, effortLabel } from "./lib/agentOptions";
 import type { DaemonStatus } from "./lib/daemon";
 import type { ThemePreference } from "./lib/useTheme";
 import type {
@@ -19,6 +21,7 @@ import type {
   FetchModelsResult,
   ModelOption,
   ProviderInput,
+  SandboxState,
 } from "./lib/useDaemon";
 
 interface SettingsProps {
@@ -49,6 +52,10 @@ interface SettingsProps {
     apiKey?: string;
   }) => Promise<FetchModelsResult>;
   onTestDecision: () => Promise<DecisionTestResult>;
+  roles: Bot[];
+  sandboxStates: Record<string, SandboxState>;
+  onHireRole: () => void;
+  onEditRole: (botId: string) => void;
 }
 
 interface FormState {
@@ -68,7 +75,13 @@ interface DecisionFormState {
   timeoutMs: string;
 }
 
-type SectionId = "general" | "appearance" | "providers" | "harness" | "decision";
+type SectionId =
+  | "general"
+  | "appearance"
+  | "providers"
+  | "team"
+  | "harness"
+  | "decision";
 
 const EMPTY_FORM: FormState = {
   label: "",
@@ -82,6 +95,7 @@ const SECTION_LABEL: Record<SectionId, string> = {
   general: "General",
   appearance: "Appearance",
   providers: "Providers",
+  team: "Team",
   harness: "Harness",
   decision: "Decision model",
 };
@@ -156,6 +170,27 @@ function ProvidersIcon() {
       <rect x="2.2" y="8.8" width="11.6" height="4.6" rx="1.6" stroke="currentColor" strokeWidth="1.4" />
       <circle cx="5" cy="4.9" r="0.8" fill="currentColor" />
       <circle cx="5" cy="11.1" r="0.8" fill="currentColor" />
+    </svg>
+  );
+}
+
+function TeamIcon() {
+  return (
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+      <circle cx="9" cy="7" r="4" />
+      <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+      <path d="M16 3.13a4 4 0 0 1 0 7.75" />
     </svg>
   );
 }
@@ -241,6 +276,7 @@ const NAV_ITEMS: Array<{
   { id: "general", label: "General", icon: SlidersIcon },
   { id: "appearance", label: "Appearance", icon: AppearanceIcon },
   { id: "providers", label: "Providers", icon: ProvidersIcon },
+  { id: "team", label: "Team", icon: TeamIcon },
   { id: "harness", label: "Harness", icon: HarnessIcon },
   { id: "decision", label: "Decision model", icon: DecisionIcon },
 ];
@@ -835,6 +871,60 @@ export function Settings(props: SettingsProps) {
                   </p>
                 )}
               </>
+            )}
+
+            {section === "team" && (
+              <section className="settings-card">
+                <div className="settings-row">
+                  <span>Workers</span>
+                  <button
+                    className="ghost-button"
+                    onClick={() => props.onHireRole()}
+                  >
+                    Hire a role
+                  </button>
+                </div>
+                {props.roles.length === 0 ? (
+                  <p className="settings-empty">
+                    No workers yet. Hire a role once, and the lead and threads
+                    can spawn it for tasks.
+                  </p>
+                ) : (
+                  props.roles.map((role) => {
+                    const state = props.sandboxStates[role.id] ?? "stopped";
+                    return (
+                      <button
+                        key={role.id}
+                        className="team-row"
+                        onClick={() => props.onEditRole(role.id)}
+                      >
+                        <span
+                          className="avatar"
+                          style={{
+                            background:
+                              role.color ?? avatarColor(role.id),
+                          }}
+                        />
+                        <span className="team-row-body">
+                          <span className="team-row-name">{role.name}</span>
+                          <span className="team-row-sub">
+                            {role.role?.trim() || "Worker"} ·{" "}
+                            {role.model.provider} · {role.model.model}
+                            {role.model.effort
+                              ? ` · ${effortLabel(role.model.effort)}`
+                              : ""}
+                          </span>
+                        </span>
+                        <span className="team-row-state">
+                          {role.computer === "mac"
+                            ? "This Mac"
+                            : COMPUTER_LABEL[state] ?? state}
+                        </span>
+                      </button>
+                    );
+                  })
+                )}
+              </section>
             )}
 
             {section === "harness" && (

@@ -298,6 +298,23 @@ const mockModelServer = createServer(async (request, response) => {
       ? ""
       : createProjectRest.slice(createProjectSeparator + 2).trim();
 
+  const createWorkerRest =
+    Array.isArray(parsed.tools) &&
+    last?.role === "user" &&
+    typeof last.content === "string" &&
+    last.content.startsWith("create-worker:")
+      ? last.content.slice("create-worker:".length).trim()
+      : "";
+  const createWorkerSeparator = createWorkerRest.indexOf("::");
+  const createWorkerName =
+    createWorkerSeparator === -1
+      ? createWorkerRest
+      : createWorkerRest.slice(0, createWorkerSeparator).trim();
+  const createWorkerSpecialty =
+    createWorkerSeparator === -1
+      ? ""
+      : createWorkerRest.slice(createWorkerSeparator + 2).trim();
+
   const askRest =
     Array.isArray(parsed.tools) &&
     last?.role === "user" &&
@@ -390,6 +407,7 @@ const mockModelServer = createServer(async (request, response) => {
     hasTools: Array.isArray(parsed.tools) && parsed.tools.length > 0,
     system: systemContent,
     lastUser: lastUserContent,
+    reasoningEffort: parsed.reasoning_effort ?? null,
   });
 
   const requestedTool =
@@ -438,6 +456,14 @@ const mockModelServer = createServer(async (request, response) => {
                         scope: createProjectScope,
                       },
                     }
+                  : last.content.startsWith("create-worker:")
+                    ? {
+                        name: "create_worker",
+                        args: {
+                          name: createWorkerName,
+                          specialty: createWorkerSpecialty,
+                        },
+                      }
                   : last.content.startsWith("remember:")
                     ? {
                         name: "remember",
@@ -1150,6 +1176,80 @@ try {
   const textDone = await waitFor("chat.done");
   assert.match(textDone.message.content, /Mock reply to: hello there/);
   assert.equal(textDone.message.toolCalls, null);
+
+  // Reasoning effort rides on the model selection and reaches the provider as
+  // the reasoning_effort parameter.
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId,
+      text: "effort max check",
+      model: {
+        provider: "deepseek",
+        model: "deepseek-v4-flash",
+        effort: "max",
+      },
+    }),
+  );
+  const effortDone = await waitFor("chat.done");
+  assert.match(effortDone.message.content, /Mock reply to: effort max check/);
+  const effortRequest = [...modelRequests]
+    .reverse()
+    .find((item) => item.lastUser === "effort max check");
+  assert.equal(
+    effortRequest?.reasoningEffort,
+    "max",
+    "chat.send model effort should reach the provider as reasoning_effort",
+  );
+
+  // A bot-level model (with its effort) is persisted and used when chat.send
+  // omits a model — this is what the composer writes when the user changes
+  // the model or effort.
+  socket.send(
+    JSON.stringify({
+      type: "bots.update",
+      requestId: "smoke-effort",
+      botId,
+      model: {
+        provider: "deepseek",
+        model: "deepseek-v4-flash",
+        effort: "low",
+      },
+    }),
+  );
+  const effortBot = await waitFor("bot.updated");
+  assert.equal(
+    effortBot.bot.model.effort,
+    "low",
+    "bots.update should persist the bot's effort",
+  );
+  socket.send(
+    JSON.stringify({ type: "chat.send", botId, text: "effort bot check" }),
+  );
+  const botEffortDone = await waitFor("chat.done");
+  assert.match(botEffortDone.message.content, /Mock reply to: effort bot check/);
+  const botEffortRequest = [...modelRequests]
+    .reverse()
+    .find((item) => item.lastUser === "effort bot check");
+  assert.equal(
+    botEffortRequest?.reasoningEffort,
+    "low",
+    "the bot's persisted effort should be used when chat.send has no model",
+  );
+  socket.send(
+    JSON.stringify({
+      type: "bots.update",
+      requestId: "smoke-effort-clear",
+      botId,
+      model: { provider: "deepseek", model: "deepseek-v4-flash" },
+    }),
+  );
+  const clearedBot = await waitFor("bot.updated");
+  assert.equal(
+    clearedBot.bot.model.effort,
+    undefined,
+    "clearing effort should return the model to the provider default",
+  );
 
   socket.send(
     JSON.stringify({ type: "chat.send", botId, text: "run: uname -a" }),
@@ -2027,6 +2127,119 @@ try {
     "the lead should persist its task report in the conversation",
   );
 
+  // The lead builds the team when no role fits: create_worker adds a
+  // persistent worker, and a duplicate name reuses the existing role.
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId,
+      text: "create-worker: Weather Watcher :: checks NWS forecasts and alerts",
+    }),
+  );
+  const createWorkerApproval = await waitFor("approval.request");
+  assert.equal(createWorkerApproval.name, "create_worker");
+  assert.match(createWorkerApproval.arguments, /Weather Watcher/);
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: createWorkerApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const workerCreated = await waitForWhere(
+    (item) =>
+      item.type === "bot.created" && item.bot.name === "Weather Watcher",
+  );
+  assert.equal(workerCreated.bot.kind, "role", "created workers should be roles");
+  assert.equal(
+    workerCreated.bot.delegates,
+    false,
+    "created workers should not be managers",
+  );
+  assert.equal(
+    workerCreated.bot.computer,
+    "firecracker",
+    "created workers should default to a microVM",
+  );
+  assert.match(
+    workerCreated.bot.role ?? "",
+    /forecasts/,
+    "the specialty should become the worker's role",
+  );
+  const hiredWorkerId = workerCreated.bot.id;
+  await waitForLeadQuiet();
+
+  // The freshly created worker is immediately usable for the task that
+  // needed it.
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId,
+      text: `spawn: ${hiredWorkerId} :: run: uname -a`,
+    }),
+  );
+  const hireApproval = await waitFor("approval.request");
+  assert.equal(hireApproval.name, "spawn_worker");
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: hireApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const hiredTask = await waitForTaskWhere(
+    (task) => task.roleId === hiredWorkerId && task.status === "done",
+  );
+  assert.ok(hiredTask.result, "the new worker should complete a task");
+  assert.match(
+    hiredTask.grant.tools.join(","),
+    /shell/,
+    "the new worker's default grant should cover the tools it used",
+  );
+
+  // Let the task notification turn finish before the next lead turn.
+  await waitForLeadQuiet();
+
+  // Repeating a name reuses the role instead of forking the team.
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId,
+      text: "create-worker: Weather Watcher :: checks NWS forecasts and alerts",
+    }),
+  );
+  const reuseApproval = await waitFor("approval.request");
+  assert.equal(reuseApproval.name, "create_worker");
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: reuseApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const reuseCall = await waitForWhere(
+    (item) =>
+      item.type === "chat.message" &&
+      (item.message?.toolCalls ?? []).some(
+        (call) =>
+          call.name === "create_worker" && /already exists/.test(call.output),
+      ),
+  );
+  assert.match(
+    reuseCall.message.toolCalls.find((call) => call.name === "create_worker")
+      .output,
+    /already exists/,
+    "a duplicate worker name should reuse the existing role",
+  );
+  assert.equal(
+    received.filter(
+      (item) =>
+        item.type === "bot.created" && item.bot.name === "Weather Watcher",
+    ).length,
+    1,
+    "a duplicate worker name must not create a second bot",
+  );
+
   // A tool outside the grant escalates instead of running silently.
   socket.send(
     JSON.stringify({
@@ -2750,7 +2963,7 @@ try {
   );
 
   console.log(
-    `SMOKE OK — text chat, single thread per bot, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, lead delegation (spawn_worker, task grant, in-grant tools without re-approval, out-of-grant escalation and denial, task result + evidence + usage, lead notification), projects (lead creates a persistent manager, list_projects routing, ask_project request on the project thread, worker sessions in the project computer with their own browser, project survives and is reused), per-task computers (own sandbox id, concurrency cap and queueing, destroyed on settle), memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-role narrowing, egress allowlist), Jev routing (conversation runs without tools, a named project gets the routing hint)`,
+    `SMOKE OK — text chat, single thread per bot, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, lead delegation (spawn_worker, task grant, in-grant tools without re-approval, out-of-grant escalation and denial, task result + evidence + usage, lead notification), dynamic team building (create_worker, immediate delegation to the new worker, duplicate-name reuse), projects (lead creates a persistent manager, list_projects routing, ask_project request on the project thread, worker sessions in the project computer with their own browser, project survives and is reused), per-task computers (own sandbox id, concurrency cap and queueing, destroyed on settle), memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-role narrowing, egress allowlist), Jev routing (conversation runs without tools, a named project gets the routing hint)`,
   );
 } finally {
   socket?.close();

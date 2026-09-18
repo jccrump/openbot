@@ -772,6 +772,9 @@ export function createDaemon(options: DaemonOptions): Daemon {
           if (message.policy !== undefined) {
             patch.policy = message.policy;
           }
+          if (message.model !== undefined) {
+            patch.model = message.model;
+          }
           const bot = options.store.updateBot(message.botId, patch);
           if (!bot) {
             send({ type: "chat.error", message: `unknown bot: ${message.botId}` });

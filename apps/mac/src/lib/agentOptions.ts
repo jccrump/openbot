@@ -1,3 +1,4 @@
+import type { ReasoningEffort } from "@openbot/protocol";
 import type { SandboxState } from "./useDaemon";
 
 export const AVATAR_COLORS = [
@@ -9,20 +10,27 @@ export const AVATAR_COLORS = [
   "#0891b2",
 ];
 
-export const EMOJI_CHOICES = [
-  "🤖",
-  "🧠",
-  "📈",
-  "🎨",
-  "🛠️",
-  "🔬",
-  "✍️",
-  "🚀",
-  "📣",
-  "🧭",
-  "⚙️",
-  "🦾",
+// Reasoning effort is sent as `reasoning_effort`. DeepSeek supports
+// none/low/high/max (minimal maps to low, medium to high); OpenAI supports
+// minimal/low/medium/high. Unset keeps the provider's own default.
+export const EFFORT_OPTIONS: Array<{ value: ReasoningEffort; label: string }> = [
+  { value: "none", label: "None" },
+  { value: "minimal", label: "Minimal" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "max", label: "Max" },
 ];
+
+const EFFORT_LABELS = new Map<ReasoningEffort, string>(
+  EFFORT_OPTIONS.map((option) => [option.value, option.label]),
+);
+
+export function effortLabel(
+  effort: ReasoningEffort | null | undefined,
+): string {
+  return effort ? (EFFORT_LABELS.get(effort) ?? effort) : "Default";
+}
 
 export const COMPUTER_LABEL: Record<SandboxState, string> = {
   stopped: "Computer off",

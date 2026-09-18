@@ -7,6 +7,7 @@ import type {
   ComputerKind,
   ModelRef,
   PolicySettings,
+  ReasoningEffort,
   TaskDisplay,
   TaskGrant,
   TaskStatus,
@@ -157,6 +158,14 @@ export interface OrchestratorHandle {
     brief?: string;
     model?: ModelRef;
   }): ProjectSummary;
+  createWorker(input: {
+    callerBotId: string;
+    name: string;
+    specialty: string;
+    instructions?: string;
+    model?: ModelRef;
+    computer?: string;
+  }): { role: RoleSummary; created: boolean };
   askProject(input: {
     callerBotId: string;
     projectId: string;
@@ -1776,6 +1785,139 @@ const spawnWorkerTool: Tool = {
   },
 };
 
+const REASONING_EFFORTS = new Set<string>([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "max",
+]);
+
+/**
+ * Parse the optional `model` argument the team-building tools accept. The
+ * effort is validated here so a model string that never reached the schema
+ * cannot reach a provider request.
+ */
+function parseModelArg(value: unknown): ModelRef | undefined {
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.provider !== "string" || typeof record.model !== "string") {
+    return undefined;
+  }
+  const effort =
+    typeof record.effort === "string" && REASONING_EFFORTS.has(record.effort)
+      ? (record.effort as ReasoningEffort)
+      : undefined;
+  return {
+    provider: record.provider,
+    model: record.model,
+    ...(effort ? { effort } : {}),
+  };
+}
+
+const createWorkerTool: Tool = {
+  definition: {
+    name: "create_worker",
+    description:
+      "Add a persistent team worker when list_roles has no role that fits a " +
+      "task. The worker gets its own computer and stays on the team for " +
+      "future tasks, so the team grows only as the work needs it. Give it a " +
+      "short name and a one-line specialty, then delegate to it with " +
+      "spawn_worker using the returned id. Check list_roles first and reuse " +
+      "an existing role whenever one fits.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "Short worker name, for example \"Weather Watcher\".",
+        },
+        specialty: {
+          type: "string",
+          description:
+            "One line describing what this worker is for, for example " +
+            "\"checks National Weather Service forecasts and active alerts\".",
+        },
+        instructions: {
+          type: "string",
+          description:
+            "Optional extra instructions for the worker: sites, tools, or " +
+            "rules it should always follow.",
+        },
+        model: {
+          type: "object",
+          description:
+            "Optional model for the worker (provider, model, and reasoning effort).",
+          properties: {
+            provider: { type: "string" },
+            model: { type: "string" },
+            effort: {
+              type: "string",
+              enum: ["none", "minimal", "low", "medium", "high", "max"],
+              description: "Optional reasoning effort for the worker's model.",
+            },
+          },
+        },
+        computer: {
+          type: "string",
+          enum: ["firecracker", "mac"],
+          description:
+            "Optional computer: a Firecracker microVM (default) or This Mac.",
+        },
+      },
+      required: ["name", "specialty"],
+    },
+  },
+  async execute(context, args) {
+    const orchestrator = context.orchestrator;
+    if (!orchestrator) {
+      return orchestratorUnavailable();
+    }
+    const name = typeof args.name === "string" ? args.name.trim() : "";
+    const specialty =
+      typeof args.specialty === "string" ? args.specialty.trim() : "";
+    const instructions =
+      typeof args.instructions === "string" ? args.instructions.trim() : undefined;
+    const model = parseModelArg(args.model);
+    const computer =
+      args.computer === "mac" || args.computer === "firecracker"
+        ? args.computer
+        : undefined;
+    if (!name || !specialty) {
+      return {
+        ok: false,
+        output: "name and specialty are required.",
+        durationMs: 0,
+      };
+    }
+    try {
+      const { role, created } = orchestrator.createWorker({
+        callerBotId: context.botId,
+        name,
+        specialty,
+        instructions,
+        model,
+        computer,
+      });
+      return {
+        ok: true,
+        output: created
+          ? `Worker created: ${role.name} (id: ${role.id}) — ${specialty}.\n` +
+            "It is on the team now; delegate to it with spawn_worker using " +
+            "this id."
+          : `A worker named ${role.name} already exists (id: ${role.id}); ` +
+            "reusing it. Delegate to it with spawn_worker.",
+        durationMs: 0,
+      };
+    } catch (error) {
+      return { ok: false, output: (error as Error).message, durationMs: 0 };
+    }
+  },
+};
+
 const workerStatusTool: Tool = {
   definition: {
     name: "worker_status",
@@ -1949,10 +2091,15 @@ const createProjectTool: Tool = {
         model: {
           type: "object",
           description:
-            "Optional model for the project manager (provider and model).",
+            "Optional model for the project manager (provider, model, and reasoning effort).",
           properties: {
             provider: { type: "string" },
             model: { type: "string" },
+            effort: {
+              type: "string",
+              enum: ["none", "minimal", "low", "medium", "high", "max"],
+              description: "Optional reasoning effort for the manager's model.",
+            },
           },
         },
       },
@@ -1975,16 +2122,7 @@ const createProjectTool: Tool = {
     const name = typeof args.name === "string" ? args.name.trim() : "";
     const scope = typeof args.scope === "string" ? args.scope.trim() : "";
     const brief = typeof args.brief === "string" ? args.brief.trim() : undefined;
-    const modelArg =
-      typeof args.model === "object" && args.model !== null
-        ? (args.model as Record<string, unknown>)
-        : null;
-    const model =
-      modelArg &&
-      typeof modelArg.provider === "string" &&
-      typeof modelArg.model === "string"
-        ? { provider: modelArg.provider, model: modelArg.model }
-        : undefined;
+    const model = parseModelArg(args.model);
     if (!name || !scope) {
       return {
         ok: false,
@@ -2362,6 +2500,7 @@ const updateSoulTool: Tool = {
 const ORCHESTRATION_TOOL_NAMES = new Set([
   "list_roles",
   "spawn_worker",
+  "create_worker",
   "worker_status",
   "cancel_worker",
   "list_projects",
@@ -2394,6 +2533,7 @@ export const tools: Tool[] = [
   browseTool,
   listRolesTool,
   spawnWorkerTool,
+  createWorkerTool,
   workerStatusTool,
   cancelWorkerTool,
   listProjectsTool,

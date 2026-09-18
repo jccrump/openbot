@@ -1,21 +1,27 @@
 import { useEffect, useState } from "react";
-import type { Bot, ComputerKind, RolePolicy } from "@openbot/protocol";
+import type {
+  Bot,
+  ComputerKind,
+  ModelRef,
+  ReasoningEffort,
+  RolePolicy,
+} from "@openbot/protocol";
 import { ConfirmDialog } from "./ConfirmDialog";
 import {
   AVATAR_COLORS,
   COMPUTER_LABEL,
-  EMOJI_CHOICES,
+  EFFORT_OPTIONS,
 } from "../lib/agentOptions";
 import type { SandboxState } from "../lib/useDaemon";
 
 export interface AgentSettingsPatch {
   name: string;
   role: string | null;
-  avatar: string;
   color: string;
   computer: ComputerKind;
   delegates: boolean;
   policy: RolePolicy;
+  model: ModelRef;
 }
 
 export function AgentSettingsModal({
@@ -39,11 +45,11 @@ export function AgentSettingsModal({
 }) {
   const [name, setName] = useState("");
   const [role, setRole] = useState("");
-  const [avatar, setAvatar] = useState(EMOJI_CHOICES[0]!);
   const [color, setColor] = useState(AVATAR_COLORS[0]!);
   const [computer, setComputer] = useState<ComputerKind>("firecracker");
   const [delegates, setDelegates] = useState(false);
   const [policy, setPolicy] = useState<RolePolicy>("inherit");
+  const [effort, setEffort] = useState<ReasoningEffort | "">("");
   const [confirm, setConfirm] = useState<"reset" | "delete" | null>(null);
 
   useEffect(() => {
@@ -52,11 +58,11 @@ export function AgentSettingsModal({
     }
     setName(bot.name);
     setRole(bot.role ?? "");
-    setAvatar(bot.avatar ?? EMOJI_CHOICES[0]!);
     setColor(bot.color ?? AVATAR_COLORS[0]!);
     setComputer(bot.computer === "mac" ? "mac" : "firecracker");
     setDelegates(bot.delegates);
     setPolicy(bot.policy);
+    setEffort(bot.model.effort ?? "");
     setConfirm(null);
   }, [bot]);
 
@@ -82,11 +88,11 @@ export function AgentSettingsModal({
   const changed =
     name.trim() !== bot.name ||
     (role.trim() || null) !== (bot.role ?? null) ||
-    avatar !== (bot.avatar ?? EMOJI_CHOICES[0]!) ||
     color !== (bot.color ?? AVATAR_COLORS[0]!) ||
     computer !== (bot.computer === "mac" ? "mac" : "firecracker") ||
     delegates !== bot.delegates ||
-    policy !== bot.policy;
+    policy !== bot.policy ||
+    (effort || null) !== (bot.model.effort ?? null);
 
   return (
     <>
@@ -102,10 +108,8 @@ export function AgentSettingsModal({
         >
           <header className="modal-head">
             <div className="modal-head-title">
-              <span className="avatar avatar-lg" style={{ background: color }}>
-                {avatar}
-              </span>
-              <h2>Agent settings</h2>
+              <span className="avatar avatar-lg" style={{ background: color }} />
+              <h2>Worker settings</h2>
             </div>
             <button
               className="icon-button"
@@ -139,22 +143,7 @@ export function AgentSettingsModal({
             </label>
 
             <div className="field">
-              <span>Icon</span>
-              <div className="emoji-row">
-                {EMOJI_CHOICES.map((choice) => (
-                  <button
-                    key={choice}
-                    className={`emoji-choice ${
-                      avatar === choice ? "emoji-choice-active" : ""
-                    }`}
-                    onClick={() => setAvatar(choice)}
-                    aria-label={`Icon ${choice}`}
-                    aria-pressed={avatar === choice}
-                  >
-                    {choice}
-                  </button>
-                ))}
-              </div>
+              <span>Color</span>
               <div className="swatch-row">
                 {AVATAR_COLORS.map((choice) => (
                   <button
@@ -272,6 +261,28 @@ export function AgentSettingsModal({
               </p>
             </label>
 
+            <label className="field">
+              <span>Reasoning effort</span>
+              <select
+                value={effort}
+                aria-label="Agent reasoning effort"
+                onChange={(event) =>
+                  setEffort(event.target.value as ReasoningEffort | "")
+                }
+              >
+                <option value="">Model default</option>
+                {EFFORT_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <p className="computer-warning">
+                Sent to the provider as reasoning_effort. DeepSeek accepts
+                none/low/high/max; OpenAI accepts minimal/low/medium/high.
+              </p>
+            </label>
+
             <div className="agent-modal-danger">
               <div className="agent-modal-danger-copy">
                 <p className="agent-modal-danger-title">Danger zone</p>
@@ -308,11 +319,15 @@ export function AgentSettingsModal({
                 onSave({
                   name: name.trim(),
                   role: role.trim() || null,
-                  avatar,
                   color,
                   computer,
                   delegates,
                   policy,
+                  model: {
+                    provider: bot.model.provider,
+                    model: bot.model.model,
+                    ...(effort ? { effort } : {}),
+                  },
                 })
               }
             >

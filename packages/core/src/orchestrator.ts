@@ -11,6 +11,7 @@ import type {
   TaskUsage,
 } from "@openbot/protocol";
 import { runAgent, type AgentDeps } from "./agent";
+import { systemPromptForBot } from "./store";
 import { renderEvidenceLedger } from "./task-harness";
 import type {
   OrchestratorHandle,
@@ -25,6 +26,9 @@ const MAX_DEPTH = 1;
 // Worker sessions share the project's computer, so the limit is about model
 // and browser concurrency rather than memory.
 const MAX_CONCURRENT_TASKS = 4;
+// The lead and managers build the team on demand, so the cap is a runaway
+// guard rather than a team-size policy: reuse beats hiring at the limit.
+const MAX_TEAM_ROLES = 12;
 const PROJECT_MANAGER_CONTRACT =
   "You own this project's computer, its files, and its detailed context; the " +
   "lead only sees your reports. Keep the project's assets in your home " +
@@ -32,7 +36,9 @@ const PROJECT_MANAGER_CONTRACT =
   "ephemeral session inside your computer with its own browser and a " +
   "workspace under /root/workspaces/<taskId>, and it has no memory of this " +
   "conversation, so write each brief fully: objective, constraints, " +
-  "deliverable, and what counts as done. Review worker results, resolve " +
+  "deliverable, and what counts as done. When no existing role fits a task, " +
+  "build the team: create a worker with create_worker and then delegate to " +
+  "it; the new role persists for future tasks. Review worker results, resolve " +
   "conflicts between them, and answer the lead with one report that keeps " +
   "evidence handles (observation ids, URLs) instead of paraphrasing them " +
   "away. Leave worker budgets unset unless the user asked for limits: the " +
@@ -118,24 +124,95 @@ export class Orchestrator implements OrchestratorHandle {
 
   constructor(private readonly options: OrchestratorOptions) {}
 
+  private roleSummary(bot: Bot): RoleSummary {
+    const active = this.options.deps.store.activeTaskForRole(bot.id);
+    return {
+      id: bot.id,
+      name: bot.name,
+      role: bot.role ?? null,
+      model: bot.model,
+      computer: bot.computer ?? null,
+      delegates: bot.delegates,
+      busyTaskId: active?.id ?? null,
+      busyTaskTitle: active?.title ?? null,
+    };
+  }
+
   listRoles(): RoleSummary[] {
-    const store = this.options.deps.store;
-    return store
+    return this.options.deps.store
       .listBots()
       .filter((bot) => bot.kind === "role")
-      .map((bot) => {
-        const active = store.activeTaskForRole(bot.id);
-        return {
-          id: bot.id,
-          name: bot.name,
-          role: bot.role ?? null,
-          model: bot.model,
-          computer: bot.computer ?? null,
-          delegates: bot.delegates,
-          busyTaskId: active?.id ?? null,
-          busyTaskTitle: active?.title ?? null,
-        };
-      });
+      .map((bot) => this.roleSummary(bot));
+  }
+
+  /**
+   * The lead and managers build the team on demand: when no existing role
+   * fits a task, create a persistent worker instead of doing the work in the
+   * wrong role or failing. A duplicate name returns the existing role so a
+   * model that loses track of the team cannot fork it.
+   */
+  createWorker(input: {
+    callerBotId: string;
+    name: string;
+    specialty: string;
+    instructions?: string;
+    model?: ModelRef;
+    computer?: string;
+  }): { role: RoleSummary; created: boolean } {
+    const store = this.options.deps.store;
+    const caller = store.getBot(input.callerBotId);
+    if (!caller) {
+      throw new Error(`unknown caller: ${input.callerBotId}`);
+    }
+    const name = input.name.trim();
+    const specialty = input.specialty.trim();
+    if (!name) {
+      throw new Error("a worker needs a name");
+    }
+    if (!specialty) {
+      throw new Error("a worker needs a specialty");
+    }
+    const bots = store.listBots();
+    const existing = bots.find(
+      (bot) =>
+        bot.kind === "role" &&
+        bot.name.trim().toLowerCase() === name.toLowerCase(),
+    );
+    if (existing) {
+      return { role: this.roleSummary(existing), created: false };
+    }
+    const roles = bots.filter((bot) => bot.kind === "role");
+    if (roles.length >= MAX_TEAM_ROLES) {
+      throw new Error(
+        `the team already has ${MAX_TEAM_ROLES} workers; reuse an existing ` +
+          "role or ask the user to remove one",
+      );
+    }
+    const model = input.model ?? caller.model;
+    if (!model) {
+      throw new Error("no model is available for the worker");
+    }
+    const systemPrompt = [
+      systemPromptForBot(name, specialty),
+      input.instructions?.trim() ?? "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    const bot = store.createBot({
+      name,
+      systemPrompt,
+      model,
+      kind: "role",
+      role: specialty,
+      computer: input.computer ?? "firecracker",
+      delegates: false,
+    });
+    this.options.emit({
+      type: "bot.created",
+      requestId: `worker:${bot.id}`,
+      bot,
+    });
+    return { role: this.roleSummary(bot), created: true };
   }
 
   listProjects(): ProjectSummary[] {

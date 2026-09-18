@@ -55,6 +55,7 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     computer: ComputerKindSchema.optional(),
     delegates: z.boolean().optional(),
     policy: RolePolicySchema.optional(),
+    model: ModelRefSchema.optional(),
   }),
   z.object({
     type: z.literal("bots.power"),

@@ -204,6 +204,10 @@ export function useDaemon() {
   const [selectedModel, setSelectedModel] = useState<ModelRef | null>(null);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  // A thread opened in the drawer is fetched on the side so it can be shown
+  // without switching the chat behind it.
+  const [previewThreadId, setPreviewThreadId] = useState<string | null>(null);
+  const [previewMessages, setPreviewMessages] = useState<Message[]>([]);
   const [streamingByThread, setStreamingByThread] = useState<
     Record<string, StreamingState>
   >({});
@@ -226,6 +230,8 @@ export function useDaemon() {
 
   const activeThreadIdRef = useRef<string | null>(null);
   activeThreadIdRef.current = activeThreadId;
+  const previewThreadIdRef = useRef<string | null>(null);
+  previewThreadIdRef.current = previewThreadId;
   const streamingRef = useRef<Record<string, StreamingState>>({});
   streamingRef.current = streamingByThread;
   const toolActivityRef = useRef<ToolActivity[]>([]);
@@ -395,7 +401,12 @@ export function useDaemon() {
             (stored && message.bots.some((bot) => bot.id === stored)
               ? stored
               : null);
+          // The chat always belongs to the main agent; every other thread is
+          // opened in the drawer instead.
+          const lead =
+            message.bots.find((item) => item.kind === "lead") ?? null;
           const bot =
+            lead ??
             (preferred
               ? message.bots.find((item) => item.id === preferred)
               : null) ??
@@ -430,6 +441,14 @@ export function useDaemon() {
               bot.id === message.bot.id ? message.bot : bot,
             ),
           );
+          if (
+            message.bot.id === selectedBotIdRef.current &&
+            isModelUsable(providersRef.current, message.bot.model)
+          ) {
+            // The agent's model is the source of truth for the composer, so a
+            // persisted change (composer or settings) is reflected right away.
+            setSelectedModel(message.bot.model);
+          }
           break;
         }
         case "bot.deleted": {
@@ -615,6 +634,9 @@ export function useDaemon() {
         case "thread.messages": {
           if (message.threadId === activeThreadIdRef.current) {
             setMessages(message.messages);
+          }
+          if (message.threadId === previewThreadIdRef.current) {
+            setPreviewMessages(message.messages);
           }
           break;
         }
@@ -848,12 +870,15 @@ export function useDaemon() {
           setToolActivity((current) =>
             current.filter((item) => item.threadId !== message.threadId),
           );
+          const appendMessage = (current: Message[]) =>
+            current.some((item) => item.id === message.message.id)
+              ? current
+              : [...current, message.message];
           if (message.threadId === activeThreadIdRef.current) {
-            setMessages((current) =>
-              current.some((item) => item.id === message.message.id)
-                ? current
-                : [...current, message.message],
-            );
+            setMessages(appendMessage);
+          }
+          if (message.threadId === previewThreadIdRef.current) {
+            setPreviewMessages(appendMessage);
           }
           break;
         }
@@ -876,12 +901,15 @@ export function useDaemon() {
           setChallenges((current) =>
             current.filter((item) => item.threadId !== message.threadId),
           );
+          const appendDone = (current: Message[]) =>
+            current.some((item) => item.id === message.message.id)
+              ? current
+              : [...current, message.message];
           if (message.threadId === activeThreadIdRef.current) {
-            setMessages((current) =>
-              current.some((item) => item.id === message.message.id)
-                ? current
-                : [...current, message.message],
-            );
+            setMessages(appendDone);
+          }
+          if (message.threadId === previewThreadIdRef.current) {
+            setPreviewMessages(appendDone);
           }
           break;
         }
@@ -991,6 +1019,16 @@ export function useDaemon() {
       client.send({ type: "chat.cancel", runId: current.runId });
     }
   }, [client]);
+
+  const cancelThread = useCallback(
+    (threadId: string) => {
+      const current = streamingRef.current[threadId];
+      if (current) {
+        client.send({ type: "chat.cancel", runId: current.runId });
+      }
+    },
+    [client],
+  );
 
   const respondToApproval = useCallback(
     (requestId: string, decision: "approve" | "deny") => {
@@ -1126,12 +1164,29 @@ export function useDaemon() {
         computer?: ComputerKind;
         delegates?: boolean;
         policy?: RolePolicy;
+        model?: ModelRef;
       },
     ) => {
       const requestId = `bot-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       client.send({ type: "bots.update", requestId, botId, ...patch });
     },
     [client],
+  );
+
+  /**
+   * Change the selected agent's model (and its reasoning effort) from the
+   * composer. The choice is persisted on the agent, so a refresh or relaunch
+   * restores it, and delegated work uses the same model.
+   */
+  const chooseModel = useCallback(
+    (model: ModelRef) => {
+      setSelectedModel(model);
+      const botId = selectedBotIdRef.current;
+      if (botId) {
+        updateBot(botId, { model });
+      }
+    },
+    [updateBot],
   );
 
   const powerBot = useCallback(
@@ -1252,6 +1307,53 @@ export function useDaemon() {
       ? (streamingByThread[activeThreadId] ?? null)
       : null;
 
+  const previewStreaming =
+    previewThreadId !== null
+      ? (streamingByThread[previewThreadId] ?? null)
+      : null;
+
+  // The drawer reads a thread without making it the active one: fetch its
+  // messages on the side, and reply into it with chat.send's explicit thread.
+  const openThreadPreview = useCallback(
+    (threadId: string) => {
+      setPreviewThreadId(threadId);
+      setPreviewMessages([]);
+      client.send({ type: "thread.messages", threadId });
+    },
+    [client],
+  );
+
+  const closeThreadPreview = useCallback(() => {
+    setPreviewThreadId(null);
+    setPreviewMessages([]);
+  }, []);
+
+  const sendMessageToThread = useCallback(
+    (threadId: string, botId: string, text: string) => {
+      if (client.status !== "connected") {
+        setError(DISCONNECTED_ERROR);
+        return;
+      }
+      const optimistic: Message = {
+        id: localMessageId(),
+        threadId,
+        role: "user",
+        content: text,
+        model: null,
+        toolCalls: null,
+        createdAt: new Date().toISOString(),
+      };
+      if (threadId === activeThreadIdRef.current) {
+        setMessages((current) => [...current, optimistic]);
+      } else {
+        setPreviewMessages((current) => [...current, optimistic]);
+      }
+      setError(null);
+      client.send({ type: "chat.send", botId, threadId, text });
+    },
+    [client],
+  );
+
   const modelOptions: ModelOption[] = providers
     .filter(isProviderUsable)
     .flatMap((provider) =>
@@ -1292,10 +1394,16 @@ export function useDaemon() {
     decision,
     codex,
     selectedModel,
-    setSelectedModel,
+    chooseModel,
     activeThreadId,
     messages,
     streaming,
+    previewThreadId,
+    previewMessages,
+    previewStreaming,
+    openThreadPreview,
+    closeThreadPreview,
+    sendMessageToThread,
     error,
     toolActivity,
     decisions,
@@ -1304,6 +1412,7 @@ export function useDaemon() {
     sandboxStates,
     sendMessage,
     cancel,
+    cancelThread,
     respondToApproval,
     respondToChallenge,
     selectBot,

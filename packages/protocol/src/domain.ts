@@ -1,8 +1,23 @@
 import { z } from "zod";
 
+// Reasoning effort sent to OpenAI-compatible providers as `reasoning_effort`.
+// DeepSeek accepts none/low/high/max (minimal maps to low, medium to high);
+// OpenAI accepts minimal/low/medium/high (none on the newest models).
+export const ReasoningEffortSchema = z.enum([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "max",
+]);
+export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
+
 export const ModelRefSchema = z.object({
   provider: z.string().min(1),
   model: z.string().min(1),
+  /** Unset means the provider's own default. */
+  effort: ReasoningEffortSchema.optional(),
 });
 export type ModelRef = z.infer<typeof ModelRefSchema>;
 

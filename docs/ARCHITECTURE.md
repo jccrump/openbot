@@ -1069,6 +1069,24 @@ network policy exists. Rejected: per-action risk scoring that auto-approves
 (approvals stay human) and policy in the prompt (the model must not be able to
 widen its own permissions).
 
+**ADR-019: The team grows on demand.** Roles began as a hand-built roster: the
+user had to anticipate every specialist before the lead could delegate, and
+work stalled the moment a task needed a skill nobody had created. Instead, the
+lead and project managers can create a persistent worker when no existing role
+fits (`create_worker`). The worker is a normal `bots.kind = 'role'` with its
+own computer and system prompt, it appears in the team list immediately, and it
+is reusable for future tasks, so the roster accumulates capability instead of
+being rebuilt per task. Creation follows the existing approval envelopes —
+approval-gated for the lead, covered by the task grant for a manager — and the
+name is the identity key: a duplicate name returns the existing role instead of
+forking the team, and a role cap (12) stops a runaway model from minting an
+unbounded roster. Workers cannot create managers; the hierarchy stays lead →
+project manager → worker, and promoting a worker to manager stays a deliberate
+user decision. Rejected: ephemeral anonymous workers (the team never
+accumulates capability, and every task pays to re-derive the role);
+auto-creating a role per task (roster sprawl and duplicate specialists);
+letting workers hire workers (unbounded fan-out and cost).
+
 **ADR-017 amendment: memory and soul adapt automatically, but stay legible.**
 The user asked for memory and soul to change over time without being told to,
 so reflection is automatic: a background pass extracts durable memories from

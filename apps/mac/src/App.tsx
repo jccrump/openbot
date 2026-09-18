@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
   Bot,
   ComputerKind,
   Message,
   ModelRef,
+  ReasoningEffort,
   Task,
   Thread,
   ToolArtifact,
@@ -18,10 +19,8 @@ import { PanelResizer } from "./components/PanelResizer";
 import { VncView, type VncState } from "./components/VncView";
 import {
   AVATAR_COLORS,
-  COMPUTER_LABEL,
-  EMOJI_CHOICES,
   avatarColor,
-  initialOf,
+  EFFORT_OPTIONS,
 } from "./lib/agentOptions";
 import { DAEMON_HTTP_URL } from "./lib/daemon";
 import { useTheme } from "./lib/useTheme";
@@ -47,10 +46,6 @@ const STATUS_LABEL: Record<string, string> = {
 
 function isLocalBot(bot: Bot | null | undefined): boolean {
   return bot?.computer === "mac";
-}
-
-function computerLabel(bot: Bot | null, state: SandboxState): string {
-  return isLocalBot(bot) ? "This Mac" : COMPUTER_LABEL[state];
 }
 
 const SCREEN_PANEL_KEY = "openbot.screenPanel";
@@ -104,18 +99,26 @@ interface ToolArguments {
   taskId?: string;
 }
 
-const TOOL_LABEL: Record<string, string> = {
-  shell: "Ran",
-  read_file: "Read",
-  write_file: "Wrote",
-  browser: "Browsed",
-  browse: "Researched",
-  desktop: "Computer",
-  list_roles: "Checked the team",
-  spawn_worker: "Delegated",
-  worker_status: "Checked work",
-  cancel_worker: "Cancelled work",
-};
+interface ToolLabel {
+  text: string;
+  code?: string;
+}
+
+// Tool rows read like a terminal: a short verb plus the raw argument in
+// monospace. Tools the app does not have a native verb for fall back to
+// `Called \`tool_name\``, matching the agent harness the app talks to.
+function toolLabel(name: string): ToolLabel {
+  if (name === "shell") {
+    return { text: "Shell" };
+  }
+  if (name === "write_file") {
+    return { text: "Wrote" };
+  }
+  if (name === "read_file") {
+    return { text: "Read" };
+  }
+  return { text: "Called", code: name };
+}
 
 function formatGrantDetail(grant: ToolArguments["grant"]): string | null {
   if (!grant) {
@@ -146,19 +149,37 @@ function formatGrantDetail(grant: ToolArguments["grant"]): string | null {
 
 function parseToolArguments(raw: string): ToolArguments {
   try {
-    return JSON.parse(raw) as ToolArguments;
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as ToolArguments;
+    }
+    return {};
   } catch {
     return {};
   }
 }
 
+function formatArgValue(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (value === null || value === undefined) {
+    return "";
+  }
+  return JSON.stringify(value);
+}
+
+// One line of monospace: the command for shell, the path for file tools, the
+// action and target for computer tools, and `key=value` pairs for everything
+// else. Kept verbatim rather than prettified so it matches what the bot ran.
 function toolDetail(raw: string): string {
   const parsed = parseToolArguments(raw);
   if (parsed.brief) {
     const grant = formatGrantDetail(parsed.grant);
-    return grant
-      ? `Brief: ${parsed.brief}\nGrant — ${grant}`
-      : `Brief: ${parsed.brief}`;
+    return grant ? `brief=${parsed.brief} · ${grant}` : `brief=${parsed.brief}`;
   }
   if (parsed.taskId) return parsed.taskId;
   if (parsed.command) return parsed.command;
@@ -183,11 +204,16 @@ function toolDetail(raw: string): string {
     return target ? `${parsed.action} ${target}` : parsed.action;
   }
   if (parsed.startUrl) return parsed.startUrl;
-  return raw;
-}
-
-function toolLabel(name: string): string {
-  return TOOL_LABEL[name] ?? name;
+  const entries = Object.entries(parsed as Record<string, unknown>).filter(
+    ([, value]) => value !== undefined && value !== null && value !== "",
+  );
+  if (entries.length > 0) {
+    return entries
+      .map(([key, value]) => `${key}=${formatArgValue(value)}`)
+      .join(" ");
+  }
+  const trimmed = raw.trim();
+  return trimmed === "{}" ? "" : trimmed;
 }
 
 function PlusIcon() {
@@ -313,32 +339,26 @@ function ShieldIcon() {
 
 function MemoryIcon() {
   return (
-    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <rect
-        x="3.2"
-        y="3.2"
-        width="9.6"
-        height="9.6"
-        rx="2.4"
-        stroke="currentColor"
-        strokeWidth="1.4"
-      />
-      <path
-        d="M6.4 1.6v1.6M9.6 1.6v1.6M6.4 12.8v1.6M9.6 12.8v1.6M1.6 6.4h1.6M1.6 9.6h1.6M12.8 6.4h1.6M12.8 9.6h1.6"
-        stroke="currentColor"
-        strokeWidth="1.3"
-        strokeLinecap="round"
-      />
-      <circle cx="8" cy="8" r="1.6" fill="currentColor" />
-    </svg>
-  );
-}
-
-function SidebarIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <rect x="2" y="2.6" width="12" height="10.8" rx="2.2" stroke="currentColor" strokeWidth="1.4" />
-      <path d="M6.4 2.6v10.8" stroke="currentColor" strokeWidth="1.4" />
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.7"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z" />
+      <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z" />
+      <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4" />
+      <path d="M17.599 6.5a3 3 0 0 0 .399-1.375" />
+      <path d="M6.003 5.125A3 3 0 0 0 6.401 6.5" />
+      <path d="M3.477 10.896a4 4 0 0 1 .585-.396" />
+      <path d="M19.938 10.5a4 4 0 0 1 .585.396" />
+      <path d="M6 18a4 4 0 0 1-1.967-.516" />
+      <path d="M19.967 17.484A4 4 0 0 1 18 18" />
     </svg>
   );
 }
@@ -361,6 +381,19 @@ function MicIcon() {
   );
 }
 
+function CloseIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path
+        d="m4 4 8 8M12 4l-8 8"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
 function CopyIcon() {
   return (
     <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -375,17 +408,466 @@ function CopyIcon() {
   );
 }
 
-function AgentAvatar({ bot, size = 30 }: { bot: Bot | null; size?: number }) {
-  const color = bot?.color ?? avatarColor(bot?.id ?? "assistant");
+interface ThreadRow {
+  id: string;
+  kind: "bot" | "task";
+  name: string;
+  color: string;
+  selected: boolean;
+  working: boolean;
+  title: string;
+  // Nesting level: 0 is the lead, 1 a manager, 2 a worker. The list indents by
+  // this so the hierarchy reads without drawing connector lines.
+  depth: number;
+}
+
+// The transcript keeps itself pinned to the newest entry; `signal` is any
+// value that changes when the thread grows.
+function Transcript({
+  signal,
+  children,
+}: {
+  signal: string;
+  children: ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const node = ref.current;
+    if (node) {
+      node.scrollTop = node.scrollHeight;
+    }
+  }, [signal]);
   return (
-    <span
-      className="avatar"
-      style={{ background: color, width: size, height: size, fontSize: size * 0.46 }}
-    >
-      {bot?.avatar ?? initialOf(bot?.name ?? "Assistant")}
-    </span>
+    <div className="transcript" ref={ref}>
+      {children}
+    </div>
   );
 }
+
+function taskThreadName(task: Task): string {
+  const title = task.title?.trim() ?? "";
+  const brief = (task.brief ?? "").replace(/\s+/g, " ").trim();
+  if (title && title.toLowerCase() !== "delegated task") {
+    return title;
+  }
+  if (brief) {
+    return `${brief.slice(0, 44)}${brief.length > 44 ? "…" : ""}`;
+  }
+  return "Task";
+}
+
+function threadRowForTask(task: Task, depth: number): ThreadRow {
+  return {
+    id: task.id,
+    kind: "task",
+    name: taskThreadName(task),
+    color: avatarColor(task.id),
+    selected: false,
+    working: task.status === "queued" || task.status === "running",
+    title: task.brief || taskThreadName(task),
+    depth,
+  };
+}
+
+// Threads live under the computer panel now: the lead is pinned on top so
+// there is always a way back, then project threads, then loose tasks.
+function ThreadList({
+  rows,
+  query,
+  searchOpen,
+  onSearchChange,
+  onToggleSearch,
+  onSelect,
+}: {
+  rows: ThreadRow[];
+  query: string;
+  searchOpen: boolean;
+  onSearchChange: (value: string) => void;
+  onToggleSearch: () => void;
+  onSelect: (row: ThreadRow) => void;
+}) {
+  return (
+    <section className="panel-threads">
+      <div className="panel-threads-head">
+        <span className="panel-section-title">Threads</span>
+        <button
+          className="icon-button icon-mini"
+          title="Search threads"
+          aria-label="Search threads"
+          aria-pressed={searchOpen}
+          onClick={onToggleSearch}
+        >
+          <SearchIcon />
+        </button>
+      </div>
+      {searchOpen && (
+        <label className="sidebar-search panel-search">
+          <SearchIcon />
+          <input
+            autoFocus
+            value={query}
+            onChange={(event) => onSearchChange(event.target.value)}
+            placeholder="Search threads"
+            aria-label="Search threads"
+            spellCheck={false}
+          />
+        </label>
+      )}
+      <div className="agent-list panel-thread-list">
+        {rows.map((row) => (
+          <div
+            key={`${row.kind}-${row.id}`}
+            role="button"
+            tabIndex={0}
+            className={`thread-row ${row.selected ? "thread-row-selected" : ""}`}
+            style={{ paddingLeft: 8 + row.depth * 18 }}
+            title={row.title}
+            onClick={() => onSelect(row)}
+            onKeyDown={(event) => {
+              if (event.target !== event.currentTarget) {
+                return;
+              }
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                onSelect(row);
+              }
+            }}
+          >
+            <span className="thread-dot" style={{ background: row.color }} />
+            <span className="agent-row-body">
+              <span className="agent-row-name">{row.name}</span>
+            </span>
+            {row.working && <span className="thread-working" title="Working now" />}
+          </div>
+        ))}
+        {rows.length === 0 && (
+          <p className="sidebar-empty">
+            {query
+              ? "No threads match your search."
+              : "No threads yet — ask the lead to start one."}
+          </p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function ThreadChat({
+  daemon,
+  bot,
+  botName,
+  draft,
+  onDraftChange,
+  onSubmit,
+  scrollSignal,
+  hasUsableProvider,
+  hasProviderNeedingKey,
+  onOpenSettings,
+  onOpenScreen,
+  onOpenApprovals,
+  onOpenMemory,
+  screenOpen,
+  messages,
+  streaming,
+  activity,
+  approvals,
+  challenges,
+  decisions,
+  onCancel,
+}: {
+  daemon: ReturnType<typeof useDaemon>;
+  bot: Bot | null;
+  botName: string;
+  draft: string;
+  onDraftChange: (value: string) => void;
+  onSubmit: () => void;
+  scrollSignal: string;
+  hasUsableProvider: boolean;
+  hasProviderNeedingKey: boolean;
+  onOpenSettings: () => void;
+  onOpenScreen: () => void;
+  onOpenApprovals: () => void;
+  onOpenMemory: () => void;
+  screenOpen: boolean;
+  messages: Message[];
+  streaming: StreamingState | null;
+  activity: ToolActivity[];
+  approvals: PendingApproval[];
+  challenges: PendingChallenge[];
+  decisions: DecisionActivity[];
+  onCancel: () => void;
+}) {
+  const modelValue = daemon.selectedModel
+    ? `${daemon.selectedModel.provider}::${daemon.selectedModel.model}`
+    : "";
+  const pendingApprovalCount = daemon.approvals.filter(
+    (approval) => !approval.decision,
+  ).length;
+
+  return (
+    <>
+        <div className="chat-float-actions" data-tauri-drag-region>
+          {daemon.harness.default === "codex" && (
+            <span className="harness-pill" title="Codex harness">
+              Codex
+            </span>
+          )}
+          {/* The panel carries its own collapse control, so the toggle only
+              appears while the computer view is closed. */}
+          {!screenOpen && (
+            <button
+              className="icon-button"
+              title="Show computer view"
+              aria-label="Show computer view"
+              onClick={() => {
+                onOpenScreen();
+                try {
+                  localStorage.setItem(SCREEN_PANEL_KEY, "open");
+                } catch {}
+              }}
+            >
+              <MonitorIcon />
+            </button>
+          )}
+        </div>
+
+        <Transcript signal={scrollSignal}>
+          <div className="transcript-inner">
+            {messages.length === 0 && !streaming && (
+              <div className="empty-state">
+                <span
+                  className="empty-mark"
+                  style={{ background: bot?.color ?? avatarColor(bot?.id ?? "assistant") }}
+                />
+                <h1>{botName}</h1>
+                {bot?.kind === "project" ? (
+                  <p>
+                    {bot.role?.trim() || "Thread"} · when the lead routes work
+                    here, the request and the manager's report appear in this
+                    thread.
+                  </p>
+                ) : hasUsableProvider ? (
+                  <p>
+                    {isLocalBot(bot)
+                      ? "Ask for what you need. The lead can run commands directly on this Mac or delegate to a team role."
+                      : "Ask for what you need. The lead can work on its own computer or delegate to a team role — workers run on their own computers and report back here."}
+                  </p>
+                ) : (
+                  <>
+                    <p>
+                      {hasProviderNeedingKey
+                        ? "Add an API key in Settings to start chatting."
+                        : "Add a model provider to get started — DeepSeek, OpenAI, OpenRouter, or a local model."}
+                    </p>
+                    <button
+                      className="save-button empty-cta"
+                      onClick={() => onOpenSettings()}
+                    >
+                      {hasProviderNeedingKey ? "Open settings" : "Set up a provider"}
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+
+            {groupTranscript(messages, streaming !== null).map((entry) =>
+              entry.kind === "turn" ? (
+                <TurnBubble
+                  key={entry.final.id}
+                  entry={entry}
+                  decisions={decisions.filter(
+                    (decision) => decision.messageId === entry.final.id,
+                  )}
+                />
+              ) : (
+                <MessageBubble
+                  key={entry.message.id}
+                  message={entry.message}
+                  decisions={decisions.filter(
+                    (decision) => decision.messageId === entry.message.id,
+                  )}
+                />
+              ),
+            )}
+
+            {streaming && (() => {
+              const liveDecisions = decisions.filter(
+                (decision) => decision.messageId === streaming.messageId,
+              );
+              return (
+                <div className="entry entry-assistant">
+                  {challenges.map((challenge) => (
+                    <ChallengeCard
+                      key={challenge.requestId}
+                      challenge={challenge}
+                      onRespond={daemon.respondToChallenge}
+                      onOpenScreen={() => onOpenScreen()}
+                    />
+                  ))}
+                  <WorkGroup
+                    items={activity}
+                    decisions={liveDecisions}
+                    reasoning={streaming.reasoning}
+                    startedAt={streaming.startedAt}
+                    running
+                    approvals={approvals}
+                    onRespondApproval={daemon.respondToApproval}
+                    statusAtBottom
+                    footer={<StreamingRow streaming={streaming} />}
+                  />
+                </div>
+              );
+            })()}
+          </div>
+        </Transcript>
+
+        <footer className="composer-wrap">
+          <div className="composer">
+            <span
+              className="icon-button icon-muted composer-plus"
+              title="Attachments — coming soon"
+              aria-hidden="true"
+            >
+              <PlusIcon />
+            </span>
+            <textarea
+              value={draft}
+              placeholder={`Message ${botName}`}
+              rows={1}
+              onChange={(event) => onDraftChange(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  onSubmit();
+                }
+              }}
+            />
+            <button
+              className="icon-button icon-muted composer-mic"
+              title="Voice input — coming soon"
+              aria-label="Voice input (coming soon)"
+              disabled
+            >
+              <MicIcon />
+            </button>
+            {streaming ? (
+              <button className="send-circle stop" onClick={onCancel} title="Stop">
+                <StopIcon />
+              </button>
+            ) : (
+              <button
+                className="send-circle"
+                onClick={onSubmit}
+                disabled={draft.trim().length === 0}
+                title="Send"
+              >
+                <ArrowUpIcon />
+              </button>
+            )}
+          </div>
+          <div className="composer-tools">
+            <div className="composer-model-group">
+              <label className="model-pill model-pill-composer" title="Model">
+                <select
+                  value={modelValue}
+                  aria-label="Model"
+                  onChange={(event) => {
+                    const [provider, model] = event.target.value.split("::");
+                    if (provider && model) {
+                      daemon.chooseModel({
+                        provider,
+                        model,
+                        ...(daemon.selectedModel?.effort
+                          ? { effort: daemon.selectedModel.effort }
+                          : {}),
+                      });
+                    }
+                  }}
+                >
+                  {daemon.modelOptions.length === 0 && (
+                    <option value="">No models configured</option>
+                  )}
+                  {daemon.modelOptions.map((option) => (
+                    <option
+                      key={`${option.provider}::${option.model}`}
+                      value={`${option.provider}::${option.model}`}
+                    >
+                      {option.providerLabel} · {option.model}
+                    </option>
+                  ))}
+                </select>
+                <ChevronIcon />
+              </label>
+              <label
+                className="model-pill model-pill-effort"
+                title="Reasoning effort — sent to the provider as reasoning_effort"
+              >
+                <select
+                  value={daemon.selectedModel?.effort ?? ""}
+                  aria-label="Reasoning effort"
+                  disabled={daemon.selectedModel === null}
+                  onChange={(event) => {
+                    const effort = event.target.value as ReasoningEffort | "";
+                    const current = daemon.selectedModel;
+                    if (!current) {
+                      return;
+                    }
+                    daemon.chooseModel({
+                      provider: current.provider,
+                      model: current.model,
+                      ...(effort ? { effort } : {}),
+                    });
+                  }}
+                >
+                  <option value="">Effort: default</option>
+                  {EFFORT_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <ChevronIcon />
+              </label>
+            </div>
+            <div className="composer-tools-actions">
+              <button
+                className="icon-button"
+                title="Approvals"
+                aria-label="Approvals"
+                onClick={() => onOpenApprovals()}
+              >
+                <ShieldIcon />
+                {pendingApprovalCount > 0 && (
+                  <span className="icon-badge">{pendingApprovalCount}</span>
+                )}
+              </button>
+              <button
+                className="icon-button"
+                title="Memory and soul"
+                aria-label="Memory and soul"
+                onClick={() => onOpenMemory()}
+              >
+                <MemoryIcon />
+              </button>
+              <button
+                className="icon-button"
+                title="Settings"
+                aria-label="Settings"
+                onClick={() => onOpenSettings()}
+              >
+                <GearIcon />
+              </button>
+              <span
+                className={`status-dot status-${daemon.status}`}
+                title={STATUS_LABEL[daemon.status]}
+              />
+            </div>
+          </div>
+        </footer>
+    </>
+  );
+}
+
 
 export default function App() {
   const daemon = useDaemon();
@@ -396,7 +878,12 @@ export default function App() {
   const [approvalsOpen, setApprovalsOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [search, setSearch] = useState("");
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [drawerThread, setDrawerThread] = useState<{
+    threadId: string;
+    row: ThreadRow;
+  } | null>(null);
+  const [drawerClosing, setDrawerClosing] = useState(false);
   const [settingsBotId, setSettingsBotId] = useState<string | null>(null);
   const [watchTaskId, setWatchTaskId] = useState<string | null>(null);
   const [screenOpen, setScreenOpen] = useState(storedScreenPanelOpen);
@@ -411,11 +898,18 @@ export default function App() {
   const [windowActive, setWindowActive] = useState(
     () => !document.hidden && document.hasFocus(),
   );
-  const scrollRef = useRef<HTMLDivElement | null>(null);
 
   const bot =
     daemon.bots.find((item) => item.id === daemon.selectedBotId) ?? null;
   const botName = bot?.name ?? "Assistant";
+  // The computer panel follows the thread you have open: a manager's drawer
+  // shows the manager's machine rather than the main agent's.
+  const drawerBot =
+    drawerThread?.row.kind === "bot"
+      ? (daemon.bots.find((item) => item.id === drawerThread.row.id) ?? null)
+      : null;
+  const screenBot = drawerBot ?? bot;
+  const screenBotName = screenBot?.name ?? "Assistant";
   const hasUsableProvider = daemon.providers.some(isProviderUsable);
   const hasProviderNeedingKey = daemon.providers.some(
     (provider) =>
@@ -425,10 +919,10 @@ export default function App() {
       provider.apiKeyEnv !== null,
   );
   const screenMessage = (() => {
-    if (!bot) {
+    if (!screenBot) {
       return "No agent selected";
     }
-    if (isLocalBot(bot)) {
+    if (isLocalBot(screenBot)) {
       return "Screen view is available for Firecracker microVM computers.";
     }
     if (screenStatus === "vm-off") {
@@ -445,18 +939,18 @@ export default function App() {
     }
     return "No screen yet";
   })();
-  const vncUrl = bot
-    ? `${DAEMON_HTTP_URL.replace(/^http/, "ws")}/bots/${encodeURIComponent(bot.id)}/vnc`
+  const vncUrl = screenBot
+    ? `${DAEMON_HTTP_URL.replace(/^http/, "ws")}/bots/${encodeURIComponent(screenBot.id)}/vnc`
     : "";
-  const canStream = Boolean(bot) && !isLocalBot(bot);
+  const canStream = Boolean(screenBot) && !isLocalBot(screenBot);
   const vncLive = vncState === "live";
   const vncActive =
     canStream && screenPlaying && screenOpen && screenStatus !== "vm-off";
   const screenCaption = (() => {
-    if (!bot) {
+    if (!screenBot) {
       return "No agent selected";
     }
-    if (isLocalBot(bot)) {
+    if (isLocalBot(screenBot)) {
       return "Screen view is available for Firecracker microVM computers.";
     }
     if (!screenPlaying) {
@@ -554,53 +1048,186 @@ export default function App() {
     settingsThread !== null &&
     daemon.streaming?.threadId === settingsThread.id;
 
-  const query = search.trim().toLowerCase();
   const leadBot = daemon.bots.find((item) => item.kind === "lead") ?? null;
   const roles = daemon.bots.filter((item) => item.kind === "role");
   const projects = daemon.bots.filter((item) => item.kind === "project");
   const roleName = (roleId: string): string =>
     daemon.bots.find((item) => item.id === roleId)?.name ?? "Unknown role";
-  const visibleRoles = query
-    ? roles.filter((item) =>
-        `${item.name} ${item.role ?? ""}`.toLowerCase().includes(query),
-      )
-    : roles;
-  const visibleProjects = query
-    ? projects.filter((item) =>
-        `${item.name} ${item.role ?? ""}`.toLowerCase().includes(query),
-      )
-    : projects;
-  const visibleTasks = query
-    ? daemon.tasks.filter((task) =>
-        `${task.title} ${task.brief} ${roleName(task.roleId)}`
-          .toLowerCase()
-          .includes(query),
-      )
-    : daemon.tasks;
-  const activeTasks = visibleTasks.filter(
-    (task) => task.status === "queued" || task.status === "running",
-  );
-  const finishedTasks = visibleTasks.filter(
-    (task) => task.status !== "queued" && task.status !== "running",
-  );
-  const selectedTask =
-    daemon.tasks.find((task) => task.id === daemon.selectedTaskId) ?? null;
-  const taskThreadIds = useMemo(
-    () =>
-      new Set(
-        daemon.tasks
-          .map((task) => task.threadId)
-          .filter((id): id is string => Boolean(id)),
-      ),
-    [daemon.tasks],
-  );
-  const workApprovals = useMemo(
-    () => daemon.approvals.filter((item) => taskThreadIds.has(item.threadId)),
-    [daemon.approvals, taskThreadIds],
-  );
   const pendingApprovalCount = daemon.approvals.filter(
     (approval) => !approval.decision,
   ).length;
+
+  // The thread list is a tree: the lead branches to project managers, and each
+  // manager branches to the workers it is running. Standalone tasks hang
+  // directly off the lead.
+  const drawerRowId = drawerThread?.row.id ?? null;
+  const threadRows: ThreadRow[] = (() => {
+    const rows: ThreadRow[] = [];
+    const q = search.trim().toLowerCase();
+    const matches = (...parts: Array<string | null | undefined>) =>
+      !q || parts.some((part) => (part ?? "").toLowerCase().includes(q));
+    const byActivity = (a: Task, b: Task) => {
+      const active = (task: Task) =>
+        task.status === "queued" || task.status === "running" ? 0 : 1;
+      const byActive = active(a) - active(b);
+      if (byActive !== 0) {
+        return byActive;
+      }
+      return (b.createdAt ?? "").localeCompare(a.createdAt ?? "");
+    };
+    const botRow = (
+      bot: Bot,
+      depth: number,
+      working: boolean,
+    ): ThreadRow => ({
+      id: bot.id,
+      kind: "bot",
+      name: bot.name,
+      color: bot.color ?? avatarColor(bot.id),
+      selected: drawerRowId
+        ? bot.id === drawerRowId
+        : bot.id === daemon.selectedBotId,
+      working,
+      title: bot.role ?? bot.name,
+      depth,
+    });
+    const taskRow = (task: Task, depth: number): ThreadRow => ({
+      ...threadRowForTask(task, depth),
+      selected: task.id === drawerRowId,
+    });
+
+    // The main agent is not a thread: it lives in the chat itself, so the
+    // list starts at the managers it has spun up.
+    const managers = projects
+      .map((manager) => {
+        const workers = daemon.tasks
+          .filter((task) => task.projectId === manager.id)
+          .sort(byActivity)
+          .slice(0, 6);
+        const selfMatch = matches(manager.name, manager.role);
+        const visibleWorkers =
+          q && !selfMatch
+            ? workers.filter((task) =>
+                matches(taskThreadName(task), task.title, task.brief),
+              )
+            : workers;
+        return {
+          manager,
+          workers: visibleWorkers,
+          visible: selfMatch || visibleWorkers.length > 0,
+        };
+      })
+      .filter((group) => group.visible);
+
+    const looseTasks = daemon.tasks
+      .filter((task) => !task.projectId)
+      .sort(byActivity)
+      .filter((task) =>
+        matches(taskThreadName(task), task.title, task.brief),
+      )
+      .slice(0, 8);
+
+    managers.forEach((group) => {
+      const activeRequest = daemon.tasks.some(
+        (task) =>
+          task.projectId === group.manager.id &&
+          task.roleId === group.manager.id &&
+          (task.status === "queued" || task.status === "running"),
+      );
+      rows.push(botRow(group.manager, 0, activeRequest));
+      group.workers.forEach((task) => {
+        rows.push(taskRow(task, 1));
+      });
+    });
+
+    looseTasks.forEach((task) => {
+      rows.push(taskRow(task, 0));
+    });
+
+    return rows;
+  })();
+
+  // Threads open in a drawer over the chat instead of taking it over, so the
+  // conversation behind it is never swapped out.
+  const openThread = (row: ThreadRow) => {
+    const threadId =
+      row.kind === "task"
+        ? (daemon.tasks.find((task) => task.id === row.id)?.threadId ?? null)
+        : (daemon.threads.find((item) => item.botId === row.id)?.id ?? null);
+    if (!threadId) {
+      return;
+    }
+    setDrawerClosing(false);
+    setDrawerThread({ threadId, row });
+    daemon.openThreadPreview(threadId);
+  };
+
+  // Closing plays the slide-out first; the drawer unmounts when it finishes.
+  const closeThread = () => {
+    setDrawerClosing(true);
+  };
+
+  const finishCloseThread = () => {
+    setDrawerThread(null);
+    setDrawerClosing(false);
+    daemon.closeThreadPreview();
+  };
+
+  useEffect(() => {
+    if (!drawerThread) {
+      return;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setDrawerClosing(true);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [drawerThread]);
+
+  // Everything the drawer shows comes from the previewed thread, except when
+  // the drawer is showing the thread the chat is already on.
+  const drawerThreadId = drawerThread?.threadId ?? null;
+  const drawerRow = drawerThread?.row ?? null;
+  const drawerIsActive =
+    drawerThreadId !== null && drawerThreadId === daemon.activeThreadId;
+  const drawerMessages = drawerIsActive
+    ? daemon.messages
+    : daemon.previewMessages;
+  const drawerStreaming = drawerIsActive ? streaming : daemon.previewStreaming;
+  const drawerActivity = drawerThreadId
+    ? daemon.toolActivity.filter((item) => item.threadId === drawerThreadId)
+    : [];
+  const drawerApprovals = drawerThreadId
+    ? daemon.approvals.filter((item) => item.threadId === drawerThreadId)
+    : [];
+  const drawerChallenges = drawerThreadId
+    ? daemon.challenges.filter((item) => item.threadId === drawerThreadId)
+    : [];
+  const drawerDecisions = drawerThreadId
+    ? daemon.decisions.filter((item) => item.threadId === drawerThreadId)
+    : [];
+  const drawerTask =
+    drawerRow?.kind === "task"
+      ? (daemon.tasks.find((task) => task.id === drawerRow.id) ?? null)
+      : null;
+
+  useEffect(() => {
+    if (!drawerThread) {
+      return;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setDrawerThread(null);
+        daemon.closeThreadPreview();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [drawerThread, daemon]);
 
   useEffect(() => {
     setScreenImageUrl(null);
@@ -609,7 +1236,7 @@ export default function App() {
     setScreenError(null);
     setScreenStatus("loading");
     setVncState("idle");
-  }, [bot?.id]);
+  }, [screenBot?.id]);
 
   useEffect(() => {
     return () => {
@@ -624,8 +1251,8 @@ export default function App() {
       !screenOpen ||
       !screenPlaying ||
       !windowActive ||
-      !bot ||
-      bot.computer === "mac" ||
+      !screenBot ||
+      screenBot.computer === "mac" ||
       vncLive
     ) {
       return;
@@ -642,7 +1269,7 @@ export default function App() {
       inFlight = true;
       try {
         const response = await fetch(
-          `${DAEMON_HTTP_URL}/bots/${encodeURIComponent(bot.id)}/screen?t=${Date.now()}`,
+          `${DAEMON_HTTP_URL}/bots/${encodeURIComponent(screenBot.id)}/screen?t=${Date.now()}`,
           { signal: controller.signal },
         );
         if (cancelled) {
@@ -700,20 +1327,20 @@ export default function App() {
         clearTimeout(timer);
       }
     };
-  }, [screenOpen, screenPlaying, windowActive, bot, vncLive]);
+  }, [screenOpen, screenPlaying, windowActive, screenBot, vncLive]);
 
-  useEffect(() => {
-    const node = scrollRef.current;
-    if (node) {
-      node.scrollTop = node.scrollHeight;
-    }
-  }, [
-    daemon.messages,
-    activity,
-    approvals,
-    streaming?.text,
-  ]);
-
+  const scrollSignal = [
+    daemon.messages.length,
+    activity.length,
+    approvals.length,
+    streaming?.text.length ?? 0,
+  ].join(":");
+  const drawerScrollSignal = [
+    drawerMessages.length,
+    drawerActivity.length,
+    drawerApprovals.length,
+    drawerStreaming?.text.length ?? 0,
+  ].join(":");
   const submit = () => {
     const text = draft.trim();
     if (!text || daemon.streaming) {
@@ -722,603 +1349,164 @@ export default function App() {
     daemon.sendMessage(text);
     setDraft("");
   };
-
-  const modelValue = daemon.selectedModel
-    ? `${daemon.selectedModel.provider}::${daemon.selectedModel.model}`
-    : "";
+  const submitToDrawer = () => {
+    const text = draft.trim();
+    if (!text || !drawerThreadId || drawerRow?.kind !== "bot" || drawerStreaming) {
+      return;
+    }
+    daemon.sendMessageToThread(drawerThreadId, drawerRow.id, text);
+    setDraft("");
+  };
 
   return (
-    <div className={`shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
-      <aside className="sidebar">
-        <div className="sidebar-header" data-tauri-drag-region>
-          <button
-            className="icon-button"
-            title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-            aria-label="Toggle sidebar"
-            onClick={() => setSidebarCollapsed((value) => !value)}
-          >
-            <SidebarIcon />
-          </button>
-          {!sidebarCollapsed && (
-            <>
-              <label className="sidebar-search">
-                <SearchIcon />
-                <input
-                  value={search}
-                  onChange={(event) => setSearch(event.target.value)}
-                  placeholder="Search"
-                  aria-label="Search agents"
-                  spellCheck={false}
-                />
-              </label>
-              <button
-                className="icon-button"
-                title="Hire a role"
-                aria-label="Hire a role"
-                onClick={() => setCreateOpen(true)}
-              >
-                <PlusIcon />
-              </button>
-            </>
-          )}
-        </div>
-
-        <div className="agent-list">
-          {leadBot && (
-            <div
-              role="button"
-              tabIndex={0}
-              className={`agent-row lead-row ${
-                leadBot.id === daemon.selectedBotId && !selectedTask
-                  ? "agent-row-selected"
-                  : ""
-              }`}
-              title={sidebarCollapsed ? leadBot.name : undefined}
-              onClick={() => daemon.selectBot(leadBot.id)}
-              onKeyDown={(event) => {
-                if (event.target !== event.currentTarget) {
-                  return;
-                }
-                if (event.key === "Enter" || event.key === " ") {
-                  event.preventDefault();
-                  daemon.selectBot(leadBot.id);
-                }
-              }}
-            >
-              <AgentAvatar bot={leadBot} />
-              {!sidebarCollapsed && (
-                <span className="agent-row-body">
-                  <span className="agent-row-name">{leadBot.name}</span>
-                  <span className="agent-row-sub">
-                    {threadByBot.get(leadBot.id)?.lastMessage?.trim() ||
-                      "Lead · your primary assistant"}
-                  </span>
-                </span>
-              )}
-              {!sidebarCollapsed && <span className="lead-badge">Lead</span>}
-            </div>
-          )}
-
-          {!sidebarCollapsed && visibleProjects.length > 0 && (
-            <div className="sidebar-section">
-              <span className="sidebar-section-title">Projects</span>
-            </div>
-          )}
-          {visibleProjects.map((item) => {
-            const activeRequest = daemon.tasks.find(
-              (task) =>
-                task.projectId === item.id &&
-                task.roleId === item.id &&
-                (task.status === "queued" || task.status === "running"),
-            );
-            const state = daemon.sandboxStates[item.id] ?? "stopped";
-            return (
-              <div
-                key={item.id}
-                role="button"
-                tabIndex={0}
-                className={`agent-row project-row ${
-                  item.id === daemon.selectedBotId && !selectedTask
-                    ? "agent-row-selected"
-                    : ""
-                }`}
-                title={sidebarCollapsed ? item.name : (item.role ?? undefined)}
-                onClick={() => daemon.selectBot(item.id)}
-                onKeyDown={(event) => {
-                  if (event.target !== event.currentTarget) {
-                    return;
-                  }
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    daemon.selectBot(item.id);
-                  }
-                }}
-              >
-                <AgentAvatar bot={item} />
-                {!sidebarCollapsed && (
-                  <span className="agent-row-body">
-                    <span className="agent-row-name">{item.name}</span>
-                    <span className="agent-row-sub">
-                      {activeRequest
-                        ? activeRequest.title
-                        : item.role?.trim() || "Project"}
-                    </span>
-                  </span>
-                )}
-                {!sidebarCollapsed && activeRequest && (
-                  <span className="task-count" title="Active request">
-                    1
-                  </span>
-                )}
-                {!sidebarCollapsed && (
-                  <span
-                    className={`status-dot ${
-                      isLocalBot(item) ? "status-local" : `status-${state}`
-                    }`}
-                    title={computerLabel(item, state)}
-                  />
-                )}
-              </div>
-            );
-          })}
-
-          {!sidebarCollapsed && visibleRoles.length > 0 && (
-            <div className="sidebar-section">
-              <span className="sidebar-section-title">Team</span>
-            </div>
-          )}
-          {visibleRoles.map((item) => {
-            const activeCount = daemon.tasks.filter(
-              (task) =>
-                task.roleId === item.id &&
-                (task.status === "queued" || task.status === "running"),
-            ).length;
-            const state = daemon.sandboxStates[item.id] ?? "stopped";
-            return (
-              <div
-                key={item.id}
-                role="button"
-                tabIndex={0}
-                className={`agent-row role-row ${
-                  item.id === daemon.selectedBotId && !selectedTask
-                    ? "agent-row-selected"
-                    : ""
-                }`}
-                title={sidebarCollapsed ? item.name : undefined}
-                onClick={() => daemon.selectBot(item.id)}
-                onKeyDown={(event) => {
-                  if (event.target !== event.currentTarget) {
-                    return;
-                  }
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    daemon.selectBot(item.id);
-                  }
-                }}
-              >
-                <AgentAvatar bot={item} />
-                {!sidebarCollapsed && (
-                  <span className="agent-row-body">
-                    <span className="agent-row-name">{item.name}</span>
-                    <span className="agent-row-sub">
-                      {item.role?.trim() || "Team role"}
-                    </span>
-                  </span>
-                )}
-                {!sidebarCollapsed && activeCount > 0 && (
-                  <span
-                    className="task-count"
-                    title={`${activeCount} active task${activeCount === 1 ? "" : "s"}`}
-                  >
-                    {activeCount}
-                  </span>
-                )}
-                {!sidebarCollapsed && (
-                  <button
-                    className="agent-settings-button"
-                    title="Role settings"
-                    aria-label={`Role settings for ${item.name}`}
-                    aria-haspopup="dialog"
-                    aria-expanded={settingsBotId === item.id}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      if (item.id !== daemon.selectedBotId) {
-                        daemon.selectBot(item.id);
-                      }
-                      if (item.computer !== "mac") {
-                        daemon.refreshSandboxState(item.id);
-                      }
-                      setSettingsBotId(item.id);
-                    }}
-                  >
-                    <GearIcon />
-                  </button>
-                )}
-                {!sidebarCollapsed && (
-                  <span
-                    className={`status-dot ${
-                      isLocalBot(item) ? "status-local" : `status-${state}`
-                    }`}
-                    title={computerLabel(item, state)}
-                  />
-                )}
-              </div>
-            );
-          })}
-
-          {!sidebarCollapsed && visibleTasks.length > 0 && (
-            <div className="sidebar-section">
-              <span className="sidebar-section-title">Work</span>
-            </div>
-          )}
-          {[...activeTasks, ...finishedTasks.slice(0, 8)].map((task) => (
-            <div
-              key={task.id}
-              role="button"
-              tabIndex={0}
-              className={`task-row ${
-                task.id === daemon.selectedTaskId ? "task-row-selected" : ""
-              }`}
-              title={sidebarCollapsed ? task.title : task.brief}
-              onClick={() => daemon.selectTask(task.id)}
-              onKeyDown={(event) => {
-                if (event.target !== event.currentTarget) {
-                  return;
-                }
-                if (event.key === "Enter" || event.key === " ") {
-                  event.preventDefault();
-                  daemon.selectTask(task.id);
-                }
-              }}
-            >
-              <span className={`task-dot task-dot-${task.status}`} />
-              {!sidebarCollapsed && (
-                <span className="agent-row-body">
-                  <span className="agent-row-name">{task.title}</span>
-                  <span className="agent-row-sub">
-                    {roleName(task.roleId)} · {TASK_STATUS_LABEL[task.status]}
-                  </span>
-                </span>
-              )}
-            </div>
-          ))}
-
-          {!sidebarCollapsed &&
-            visibleRoles.length === 0 &&
-            visibleTasks.length === 0 && (
-              <p className="sidebar-empty">
-                {query
-                  ? "No roles or tasks match your search."
-                  : "Hire a role to delegate work."}
-              </p>
-            )}
-        </div>
-
-        <div className="sidebar-footer">
-          {!sidebarCollapsed && (
-            <label className="model-pill model-pill-sidebar" title="Model">
-              <select
-                value={modelValue}
-                aria-label="Model"
-                onChange={(event) => {
-                  const [provider, model] = event.target.value.split("::");
-                  if (provider && model) {
-                    daemon.setSelectedModel({ provider, model });
-                  }
-                }}
-              >
-                {daemon.modelOptions.length === 0 && (
-                  <option value="">No models configured</option>
-                )}
-                {daemon.modelOptions.map((option) => (
-                  <option
-                    key={`${option.provider}::${option.model}`}
-                    value={`${option.provider}::${option.model}`}
-                  >
-                    {option.providerLabel} · {option.model}
-                  </option>
-                ))}
-              </select>
-              <ChevronIcon />
-            </label>
-          )}
-          <div className="user-row">
-            <span className="avatar user-avatar">JC</span>
-            {!sidebarCollapsed && <span className="footer-name">Justin</span>}
-            {!sidebarCollapsed && (
-              <button
-                className="icon-button"
-                title="Approvals"
-                aria-label="Approvals"
-                onClick={() => setApprovalsOpen(true)}
-              >
-                <ShieldIcon />
-                {pendingApprovalCount > 0 && (
-                  <span className="icon-badge">{pendingApprovalCount}</span>
-                )}
-              </button>
-            )}
-            {!sidebarCollapsed && (
-              <button
-                className="icon-button"
-                title="Memory and soul"
-                aria-label="Memory and soul"
-                onClick={() => setMemoryOpen(true)}
-              >
-                <MemoryIcon />
-              </button>
-            )}
-            {!sidebarCollapsed && (
-              <button
-                className="icon-button"
-                title="Settings"
-                aria-label="Settings"
-                onClick={() => setSettingsOpen(true)}
-              >
-                <GearIcon />
-              </button>
-            )}
-            {!sidebarCollapsed && (
-              <span
-                className={`status-dot status-${daemon.status}`}
-                title={STATUS_LABEL[daemon.status]}
-              />
-            )}
-          </div>
-        </div>
-      </aside>
-
+    <div className="shell">
       <main className="chat">
-        {selectedTask ? (
-          <TaskView
-            task={selectedTask}
-            roleNameFor={roleName}
-            childTasks={daemon.tasks.filter(
-              (task) => task.parentId === selectedTask.id,
-            )}
-            messages={daemon.messages}
-            decisions={decisions}
-            approvals={approvals}
-            activity={activity}
-            streaming={streaming}
-            computerState={daemon.sandboxStates[selectedTask.id] ?? null}
-            onCancel={daemon.cancelTask}
-            onBack={() => {
-              if (leadBot) {
-                daemon.selectBot(leadBot.id);
-              }
+        <header className="agent-badge">
+          <span
+            className="agent-badge-avatar"
+            style={{
+              background:
+                leadBot?.color ?? avatarColor(leadBot?.id ?? "assistant"),
             }}
-            onWatch={setWatchTaskId}
-            onSelectTask={daemon.selectTask}
-            onRespondApproval={daemon.respondToApproval}
           />
-        ) : (
-          <>
-        <header className="chat-header" data-tauri-drag-region>
-          <div className="chat-title">
-            <AgentAvatar bot={bot} size={26} />
-            <span className="chat-title-name">{botName}</span>
-            {bot?.role && <span className="chat-title-role">{bot.role}</span>}
-          </div>
-          <div className="chat-actions">
-            <button
-              className="icon-button"
-              title={screenOpen ? "Hide screen panel" : "Show screen panel"}
-              aria-label="Toggle screen panel"
-              aria-pressed={screenOpen}
-              onClick={() => {
-                setScreenOpen((value) => {
-                  const next = !value;
-                  try {
-                    localStorage.setItem(
-                      SCREEN_PANEL_KEY,
-                      next ? "open" : "closed",
-                    );
-                  } catch {}
-                  return next;
-                });
-              }}
-            >
-              <MonitorIcon />
-            </button>
-            {daemon.harness.default === "codex" && (
-              <span className="harness-pill" title="Codex harness">
-                Codex
-              </span>
-            )}
-          </div>
+          <span className="agent-badge-name">
+            {leadBot?.name ?? "Assistant"}
+          </span>
         </header>
 
-        {daemon.tasks.length > 0 && (
-          <div className="workboard">
-            <div className="workboard-row">
-              {[...activeTasks, ...finishedTasks.slice(0, 4)].map((task) => (
-                <button
-                  key={task.id}
-                  className={`task-chip task-chip-${task.status}`}
-                  title={task.brief}
-                  onClick={() => daemon.selectTask(task.id)}
-                >
-                  <span className={`task-dot task-dot-${task.status}`} />
-                  <span className="task-chip-title">{task.title}</span>
-                  <span className="task-chip-meta">
-                    {roleName(task.roleId)} · {TASK_STATUS_LABEL[task.status]}
-                  </span>
-                </button>
-              ))}
-            </div>
-            {workApprovals.length > 0 && (
-              <div className="workboard-approvals">
-                {workApprovals.map((approval) => (
-                  <ApprovalCard
-                    key={approval.requestId}
-                    approval={approval}
-                    onRespond={daemon.respondToApproval}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
-        )}
+        <ThreadChat
+          daemon={daemon}
+          bot={bot}
+          botName={botName}
+          draft={draft}
+          onDraftChange={setDraft}
+          onSubmit={submit}
+          scrollSignal={scrollSignal}
+          hasUsableProvider={hasUsableProvider}
+          hasProviderNeedingKey={hasProviderNeedingKey}
+          onOpenSettings={() => setSettingsOpen(true)}
+          onOpenScreen={() => setScreenOpen(true)}
+          onOpenApprovals={() => setApprovalsOpen(true)}
+          onOpenMemory={() => setMemoryOpen(true)}
+          screenOpen={screenOpen}
+          messages={daemon.messages}
+          streaming={streaming}
+          activity={activity}
+          approvals={approvals}
+          challenges={challenges}
+          decisions={decisions}
+          onCancel={daemon.cancel}
+        />
 
-        <div className="transcript" ref={scrollRef}>
-          <div className="transcript-inner">
-            {daemon.messages.length === 0 && !streaming && (
-              <div className="empty-state">
-                <span className="empty-mark" style={{ background: bot?.color ?? avatarColor(bot?.id ?? "assistant") }}>
-                  {bot?.avatar ?? initialOf(botName)}
-                </span>
-                <h1>
-                  {bot?.kind === "project"
-                    ? "No requests yet."
-                    : "Hand off the work."}
-                </h1>
-                {bot?.kind === "project" ? (
-                  <p>
-                    When the lead routes work to this project, the request and
-                    the manager's report appear here.
-                  </p>
-                ) : hasUsableProvider ? (
-                  <p>
-                    {isLocalBot(bot)
-                      ? "Ask for what you need. The lead can run commands directly on this Mac or delegate to a team role."
-                      : "Ask for what you need. The lead can work on its own computer or delegate to a team role — workers run on their own computers and report back here."}
-                  </p>
-                ) : (
-                  <>
-                    <p>
-                      {hasProviderNeedingKey
-                        ? "Add an API key in Settings to start chatting."
-                        : "Add a model provider to get started — DeepSeek, OpenAI, OpenRouter, or a local model."}
-                    </p>
-                    <button
-                      className="save-button empty-cta"
-                      onClick={() => setSettingsOpen(true)}
-                    >
-                      {hasProviderNeedingKey ? "Open settings" : "Set up a provider"}
-                    </button>
-                  </>
-                )}
-              </div>
-            )}
-
-            {groupTranscript(daemon.messages, streaming !== null).map((entry) =>
-              entry.kind === "turn" ? (
-                <TurnBubble
-                  key={entry.final.id}
-                  entry={entry}
-                  decisions={decisions.filter(
-                    (decision) => decision.messageId === entry.final.id,
-                  )}
-                />
-              ) : (
-                <MessageBubble
-                  key={entry.message.id}
-                  message={entry.message}
-                  decisions={decisions.filter(
-                    (decision) => decision.messageId === entry.message.id,
-                  )}
-                />
-              ),
-            )}
-
-            {streaming && (() => {
-              const liveDecisions = decisions.filter(
-                (decision) => decision.messageId === streaming.messageId,
-              );
-              const hasWork =
-                activity.length > 0 ||
-                liveDecisions.length > 0 ||
-                approvals.length > 0;
-              return (
-                <div className="entry entry-assistant">
-                  {challenges.map((challenge) => (
-                    <ChallengeCard
-                      key={challenge.requestId}
-                      challenge={challenge}
-                      onRespond={daemon.respondToChallenge}
-                      onOpenScreen={() => setScreenOpen(true)}
-                    />
-                  ))}
-                  {hasWork && (
-                    <WorkGroup
-                      items={activity}
-                      decisions={liveDecisions}
-                      reasoning={streaming.reasoning}
-                      startedAt={streaming.startedAt}
-                      running
-                      approvals={approvals}
-                      onRespondApproval={daemon.respondToApproval}
-                    />
-                  )}
-                  <StreamingRow streaming={streaming} showTyping={!hasWork} />
-                </div>
-              );
-            })()}
-          </div>
-        </div>
-
-        {bot?.kind === "project" ? (
-          <div className="composer-note">
-            {bot.name} is a project manager. The lead routes requests to it —
-            ask the lead for changes.
-          </div>
-        ) : (
-        <footer className="composer-wrap">
-          <div className="composer">
-            <span
-              className="icon-button icon-muted composer-plus"
-              title="Attachments — coming soon"
-              aria-hidden="true"
-            >
-              <PlusIcon />
-            </span>
-            <textarea
-              value={draft}
-              placeholder={`Message ${botName}`}
-              rows={1}
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  submit();
+        {drawerRow && (
+          <div className="drawer-layer">
+            <section
+              className={`thread-drawer${
+                drawerClosing ? " thread-drawer-closing" : ""
+              }`}
+              role="dialog"
+              aria-label={`${drawerRow.name} thread`}
+              onAnimationEnd={(event) => {
+                if (drawerClosing && event.target === event.currentTarget) {
+                  finishCloseThread();
                 }
               }}
-            />
-            <button
-              className="icon-button icon-muted composer-mic"
-              title="Voice input — coming soon"
-              aria-label="Voice input (coming soon)"
-              disabled
             >
-              <MicIcon />
-            </button>
-            {daemon.streaming ? (
-              <button className="send-circle stop" onClick={daemon.cancel} title="Stop">
-                <StopIcon />
-              </button>
-            ) : (
-              <button
-                className="send-circle"
-                onClick={submit}
-                disabled={draft.trim().length === 0}
-                title="Send"
-              >
-                <ArrowUpIcon />
-              </button>
-            )}
+              {drawerTask ? (
+                <TaskView
+                  task={drawerTask}
+                  roleNameFor={roleName}
+                  childTasks={daemon.tasks.filter(
+                    (task) => task.parentId === drawerTask.id,
+                  )}
+                  messages={drawerMessages}
+                  decisions={drawerDecisions}
+                  approvals={drawerApprovals}
+                  activity={drawerActivity}
+                  streaming={drawerStreaming}
+                  computerState={daemon.sandboxStates[drawerTask.id] ?? null}
+                  onCancel={daemon.cancelTask}
+                  onBack={closeThread}
+                  onWatch={setWatchTaskId}
+                  onSelectTask={(taskId) => {
+                    const task = daemon.tasks.find((item) => item.id === taskId);
+                    if (task) {
+                      openThread(threadRowForTask(task, 2));
+                    }
+                  }}
+                  onRespondApproval={daemon.respondToApproval}
+                />
+              ) : (
+                <>
+                  <div className="drawer-bar">
+                    <span className="drawer-grip" aria-hidden="true" />
+                    <span className="drawer-title">{drawerRow.name}</span>
+                    <button
+                      className="icon-button"
+                      title="Close thread"
+                      aria-label="Close thread"
+                      onClick={closeThread}
+                    >
+                      <CloseIcon />
+                    </button>
+                  </div>
+                  <ThreadChat
+                    daemon={daemon}
+                    bot={drawerBot}
+                    botName={drawerRow.name}
+                    draft={draft}
+                    onDraftChange={setDraft}
+                    onSubmit={submitToDrawer}
+                    scrollSignal={drawerScrollSignal}
+                    hasUsableProvider={hasUsableProvider}
+                    hasProviderNeedingKey={hasProviderNeedingKey}
+                    onOpenSettings={() => setSettingsOpen(true)}
+                    onOpenScreen={() => setScreenOpen(true)}
+                    onOpenApprovals={() => setApprovalsOpen(true)}
+                    onOpenMemory={() => setMemoryOpen(true)}
+                    screenOpen={screenOpen}
+                    messages={drawerMessages}
+                    streaming={drawerStreaming}
+                    activity={drawerActivity}
+                    approvals={drawerApprovals}
+                    challenges={drawerChallenges}
+                    decisions={drawerDecisions}
+                    onCancel={() => {
+                      if (drawerThreadId) {
+                        daemon.cancelThread(drawerThreadId);
+                      }
+                    }}
+                  />
+                </>
+              )}
+            </section>
           </div>
-        </footer>
-        )}
-          </>
         )}
       </main>
 
-      <PanelResizer active={screenOpen && !selectedTask} />
-      {screenOpen && !selectedTask && (
-        <aside className="screen-panel">
+      <PanelResizer active={screenOpen} />
+      {screenOpen && (
+        <aside
+          className={`screen-panel ${
+            screenExpanded ? "screen-panel-expanded" : ""
+          }`}
+        >
           <div className="screen-panel-bar">
-            <span className="screen-panel-title">Computer</span>
+            <span className="screen-panel-identity">
+              <span
+                className="screen-panel-dot"
+                style={{
+                  background:
+                    screenBot?.color ?? avatarColor(screenBot?.id ?? "assistant"),
+                }}
+              />
+              {screenBot && (
+                <span className="screen-panel-name">
+                  {screenBotName}&rsquo;s
+                </span>
+              )}
+              <span className="screen-panel-title">Computer</span>
+            </span>
             <button
               className="icon-button"
               title="Collapse computer view"
@@ -1367,13 +1555,13 @@ export default function App() {
               )}
               {!vncLive && (
                 <div className="screen-fallback">
-                  {!isLocalBot(bot) &&
+                  {!isLocalBot(screenBot) &&
                   screenStatus !== "vm-off" &&
                   screenImageUrl ? (
                     <img
                       className="screen-image"
                       src={screenImageUrl}
-                      alt={`${botName}'s screen`}
+                      alt={`${screenBotName}'s screen`}
                     />
                   ) : (
                     <div className="screen-empty">
@@ -1410,11 +1598,8 @@ export default function App() {
               )}
             </div>
             <div className="screen-caption">
-              <span className="screen-caption-title">
-                {botName}&rsquo;s screen
-              </span>
               <span className="screen-caption-status">{screenCaption}</span>
-              {!isLocalBot(bot) && (
+              {!isLocalBot(screenBot) && (
                 <button
                   className="icon-button"
                   title={screenPlaying ? "Pause live view" : "Resume live view"}
@@ -1428,18 +1613,24 @@ export default function App() {
               )}
             </div>
           </section>
-          <section className="routines">
-            <h2>
-              Routines
-              <span className="badge">Soon</span>
-            </h2>
-            <div className="routines-empty">
-              <p className="routines-title">Not implemented yet</p>
-              <p className="routines-sub">
-                Scheduled and replayable routines are planned, not wired up.
-              </p>
-            </div>
-          </section>
+
+          {!screenExpanded && (
+            <ThreadList
+              rows={threadRows}
+              query={search}
+              searchOpen={searchOpen}
+              onSearchChange={setSearch}
+              onToggleSearch={() =>
+                setSearchOpen((value) => {
+                  if (value) {
+                    setSearch("");
+                  }
+                  return !value;
+                })
+              }
+              onSelect={openThread}
+            />
+          )}
         </aside>
       )}
 
@@ -1559,6 +1750,10 @@ export default function App() {
         onUpdateSettings={daemon.updateSettings}
         onFetchModels={daemon.fetchModels}
         onTestDecision={daemon.testDecision}
+        roles={roles}
+        sandboxStates={daemon.sandboxStates}
+        onHireRole={() => setCreateOpen(true)}
+        onEditRole={(botId) => setSettingsBotId(botId)}
       />
     </div>
   );
@@ -1742,6 +1937,12 @@ interface NarrationItem {
   at: number;
 }
 
+type WorkRow =
+  | { type: "tool"; at: number; item: WorkItem }
+  | { type: "narration"; at: number; narration: NarrationItem }
+  | { type: "decision"; at: number; decision: DecisionActivity }
+  | { type: "reads"; at: number; items: WorkItem[] };
+
 function formatElapsed(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
   if (seconds < 60) {
@@ -1760,6 +1961,8 @@ function WorkGroup({
   running,
   approvals,
   onRespondApproval,
+  statusAtBottom,
+  footer,
 }: {
   items: WorkItem[];
   decisions?: DecisionActivity[];
@@ -1769,6 +1972,11 @@ function WorkGroup({
   running: boolean;
   approvals?: PendingApproval[];
   onRespondApproval?: (requestId: string, decision: "approve" | "deny") => void;
+  // While a turn is live the status line trails the work — tools and streamed
+  // text stack above it, the way the agent harness prints "Thinking". Finished
+  // turns keep the summary header on top so the answer reads below it.
+  statusAtBottom?: boolean;
+  footer?: ReactNode;
 }) {
   const pending = (approvals ?? []).filter((approval) => !approval.decision);
   const [open, setOpen] = useState(pending.length > 0 || running);
@@ -1823,6 +2031,156 @@ function WorkGroup({
     })),
   ].sort((a, b) => a.at - b.at);
 
+  // Consecutive reads collapse into one "Explored N reads" row, the way the
+  // agent harness prints them; expanding reveals each file and its output.
+  const rows: WorkRow[] = [];
+  for (const entry of timeline) {
+    const last = rows[rows.length - 1];
+    if (
+      entry.type === "tool" &&
+      entry.item.name === "read_file" &&
+      !approvalByCall.has(entry.item.callId)
+    ) {
+      if (last?.type === "reads") {
+        last.items.push(entry.item);
+        continue;
+      }
+      rows.push({ type: "reads", at: entry.at, items: [entry.item] });
+      continue;
+    }
+    rows.push(entry);
+  }
+
+  const statusContent = (
+    <>
+      {running ? (
+        <span className="work-group-label">
+          Working
+          <span className="work-group-dots" aria-hidden="true">
+            <span />
+            <span />
+            <span />
+          </span>
+        </span>
+      ) : (
+        <span className="work-group-label">Worked</span>
+      )}
+      <span className="work-group-meta">
+        {items.length > 0 &&
+          `${items.length} action${items.length === 1 ? "" : "s"}`}
+        {items.length > 0 && failed > 0 && (
+          <span className="work-group-failed"> · {failed} failed</span>
+        )}
+        {(decisions?.length ?? 0) > 0 &&
+          `${items.length > 0 ? " · " : ""}${decisions?.length} Jev decision${
+            decisions?.length === 1 ? "" : "s"
+          }`}
+        {running && elapsed > 0 && ` · ${formatElapsed(elapsed)}`}
+        {pending.length > 0 && (
+          <span className="work-group-approval"> · Approval needed</span>
+        )}
+      </span>
+    </>
+  );
+
+  const body = (
+    <div className="work-group-body">
+      {reasoning && reasoning.trim().length > 0 && (
+        <details className="work-thinking">
+          <summary>
+            <span className="work-thinking-label">Thinking</span>
+            <span className="work-thinking-preview">
+              {reasoning.trim().split("\n")[0]}
+            </span>
+          </summary>
+          <pre>{reasoning.trim()}</pre>
+        </details>
+      )}
+      {rows.map((entry) => {
+        if (entry.type === "decision") {
+          const decision = entry.decision;
+          return (
+            <div
+              key={decision.id}
+              className={`work-decision ${
+                decision.flagged ? "work-decision-flagged" : ""
+              }`}
+            >
+              <span className="work-decision-engine">Jev</span>
+              <span className="work-decision-kind">{decision.kind}</span>
+              <span className="work-decision-summary">
+                {decision.summary}
+              </span>
+              <span className="work-decision-meta">
+                {decision.model}
+                {decision.latencyMs !== null
+                  ? ` · ${decision.latencyMs} ms`
+                  : ""}
+              </span>
+            </div>
+          );
+        }
+        if (entry.type === "narration") {
+          return (
+            <div key={entry.narration.id} className="work-narration">
+              <Markdown text={entry.narration.text} />
+            </div>
+          );
+        }
+        if (entry.type === "reads") {
+          return (
+            <ReadsRow key={entry.items[0]!.callId} items={entry.items} />
+          );
+        }
+        const item = entry.item;
+        const approval = approvalByCall.get(item.callId);
+        return (
+          <div key={item.callId} className="work-step">
+            {approval && onRespondApproval && (
+              <ApprovalCard
+                approval={approval}
+                onRespond={onRespondApproval}
+              />
+            )}
+            <ToolRow
+              name={item.name}
+              arguments={item.arguments}
+              status={item.status}
+              ok={item.ok}
+              output={item.output}
+              durationMs={item.durationMs}
+              artifacts={item.artifacts}
+              at={item.at}
+            />
+          </div>
+        );
+      })}
+      {trailingApprovals.map((approval) =>
+        onRespondApproval ? (
+          <ApprovalCard
+            key={approval.requestId}
+            approval={approval}
+            onRespond={onRespondApproval}
+          />
+        ) : null,
+      )}
+    </div>
+  );
+
+  // A live turn keeps its tool rows and streamed text visible as transcript
+  // rows, so the status line only trails them — there is nothing to collapse.
+  if (statusAtBottom) {
+    return (
+      <div className="work-group work-group-live">
+        {body}
+        {footer}
+        <div className="work-group-status" role="status">
+          {statusContent}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="work-group">
       <button
@@ -1834,112 +2192,9 @@ function WorkGroup({
         <span className={`work-group-chevron ${open ? "open" : ""}`}>
           <ChevronIcon />
         </span>
-        {running ? (
-          <span className="work-group-label">
-            Working
-            <span className="work-group-dots" aria-hidden="true">
-              <span />
-              <span />
-              <span />
-            </span>
-          </span>
-        ) : (
-          <span className="work-group-label">Worked</span>
-        )}
-        <span className="work-group-meta">
-          {items.length > 0 &&
-            `${items.length} action${items.length === 1 ? "" : "s"}`}
-          {items.length > 0 && failed > 0 && (
-            <span className="work-group-failed"> · {failed} failed</span>
-          )}
-          {(decisions?.length ?? 0) > 0 &&
-            `${items.length > 0 ? " · " : ""}${decisions?.length} Jev decision${
-              decisions?.length === 1 ? "" : "s"
-            }`}
-          {running && elapsed > 0 && ` · ${formatElapsed(elapsed)}`}
-          {pending.length > 0 && (
-            <span className="work-group-approval"> · Approval needed</span>
-          )}
-        </span>
+        {statusContent}
       </button>
-      {open && (
-        <div className="work-group-body">
-          {reasoning && reasoning.trim().length > 0 && (
-            <details className="work-thinking">
-              <summary>
-                <span className="work-thinking-label">Thinking</span>
-                <span className="work-thinking-preview">
-                  {reasoning.trim().split("\n")[0]}
-                </span>
-              </summary>
-              <pre>{reasoning.trim()}</pre>
-            </details>
-          )}
-          {timeline.map((entry) => {
-            if (entry.type === "decision") {
-              const decision = entry.decision;
-              return (
-                <div
-                  key={decision.id}
-                  className={`work-decision ${
-                    decision.flagged ? "work-decision-flagged" : ""
-                  }`}
-                >
-                  <span className="work-decision-engine">Jev</span>
-                  <span className="work-decision-kind">{decision.kind}</span>
-                  <span className="work-decision-summary">
-                    {decision.summary}
-                  </span>
-                  <span className="work-decision-meta">
-                    {decision.model}
-                    {decision.latencyMs !== null
-                      ? ` · ${decision.latencyMs} ms`
-                      : ""}
-                  </span>
-                </div>
-              );
-            }
-            if (entry.type === "narration") {
-              return (
-                <div key={entry.narration.id} className="work-narration">
-                  <Markdown text={entry.narration.text} />
-                </div>
-              );
-            }
-            const item = entry.item;
-            const approval = approvalByCall.get(item.callId);
-            return (
-              <div key={item.callId} className="work-step">
-                {approval && onRespondApproval && (
-                  <ApprovalCard
-                    approval={approval}
-                    onRespond={onRespondApproval}
-                  />
-                )}
-                <ToolRow
-                  name={item.name}
-                  arguments={item.arguments}
-                  status={item.status}
-                  ok={item.ok}
-                  output={item.output}
-                  durationMs={item.durationMs}
-                  artifacts={item.artifacts}
-                  at={item.at}
-                />
-              </div>
-            );
-          })}
-          {trailingApprovals.map((approval) =>
-            onRespondApproval ? (
-              <ApprovalCard
-                key={approval.requestId}
-                approval={approval}
-                onRespond={onRespondApproval}
-              />
-            ) : null,
-          )}
-        </div>
-      )}
+      {open && body}
     </div>
   );
 }
@@ -1964,6 +2219,7 @@ function ToolRow({
   at?: number;
 }) {
   const [now, setNow] = useState(() => Date.now());
+  const [open, setOpen] = useState(false);
   const outputRef = useRef<HTMLPreElement | null>(null);
 
   useEffect(() => {
@@ -1986,11 +2242,16 @@ function ToolRow({
   const failed = status === "done" && ok === false;
   const runningFor =
     status === "running" && at !== undefined ? Math.max(0, now - at) : null;
+  const hasBody = Boolean(output) || (artifacts?.length ?? 0) > 0;
+  const imageCount = artifacts?.length ?? 0;
 
   return (
     <div className="tool-row">
       <div className="tool-row-head">
-        <span className="tool-row-label">{label}</span>
+        <span className="tool-row-label">
+          {label.text}
+          {label.code && <code className="tool-row-name">{label.code}</code>}
+        </span>
         {detail && (
           <span className="tool-row-detail" title={detail}>
             {detail}
@@ -2008,20 +2269,88 @@ function ToolRow({
             {durationMs !== null ? ` · ${durationMs} ms` : ""}
           </span>
         ) : null}
+        {!open && imageCount > 0 && (
+          <span className="tool-row-meta">
+            {imageCount} image{imageCount === 1 ? "" : "s"}
+          </span>
+        )}
+        {hasBody && (
+          <button
+            type="button"
+            className={`tool-row-toggle${open ? " open" : ""}`}
+            aria-expanded={open}
+            aria-label={open ? "Hide output" : "Show output"}
+            title={open ? "Hide output" : "Show output"}
+            onClick={() => setOpen((value) => !value)}
+          >
+            <ChevronIcon />
+          </button>
+        )}
       </div>
-      {artifacts?.map((artifact) => (
-        <img
-          key={artifact.url}
-          className="tool-row-image"
-          src={`${DAEMON_HTTP_URL}${artifact.url}`}
-          alt="Screenshot from the bot's computer"
-        />
-      ))}
-      {output && (
-        <details className="tool-row-output">
-          <summary>Output</summary>
-          <pre ref={outputRef}>{output}</pre>
-        </details>
+      {open && (
+        <div className="tool-row-body">
+          {artifacts?.map((artifact) => (
+            <img
+              key={artifact.url}
+              className="tool-row-image"
+              src={`${DAEMON_HTTP_URL}${artifact.url}`}
+              alt="Screenshot from the bot's computer"
+            />
+          ))}
+          {output && <pre ref={outputRef}>{output}</pre>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ReadsRow({ items }: { items: WorkItem[] }) {
+  const [open, setOpen] = useState(false);
+  const running = items.some((item) => item.status === "running");
+  const failed = items.filter((item) => item.ok === false).length;
+
+  return (
+    <div className="tool-row">
+      <div className="tool-row-head">
+        <span className="tool-row-label">Explored</span>
+        <span className="tool-row-meta">
+          {items.length} read{items.length === 1 ? "" : "s"}
+          {failed > 0 && (
+            <span className="tool-row-failed"> · {failed} failed</span>
+          )}
+        </span>
+        {running && (
+          <span className="tool-row-meta tool-row-running">
+            <span className="tool-row-dot" />
+          </span>
+        )}
+        <button
+          type="button"
+          className={`tool-row-toggle${open ? " open" : ""}`}
+          aria-expanded={open}
+          aria-label={open ? "Hide reads" : "Show reads"}
+          title={open ? "Hide reads" : "Show reads"}
+          onClick={() => setOpen((value) => !value)}
+        >
+          <ChevronIcon />
+        </button>
+      </div>
+      {open && (
+        <div className="tool-row-body reads-body">
+          {items.map((item) => (
+            <ToolRow
+              key={item.callId}
+              name={item.name}
+              arguments={item.arguments}
+              status={item.status}
+              ok={item.ok}
+              output={item.output}
+              durationMs={item.durationMs}
+              artifacts={item.artifacts}
+              at={item.at}
+            />
+          ))}
+        </div>
       )}
     </div>
   );
@@ -2140,28 +2469,9 @@ function ChallengeCard({
   );
 }
 
-function StreamingRow({
-  streaming,
-  showTyping,
-}: {
-  streaming: StreamingState;
-  showTyping: boolean;
-}) {
+function StreamingRow({ streaming }: { streaming: StreamingState }) {
   if (!streaming.text) {
-    if (!showTyping) {
-      return null;
-    }
-    return (
-      <div
-        className="entry-body typing-bubble"
-        role="status"
-        aria-label="Assistant is typing"
-      >
-        <span className="typing-dot" />
-        <span className="typing-dot" />
-        <span className="typing-dot" />
-      </div>
-    );
+    return null;
   }
 
   return (
@@ -2430,22 +2740,19 @@ function TaskView({
               const liveDecisions = decisions.filter(
                 (decision) => decision.messageId === streaming.messageId,
               );
-              const hasWork =
-                activity.length > 0 || liveDecisions.length > 0;
               return (
                 <div className="entry entry-assistant">
-                  {hasWork && (
-                    <WorkGroup
-                      items={activity}
-                      decisions={liveDecisions}
-                      reasoning={streaming.reasoning}
-                      startedAt={streaming.startedAt}
-                      running
-                      approvals={approvals}
-                      onRespondApproval={onRespondApproval}
-                    />
-                  )}
-                  <StreamingRow streaming={streaming} showTyping={!hasWork} />
+                  <WorkGroup
+                    items={activity}
+                    decisions={liveDecisions}
+                    reasoning={streaming.reasoning}
+                    startedAt={streaming.startedAt}
+                    running
+                    approvals={approvals}
+                    onRespondApproval={onRespondApproval}
+                    statusAtBottom
+                    footer={<StreamingRow streaming={streaming} />}
+                  />
                 </div>
               );
             })()}
@@ -2470,9 +2777,9 @@ function CreateAgentModal({
 }) {
   const [name, setName] = useState("");
   const [role, setRole] = useState("");
-  const [avatar, setAvatar] = useState(EMOJI_CHOICES[0]!);
   const [color, setColor] = useState(AVATAR_COLORS[0]!);
   const [modelValue, setModelValue] = useState("");
+  const [effort, setEffort] = useState<ReasoningEffort | "">("");
   const [computer, setComputer] = useState<ComputerKind>("firecracker");
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2484,7 +2791,6 @@ function CreateAgentModal({
     }
     setName("");
     setRole("");
-    setAvatar(EMOJI_CHOICES[0]!);
     setColor(AVATAR_COLORS[0]!);
     setComputer("firecracker");
     setCreating(false);
@@ -2495,6 +2801,7 @@ function CreateAgentModal({
     setModelValue(
       initial ? `${initial.provider}::${initial.model}` : "",
     );
+    setEffort(preferred?.effort ?? "");
     const timer = setTimeout(() => nameRef.current?.focus(), 30);
     return () => clearTimeout(timer);
   }, [open]);
@@ -2528,9 +2835,11 @@ function CreateAgentModal({
       await onCreate({
         name: trimmed,
         ...(role.trim() ? { role: role.trim() } : {}),
-        avatar,
+        avatar: "",
         color,
-        ...(provider && model ? { model: { provider, model } } : {}),
+        ...(provider && model
+          ? { model: { provider, model, ...(effort ? { effort } : {}) } }
+          : {}),
         computer,
       });
       onClose();
@@ -2550,9 +2859,7 @@ function CreateAgentModal({
       <div className="modal" onClick={(event) => event.stopPropagation()}>
         <header className="modal-head">
           <div className="modal-head-title">
-            <span className="avatar avatar-lg" style={{ background: color }}>
-              {avatar}
-            </span>
+            <span className="avatar avatar-lg" style={{ background: color }} />
             <h2>Hire a role</h2>
           </div>
           <button
@@ -2588,21 +2895,7 @@ function CreateAgentModal({
           </label>
 
           <div className="field">
-            <span>Avatar</span>
-            <div className="emoji-row">
-              {EMOJI_CHOICES.map((choice) => (
-                <button
-                  key={choice}
-                  className={`emoji-choice ${
-                    avatar === choice ? "emoji-choice-active" : ""
-                  }`}
-                  onClick={() => setAvatar(choice)}
-                  aria-label={`Avatar ${choice}`}
-                >
-                  {choice}
-                </button>
-              ))}
-            </div>
+            <span>Color</span>
             <div className="swatch-row">
               {AVATAR_COLORS.map((choice) => (
                 <button
@@ -2638,6 +2931,28 @@ function CreateAgentModal({
                 </option>
               ))}
             </select>
+          </label>
+
+          <label className="field">
+            <span>Reasoning effort</span>
+            <select
+              value={effort}
+              onChange={(event) =>
+                setEffort(event.target.value as ReasoningEffort | "")
+              }
+              aria-label="Agent reasoning effort"
+            >
+              <option value="">Model default</option>
+              {EFFORT_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <p className="computer-warning">
+              Sent to the provider as reasoning_effort. DeepSeek accepts
+              none/low/high/max; OpenAI accepts minimal/low/medium/high.
+            </p>
           </label>
 
           <div className="field">
