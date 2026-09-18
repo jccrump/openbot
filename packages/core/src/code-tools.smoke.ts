@@ -219,6 +219,31 @@ check("edit rejects a path outside the workspace", async () => {
   );
 });
 
+check("edit works on a path containing spaces", async () => {
+  write("dir with spaces/file.txt", "before\n");
+  await expectOk("edit", {
+    path: "dir with spaces/file.txt",
+    oldString: "before",
+    newString: "after",
+  });
+  assert.equal(
+    readFileSync(join(workspace, "dir with spaces/file.txt"), "utf8"),
+    "after\n",
+  );
+});
+
+check("write_file creates nested directories containing spaces", async () => {
+  // An unquoted $(dirname ...) word-splits this path and the write fails.
+  await expectOk("write_file", {
+    path: "a dir/nested dir/file.txt",
+    content: "hello\n",
+  });
+  assert.equal(
+    readFileSync(join(workspace, "a dir/nested dir/file.txt"), "utf8"),
+    "hello\n",
+  );
+});
+
 check("edit refuses a file larger than its limit", async () => {
   // A partial read written back would destroy the rest of the file, so this
   // must fail rather than silently truncate.

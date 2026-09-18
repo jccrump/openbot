@@ -523,26 +523,37 @@ async function runCodeToolHelper(
   payload: Record<string, unknown>,
   timeoutSeconds: number,
 ): Promise<RawExecResult> {
-  let helper: string;
-  try {
-    helper = await ensureCodeToolHelper(context, context.sandbox);
-  } catch (error) {
-    return {
-      exit: 1,
-      stdout: "",
-      stderr: (error as Error).message,
-      durationMs: 0,
-    };
-  }
   const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString(
     "base64",
   );
-  return runCapture(
-    context,
-    `node ${shellQuote(helper)} ${shellQuote(encoded)}`,
-    codeCwd(context),
-    timeoutSeconds,
-  );
+  const attempt = async (): Promise<RawExecResult> => {
+    let helper: string;
+    try {
+      helper = await ensureCodeToolHelper(context, context.sandbox);
+    } catch (error) {
+      return {
+        exit: 1,
+        stdout: "",
+        stderr: (error as Error).message,
+        durationMs: 0,
+      };
+    }
+    return runCapture(
+      context,
+      `node ${shellQuote(helper)} ${shellQuote(encoded)}`,
+      codeCwd(context),
+      timeoutSeconds,
+    );
+  };
+
+  const first = await attempt();
+  // A rebuilt computer (start fresh, an image upgrade) comes back without the
+  // helper in /tmp, so drop the cached path and install it again once.
+  if (first.exit !== 0 && /Cannot find module|MODULE_NOT_FOUND/.test(first.stderr)) {
+    codeToolHelpers.delete(sandboxId(context));
+    return attempt();
+  }
+  return first;
 }
 
 function countOccurrences(haystack: string, needle: string): number {
@@ -603,7 +614,9 @@ async function writeRawFile(
   const encoded = Buffer.from(content, "utf8").toString("base64");
   const result = await runCapture(
     context,
-    `mkdir -p -- $(dirname ${shellQuote(target)}) && ` +
+    // The command substitution is quoted so a path containing spaces is not
+    // word-split into several directories.
+    `mkdir -p -- "$(dirname ${shellQuote(target)})" && ` +
       `printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(target)}`,
     codeCwd(context),
     30,
@@ -809,10 +822,10 @@ const writeFileTool: Tool = {
       if (resolved.error || !resolved.path) {
         return localResult(resolved.error ?? "invalid path", false, 0);
       }
-      const command = `mkdir -p -- $(dirname ${shellQuote(resolved.path)}) && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(resolved.path)} && wc -c < ${shellQuote(resolved.path)}`;
+      const command = `mkdir -p -- "$(dirname ${shellQuote(resolved.path)})" && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(resolved.path)} && wc -c < ${shellQuote(resolved.path)}`;
       return runCommand(context, command, context.workspaceDir, 30);
     }
-    const command = `mkdir -p -- $(dirname ${shellQuote(path)}) && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(path)} && wc -c < ${shellQuote(path)}`;
+    const command = `mkdir -p -- "$(dirname ${shellQuote(path)})" && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(path)} && wc -c < ${shellQuote(path)}`;
     return runCommand(context, command, "/root", 30);
   },
 };
