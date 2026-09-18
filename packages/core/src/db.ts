@@ -165,6 +165,9 @@ export function openDatabase(dataDir: string): DatabaseSync {
   if (!messageColumns.has("output_tokens")) {
     db.exec("ALTER TABLE messages ADD COLUMN output_tokens INTEGER");
   }
+  if (!messageColumns.has("cache_read_tokens")) {
+    db.exec("ALTER TABLE messages ADD COLUMN cache_read_tokens INTEGER");
+  }
   if (!messageColumns.has("compaction")) {
     db.exec("ALTER TABLE messages ADD COLUMN compaction TEXT");
   }
@@ -183,6 +186,9 @@ export function openDatabase(dataDir: string): DatabaseSync {
     db.exec(
       "ALTER TABLE threads ADD COLUMN compaction_count INTEGER NOT NULL DEFAULT 0",
     );
+  }
+  if (!threadColumnNames.has("plan")) {
+    db.exec("ALTER TABLE threads ADD COLUMN plan TEXT");
   }
 
   const providerColumns = db

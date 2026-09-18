@@ -12,7 +12,7 @@ TINT2_SRC="$REPO_DIR/packages/sandbox/guest/tint2rc"
 # the managed guest payload (agent, desktop, wallpaper, tint2), so a package
 # change that leaves those files untouched needs a schema bump to make existing
 # VMs pick the new image up on their next cold boot.
-IMAGE_SCHEMA_VERSION="3"
+IMAGE_SCHEMA_VERSION="4"
 
 FC_VERSION="${FC_VERSION:-v1.16.0}"
 KERNEL_VERSION="${KERNEL_VERSION:-6.1.155}"
@@ -169,9 +169,14 @@ fi
 # The dev toolchain is what lets an agent build software rather than only write
 # it: git for diff, commit, branch, and revert; make/gcc for native builds and
 # compiled dependencies; patch for unified diffs; sqlite3, ripgrep, and jq for
-# ordinary inspection work. Without these the agent can only produce
-# dependency-free single-file programs, because nothing else can be built here.
-if [ ! -x /mnt/openbot-rootfs/usr/bin/git ]; then
+# ordinary inspection work; file for identifying unknown artifacts; pip, venv,
+# and pytest so Python projects can install and test. Without these the agent
+# can only produce dependency-free single-file programs. The stamp records the
+# package list, so adding a package reinstalls without a full image rebuild.
+TOOLCHAIN_PACKAGES="git build-essential patch sqlite3 ripgrep pkg-config jq file python3-pip python3-venv python3-pytest"
+TOOLCHAIN_STAMP="/mnt/openbot-rootfs/etc/openbot-toolchain"
+TOOLCHAIN_HASH="$(printf '%s' "$TOOLCHAIN_PACKAGES" | sha256sum | awk '{print $1}')"
+if [ "$(cat "$TOOLCHAIN_STAMP" 2>/dev/null || true)" != "$TOOLCHAIN_HASH" ]; then
   echo "== installing dev toolchain into rootfs =="
   mkdir -p /mnt/openbot-rootfs/tmp \
     /mnt/openbot-rootfs/var/cache/apt/archives/partial \
@@ -182,8 +187,9 @@ if [ ! -x /mnt/openbot-rootfs/usr/bin/git ]; then
   mount -t proc proc /mnt/openbot-rootfs/proc
   mount -t sysfs sys /mnt/openbot-rootfs/sys
   cp /etc/resolv.conf /mnt/openbot-rootfs/etc/resolv.conf
-  chroot /mnt/openbot-rootfs /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install -y -qq git build-essential patch sqlite3 ripgrep pkg-config jq >/dev/null"
+  chroot /mnt/openbot-rootfs /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install -y -qq $TOOLCHAIN_PACKAGES >/dev/null"
   umount /mnt/openbot-rootfs/sys /mnt/openbot-rootfs/proc /mnt/openbot-rootfs/dev
+  printf '%s\n' "$TOOLCHAIN_HASH" > "$TOOLCHAIN_STAMP"
 fi
 
 # A default identity so the agent can commit without interactive setup. Written

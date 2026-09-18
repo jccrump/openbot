@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { providerPresetList } from "@openbot/gateway";
@@ -33,7 +34,16 @@ if (!store.getSetting("defaultModel")) {
 const registry = new ProviderRegistry();
 registry.reload(store.listProviders());
 
-const sandbox = new HttpSandboxBackend({ url: config.sandboxUrl });
+// The owner id is stable per data directory, so this daemon can prune its own
+// orphaned VMs on startup without touching another daemon's computers.
+const sandboxOwner = createHash("sha256")
+  .update(config.dataDir)
+  .digest("hex")
+  .slice(0, 16);
+const sandbox = new HttpSandboxBackend({
+  url: config.sandboxUrl,
+  owner: sandboxOwner,
+});
 const approvals = new ApprovalBroker({ store });
 const challenges = new ChallengeBroker();
 const daemon = createDaemon({

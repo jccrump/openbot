@@ -163,6 +163,14 @@ function createFixtureSandbox(activeScenarios, browserTrace) {
       response.end(JSON.stringify({ ok: true, vms: activeScenarios.size }));
       return;
     }
+    if (rawUrl === "/prune") {
+      response.end(JSON.stringify({ removed: [] }));
+      return;
+    }
+    if (rawUrl.endsWith("/network-policy")) {
+      response.end(JSON.stringify({ ok: true, ips: [] }));
+      return;
+    }
     const match = /^\/vms\/([^/]+)\/(ensure|status|browser|exec|stop|destroy)$/.exec(
       rawUrl,
     );
@@ -1009,6 +1017,9 @@ async function main() {
         OPENBOT_PORT: "0",
         OPENBOT_SANDBOX_URL: `http://127.0.0.1:${sandboxPort}`,
         OPENBOT_REQUIRE_APPROVAL: "false",
+        // The scenarios replace the web with fixtures; keep the live search
+        // tool out of the run so the fixture stays authoritative.
+        OPENBOT_WEBSEARCH_DISABLED: "1",
         OPENBOT_EVAL_PROVIDER_KEY: providerKey,
       },
       stdio: ["ignore", "pipe", "pipe"],

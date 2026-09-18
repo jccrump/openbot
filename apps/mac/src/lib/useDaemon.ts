@@ -3,10 +3,12 @@ import type {
   ApprovalRecord,
   ApprovalTier,
   Bot,
+  ChatBusyBehavior,
   CodexInfo,
   ComputerKind,
   DecisionInfo,
   DecisionSettingsPatch,
+  FileEntry,
   HarnessId,
   HarnessSettings,
   Memory,
@@ -118,6 +120,22 @@ export interface DecisionTestResult {
   error: string | null;
 }
 
+export interface FileListResult {
+  path: string;
+  entries: FileEntry[];
+  error: string | null;
+}
+
+export interface FileReadResult {
+  path: string;
+  kind: "text" | "image" | "binary" | "dir" | "missing";
+  content: string | null;
+  mime: string | null;
+  size: number;
+  truncated: boolean;
+  error: string | null;
+}
+
 const SELECTED_BOT_KEY = "openbot.bot";
 const STREAM_WATCHDOG_MS = 90_000;
 const DISCONNECTED_ERROR = "Daemon disconnected — reconnect";
@@ -149,6 +167,9 @@ function storedBotId(): string | null {
 }
 
 function localMessageId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
   return `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
@@ -201,6 +222,9 @@ export function useDaemon() {
   });
   const [decision, setDecision] = useState<DecisionInfo | null>(null);
   const [codex, setCodex] = useState<CodexInfo | null>(null);
+  const [chatBusyBehavior, setChatBusyBehavior] =
+    useState<ChatBusyBehavior>("steer");
+  const [queuedMessageIds, setQueuedMessageIds] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState<ModelRef | null>(null);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -257,6 +281,12 @@ export function useDaemon() {
   );
   const decisionTestRequests = useRef(
     new Map<string, (result: DecisionTestResult) => void>(),
+  );
+  const fileListRequests = useRef(
+    new Map<string, (result: FileListResult) => void>(),
+  );
+  const fileReadRequests = useRef(
+    new Map<string, (result: FileReadResult) => void>(),
   );
   const createRequests = useRef(
     new Map<
@@ -392,6 +422,8 @@ export function useDaemon() {
           setHarness(message.harness ?? { default: "openbot" });
           setDecision(message.decision ?? null);
           setCodex(message.codex ?? null);
+          setChatBusyBehavior(message.chatBusyBehavior ?? "steer");
+          setQueuedMessageIds([]);
           const stored = storedBotId();
           const current = selectedBotIdRef.current;
           const preferred =
@@ -572,6 +604,9 @@ export function useDaemon() {
           setHarness(message.harness ?? { default: "openbot" });
           setDecision(message.decision ?? null);
           setCodex(message.codex ?? null);
+          if (message.chatBusyBehavior) {
+            setChatBusyBehavior(message.chatBusyBehavior);
+          }
           setSelectedModel((current) => {
             if (
               current &&
@@ -608,6 +643,34 @@ export function useDaemon() {
               ok: message.ok,
               model: message.model,
               latencyMs: message.latencyMs,
+              error: message.error,
+            });
+          }
+          break;
+        }
+        case "files.list": {
+          const resolve = fileListRequests.current.get(message.requestId);
+          if (resolve) {
+            fileListRequests.current.delete(message.requestId);
+            resolve({
+              path: message.path,
+              entries: message.entries,
+              error: message.error,
+            });
+          }
+          break;
+        }
+        case "files.read": {
+          const resolve = fileReadRequests.current.get(message.requestId);
+          if (resolve) {
+            fileReadRequests.current.delete(message.requestId);
+            resolve({
+              path: message.path,
+              kind: message.kind,
+              content: message.content,
+              mime: message.mime,
+              size: message.size,
+              truncated: message.truncated,
               error: message.error,
             });
           }
@@ -867,8 +930,15 @@ export function useDaemon() {
           break;
         }
         case "chat.message": {
-          setToolActivity((current) =>
-            current.filter((item) => item.threadId !== message.threadId),
+          if (message.message.role === "assistant") {
+            setToolActivity((current) =>
+              current.filter((item) => item.threadId !== message.threadId),
+            );
+          }
+          setQueuedMessageIds((current) =>
+            current.includes(message.message.id)
+              ? current.filter((id) => id !== message.message.id)
+              : current,
           );
           const appendMessage = (current: Message[]) =>
             current.some((item) => item.id === message.message.id)
@@ -880,6 +950,20 @@ export function useDaemon() {
           if (message.threadId === previewThreadIdRef.current) {
             setPreviewMessages(appendMessage);
           }
+          break;
+        }
+        case "chat.queued": {
+          setQueuedMessageIds((current) =>
+            current.includes(message.messageId)
+              ? current
+              : [...current, message.messageId],
+          );
+          break;
+        }
+        case "chat.dequeued": {
+          setQueuedMessageIds((current) =>
+            current.filter((id) => id !== message.messageId),
+          );
           break;
         }
         case "chat.done": {
@@ -977,7 +1061,7 @@ export function useDaemon() {
   }, [client, activateBot, armWatchdog, disarmWatchdog, clearInFlight]);
 
   const sendMessage = useCallback(
-    (text: string) => {
+    (text: string, delivery?: ChatBusyBehavior) => {
       const botId = selectedBotIdRef.current;
       if (!botId) {
         setError("no bot available on the daemon");
@@ -988,11 +1072,12 @@ export function useDaemon() {
         return;
       }
       const threadId = activeThreadIdRef.current;
+      const messageId = localMessageId();
       setError(null);
       setMessages((current) => [
         ...current,
         {
-          id: localMessageId(),
+          id: messageId,
           threadId: threadId ?? "pending",
           role: "user",
           content: text,
@@ -1006,6 +1091,8 @@ export function useDaemon() {
         botId,
         ...(threadId ? { threadId } : {}),
         text,
+        messageId,
+        ...(delivery ? { delivery } : {}),
         ...(selectedModel ? { model: selectedModel } : {}),
       });
     },
@@ -1242,6 +1329,7 @@ export function useDaemon() {
       policyPreset?: PolicyPresetId;
       harness?: { default: HarnessId };
       decision?: DecisionSettingsPatch;
+      chatBusyBehavior?: ChatBusyBehavior;
     }) => {
       client.send({ type: "settings.update", settings });
     },
@@ -1274,6 +1362,52 @@ export function useDaemon() {
             });
           }
         }, 20_000);
+      });
+    },
+    [client],
+  );
+
+  const listFiles = useCallback(
+    (botId: string, path = ""): Promise<FileListResult> => {
+      const requestId = `files-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      return new Promise((resolve) => {
+        fileListRequests.current.set(requestId, resolve);
+        client.send({ type: "files.list", requestId, botId, path });
+        setTimeout(() => {
+          if (fileListRequests.current.has(requestId)) {
+            fileListRequests.current.delete(requestId);
+            resolve({
+              path,
+              entries: [],
+              error: "timed out waiting for the daemon",
+            });
+          }
+        }, 30_000);
+      });
+    },
+    [client],
+  );
+
+  const readFile = useCallback(
+    (botId: string, path: string): Promise<FileReadResult> => {
+      const requestId = `file-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      return new Promise((resolve) => {
+        fileReadRequests.current.set(requestId, resolve);
+        client.send({ type: "files.read", requestId, botId, path });
+        setTimeout(() => {
+          if (fileReadRequests.current.has(requestId)) {
+            fileReadRequests.current.delete(requestId);
+            resolve({
+              path,
+              kind: "missing",
+              content: null,
+              mime: null,
+              size: 0,
+              truncated: false,
+              error: "timed out waiting for the daemon",
+            });
+          }
+        }, 30_000);
       });
     },
     [client],
@@ -1329,13 +1463,19 @@ export function useDaemon() {
   }, []);
 
   const sendMessageToThread = useCallback(
-    (threadId: string, botId: string, text: string) => {
+    (
+      threadId: string,
+      botId: string,
+      text: string,
+      delivery?: ChatBusyBehavior,
+    ) => {
       if (client.status !== "connected") {
         setError(DISCONNECTED_ERROR);
         return;
       }
+      const messageId = localMessageId();
       const optimistic: Message = {
-        id: localMessageId(),
+        id: messageId,
         threadId,
         role: "user",
         content: text,
@@ -1349,7 +1489,14 @@ export function useDaemon() {
         setPreviewMessages((current) => [...current, optimistic]);
       }
       setError(null);
-      client.send({ type: "chat.send", botId, threadId, text });
+      client.send({
+        type: "chat.send",
+        botId,
+        threadId,
+        text,
+        messageId,
+        ...(delivery ? { delivery } : {}),
+      });
     },
     [client],
   );
@@ -1393,6 +1540,8 @@ export function useDaemon() {
     harness,
     decision,
     codex,
+    chatBusyBehavior,
+    queuedMessageIds,
     selectedModel,
     chooseModel,
     activeThreadId,
@@ -1427,6 +1576,8 @@ export function useDaemon() {
     updateSettings,
     fetchModels,
     testDecision,
+    listFiles,
+    readFile,
     clearError,
   };
 }

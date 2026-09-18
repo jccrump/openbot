@@ -2,7 +2,11 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { PROVIDER_PRESETS, type ProviderDefinition } from "@openbot/gateway";
-import type { CompactionSettings, HarnessSettings } from "@openbot/protocol";
+import type {
+  ChatBusyBehavior,
+  CompactionSettings,
+  HarnessSettings,
+} from "@openbot/protocol";
 import { clampCompactionThreshold } from "./compaction";
 import {
   decisionSettingsFromEnv,
@@ -21,6 +25,7 @@ export interface OpenBotConfig {
   compaction: CompactionSettings;
   harness: HarnessSettings;
   decision: DecisionSettings;
+  chatBusyBehavior: ChatBusyBehavior;
 }
 
 interface FileConfig {
@@ -37,6 +42,7 @@ interface FileConfig {
     default?: string;
   };
   decision?: Partial<DecisionSettings>;
+  chatBusyBehavior?: string;
 }
 
 export function defaultDataDir(): string {
@@ -106,5 +112,14 @@ export function loadConfig(
       file.decision,
       decisionSettingsFromEnv(env),
     ),
+    chatBusyBehavior: parseChatBusyBehavior(
+      env.OPENBOT_CHAT_BUSY_BEHAVIOR ?? file.chatBusyBehavior,
+    ),
   };
+}
+
+export function parseChatBusyBehavior(
+  value: string | undefined,
+): ChatBusyBehavior {
+  return value === "queue" ? "queue" : "steer";
 }

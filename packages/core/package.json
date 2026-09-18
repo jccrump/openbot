@@ -10,7 +10,8 @@
     "dev": "tsx watch src/bin/openbotd.ts",
     "start": "tsx src/bin/openbotd.ts",
     "typecheck": "tsc --noEmit",
-    "code-tools:smoke": "tsx src/code-tools.smoke.ts"
+    "code-tools:smoke": "tsx src/code-tools.smoke.ts",
+    "websearch:smoke": "tsx src/websearch.smoke.ts"
   },
   "dependencies": {
     "@openbot/gateway": "workspace:*",

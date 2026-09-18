@@ -44,6 +44,8 @@ export type ReasoningEffort =
 export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;
+  /** Prompt tokens served from the provider's cache (billed at a discount). */
+  cacheReadTokens?: number;
 }
 
 export type ChatEvent =

@@ -4,6 +4,7 @@ import {
   ApprovalRecordSchema,
   ApprovalTierSchema,
   BotSchema,
+  ChatBusyBehaviorSchema,
   CodexInfoSchema,
   CompactionSettingsSchema,
   CompactionTriggerSchema,
@@ -26,6 +27,14 @@ import {
   ThreadSchema,
   ToolArtifactSchema,
 } from "./domain";
+
+export const FileEntrySchema = z.object({
+  name: z.string(),
+  dir: z.boolean(),
+  size: z.number().nullable(),
+  mtime: z.number().nullable(),
+});
+export type FileEntry = z.infer<typeof FileEntrySchema>;
 
 export const ClientMessageSchema = z.discriminatedUnion("type", [
   z.object({
@@ -68,6 +77,18 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     botId: z.string(),
   }),
   z.object({
+    type: z.literal("files.list"),
+    requestId: z.string(),
+    botId: z.string(),
+    path: z.string().optional(),
+  }),
+  z.object({
+    type: z.literal("files.read"),
+    requestId: z.string(),
+    botId: z.string(),
+    path: z.string().min(1),
+  }),
+  z.object({
     type: z.literal("bots.delete"),
     requestId: z.string(),
     botId: z.string(),
@@ -83,6 +104,11 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     threadId: z.string().optional(),
     text: z.string().min(1),
     model: ModelRefSchema.optional(),
+    /** Client-generated id for the user message, echoed back so optimistic
+     * bubbles reconcile with the persisted transcript. */
+    messageId: z.string().optional(),
+    /** What to do when the agent is already working in this thread. */
+    delivery: ChatBusyBehaviorSchema.optional(),
   }),
   z.object({
     type: z.literal("chat.cancel"),
@@ -157,6 +183,7 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
         })
         .optional(),
       decision: DecisionSettingsPatchSchema.optional(),
+      chatBusyBehavior: ChatBusyBehaviorSchema.optional(),
     }),
   }),
   z.object({
@@ -207,6 +234,7 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     harness: HarnessSettingsSchema.optional(),
     decision: DecisionInfoSchema.optional(),
     codex: CodexInfoSchema.optional(),
+    chatBusyBehavior: ChatBusyBehaviorSchema.optional(),
   }),
   z.object({
     type: z.literal("bot.created"),
@@ -239,6 +267,7 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     harness: HarnessSettingsSchema.optional(),
     decision: DecisionInfoSchema.optional(),
     codex: CodexInfoSchema.optional(),
+    chatBusyBehavior: ChatBusyBehaviorSchema.optional(),
   }),
   z.object({
     type: z.literal("provider.models"),
@@ -326,6 +355,16 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     message: MessageSchema,
   }),
   z.object({
+    type: z.literal("chat.queued"),
+    threadId: z.string(),
+    messageId: z.string(),
+  }),
+  z.object({
+    type: z.literal("chat.dequeued"),
+    threadId: z.string(),
+    messageId: z.string(),
+  }),
+  z.object({
     type: z.literal("chat.error"),
     runId: z.string().optional(),
     threadId: z.string().optional(),
@@ -381,6 +420,26 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     botId: z.string(),
     taskId: z.string().optional(),
     state: z.enum(["stopped", "booting", "running", "error"]),
+  }),
+  z.object({
+    type: z.literal("files.list"),
+    requestId: z.string(),
+    botId: z.string(),
+    path: z.string(),
+    entries: z.array(FileEntrySchema),
+    error: z.string().nullable(),
+  }),
+  z.object({
+    type: z.literal("files.read"),
+    requestId: z.string(),
+    botId: z.string(),
+    path: z.string(),
+    kind: z.enum(["text", "image", "binary", "dir", "missing"]),
+    content: z.string().nullable(),
+    mime: z.string().nullable(),
+    size: z.number(),
+    truncated: z.boolean(),
+    error: z.string().nullable(),
   }),
   z.object({
     type: z.literal("task.upserted"),

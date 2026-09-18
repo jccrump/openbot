@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
   Bot,
+  ChatBusyBehavior,
   ComputerKind,
   Message,
   ModelRef,
@@ -13,9 +14,11 @@ import type {
 import { Settings } from "./Settings";
 import { AgentSettingsModal } from "./components/AgentSettingsModal";
 import { ApprovalsModal } from "./components/ApprovalsModal";
+import { FilesPanel } from "./components/FilesPanel";
 import { Markdown } from "./components/Markdown";
 import { MemoryModal } from "./components/MemoryModal";
 import { PanelResizer } from "./components/PanelResizer";
+import { TerminalPanel } from "./components/TerminalPanel";
 import { VncView, type VncState } from "./components/VncView";
 import {
   AVATAR_COLORS,
@@ -49,8 +52,17 @@ function isLocalBot(bot: Bot | null | undefined): boolean {
 }
 
 const SCREEN_PANEL_KEY = "openbot.screenPanel";
+const PANEL_TAB_KEY = "openbot.panelTab";
 const SCREEN_POLL_MS = 1500;
 const SCREEN_OFF_POLL_MS = 8_000;
+
+type PanelTab = "screen" | "files" | "terminal";
+
+const PANEL_TABS: Array<{ id: PanelTab; label: string }> = [
+  { id: "screen", label: "Screen" },
+  { id: "files", label: "Files" },
+  { id: "terminal", label: "Terminal" },
+];
 
 const TASK_STATUS_LABEL: Record<Task["status"], string> = {
   queued: "Queued",
@@ -70,6 +82,16 @@ function storedScreenPanelOpen(): boolean {
   }
 }
 
+function storedPanelTab(): PanelTab {
+  try {
+    const value = localStorage.getItem(PANEL_TAB_KEY);
+    if (value === "screen" || value === "files" || value === "terminal") {
+      return value;
+    }
+  } catch {}
+  return "files";
+}
+
 interface ToolArguments {
   command?: string;
   path?: string;
@@ -81,6 +103,7 @@ interface ToolArguments {
   keys?: string;
   title?: string;
   goal?: string;
+  query?: string;
   startUrl?: string;
   milliseconds?: number;
   pixels?: number;
@@ -116,6 +139,9 @@ function toolLabel(name: string): ToolLabel {
   }
   if (name === "read_file") {
     return { text: "Read" };
+  }
+  if (name === "web_search") {
+    return { text: "Searched" };
   }
   return { text: "Called", code: name };
 }
@@ -185,6 +211,7 @@ function toolDetail(raw: string): string {
   if (parsed.command) return parsed.command;
   if (parsed.path) return parsed.path;
   if (parsed.goal) return parsed.goal;
+  if (parsed.query) return parsed.query;
   if (parsed.action) {
     const target =
       parsed.url ??
@@ -255,6 +282,38 @@ function MonitorIcon() {
       <path d="M6 13.5h4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
     </svg>
   );
+}
+
+function FolderTabIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path
+        d="M2 4.2c0-.7.6-1.2 1.2-1.2h2.6l1.4 1.6h5.6c.7 0 1.2.6 1.2 1.2v6.5c0 .7-.6 1.2-1.2 1.2H3.2c-.7 0-1.2-.6-1.2-1.2V4.2Z"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function TerminalTabIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="2" y="2.8" width="12" height="10.4" rx="1.8" stroke="currentColor" strokeWidth="1.4" />
+      <path d="m5 6.4 2 1.8-2 1.8M8.8 10h2.4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function PanelTabIcon({ tab }: { tab: PanelTab }) {
+  if (tab === "screen") {
+    return <MonitorIcon />;
+  }
+  if (tab === "files") {
+    return <FolderTabIcon />;
+  }
+  return <TerminalTabIcon />;
 }
 
 function PauseIcon() {
@@ -412,13 +471,14 @@ interface ThreadRow {
   id: string;
   kind: "bot" | "task";
   name: string;
-  color: string;
   selected: boolean;
   working: boolean;
   title: string;
   // Nesting level: 0 is the lead, 1 a manager, 2 a worker. The list indents by
   // this so the hierarchy reads without drawing connector lines.
   depth: number;
+  hasChildren: boolean;
+  expanded: boolean;
 }
 
 // The transcript keeps itself pinned to the newest entry; `signal` is any
@@ -461,16 +521,23 @@ function threadRowForTask(task: Task, depth: number): ThreadRow {
     id: task.id,
     kind: "task",
     name: taskThreadName(task),
-    color: avatarColor(task.id),
     selected: false,
     working: task.status === "queued" || task.status === "running",
     title: task.brief || taskThreadName(task),
     depth,
+    hasChildren: false,
+    expanded: false,
   };
 }
 
-// Threads live under the computer panel now: the lead is pinned on top so
-// there is always a way back, then project threads, then loose tasks.
+function pulseSeed(id: string): number {
+  let hash = 0;
+  for (let index = 0; index < id.length; index += 1) {
+    hash = (hash * 31 + id.charCodeAt(index)) | 0;
+  }
+  return Math.abs(hash);
+}
+
 function ThreadList({
   rows,
   query,
@@ -478,6 +545,7 @@ function ThreadList({
   onSearchChange,
   onToggleSearch,
   onSelect,
+  onToggle,
 }: {
   rows: ThreadRow[];
   query: string;
@@ -485,6 +553,7 @@ function ThreadList({
   onSearchChange: (value: string) => void;
   onToggleSearch: () => void;
   onSelect: (row: ThreadRow) => void;
+  onToggle: (row: ThreadRow) => void;
 }) {
   return (
     <section className="panel-threads">
@@ -522,6 +591,7 @@ function ThreadList({
             className={`thread-row ${row.selected ? "thread-row-selected" : ""}`}
             style={{ paddingLeft: 8 + row.depth * 18 }}
             title={row.title}
+            aria-label={row.name}
             onClick={() => onSelect(row)}
             onKeyDown={(event) => {
               if (event.target !== event.currentTarget) {
@@ -533,11 +603,42 @@ function ThreadList({
               }
             }}
           >
-            <span className="thread-dot" style={{ background: row.color }} />
+            <span
+              className={`thread-dot${row.working ? " thread-dot-working" : ""}`}
+              title={row.working ? "Working" : "Idle"}
+              style={
+                row.working
+                  ? {
+                      animationDelay: `-${pulseSeed(row.id) % 700}ms`,
+                      animationDuration: `${1000 + (pulseSeed(row.id) % 900)}ms`,
+                    }
+                  : undefined
+              }
+            />
             <span className="agent-row-body">
               <span className="agent-row-name">{row.name}</span>
             </span>
-            {row.working && <span className="thread-working" title="Working now" />}
+            {row.hasChildren ? (
+              <button
+                type="button"
+                className={`thread-disclosure${
+                  row.expanded ? " thread-disclosure-open" : ""
+                }`}
+                aria-expanded={row.expanded}
+                aria-label={
+                  row.expanded ? `Collapse ${row.name}` : `Expand ${row.name}`
+                }
+                title={row.expanded ? "Hide workers" : "Show workers"}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onToggle(row);
+                }}
+              >
+                <ChevronIcon />
+              </button>
+            ) : (
+              <span className="thread-disclosure-spacer" aria-hidden="true" />
+            )}
           </div>
         ))}
         {rows.length === 0 && (
@@ -574,6 +675,9 @@ function ThreadChat({
   challenges,
   decisions,
   onCancel,
+  busyBehavior,
+  onBusyBehaviorChange,
+  queuedMessageIds,
 }: {
   daemon: ReturnType<typeof useDaemon>;
   bot: Bot | null;
@@ -596,6 +700,9 @@ function ThreadChat({
   challenges: PendingChallenge[];
   decisions: DecisionActivity[];
   onCancel: () => void;
+  busyBehavior: ChatBusyBehavior;
+  onBusyBehaviorChange: (value: ChatBusyBehavior) => void;
+  queuedMessageIds: string[];
 }) {
   const modelValue = daemon.selectedModel
     ? `${daemon.selectedModel.provider}::${daemon.selectedModel.model}`
@@ -683,6 +790,7 @@ function ThreadChat({
                 <MessageBubble
                   key={entry.message.id}
                   message={entry.message}
+                  queued={queuedMessageIds.includes(entry.message.id)}
                   decisions={decisions.filter(
                     (decision) => decision.messageId === entry.message.id,
                   )}
@@ -723,13 +831,6 @@ function ThreadChat({
 
         <footer className="composer-wrap">
           <div className="composer">
-            <span
-              className="icon-button icon-muted composer-plus"
-              title="Attachments — coming soon"
-              aria-hidden="true"
-            >
-              <PlusIcon />
-            </span>
             <textarea
               value={draft}
               placeholder={`Message ${botName}`}
@@ -742,125 +843,184 @@ function ThreadChat({
                 }
               }}
             />
-            <button
-              className="icon-button icon-muted composer-mic"
-              title="Voice input — coming soon"
-              aria-label="Voice input (coming soon)"
-              disabled
-            >
-              <MicIcon />
-            </button>
-            {streaming ? (
-              <button className="send-circle stop" onClick={onCancel} title="Stop">
-                <StopIcon />
-              </button>
-            ) : (
-              <button
-                className="send-circle"
-                onClick={onSubmit}
-                disabled={draft.trim().length === 0}
-                title="Send"
-              >
-                <ArrowUpIcon />
-              </button>
-            )}
-          </div>
-          <div className="composer-tools">
-            <div className="composer-model-group">
-              <label className="model-pill model-pill-composer" title="Model">
-                <select
-                  value={modelValue}
-                  aria-label="Model"
-                  onChange={(event) => {
-                    const [provider, model] = event.target.value.split("::");
-                    if (provider && model) {
+            <div className="composer-bar">
+              <div className="composer-bar-start">
+                <span
+                  className="icon-button icon-muted composer-plus"
+                  title="Attachments — coming soon"
+                  aria-hidden="true"
+                >
+                  <PlusIcon />
+                </span>
+                <div className="composer-model-group">
+                <label className="model-pill" title="Model">
+                  <select
+                    value={modelValue}
+                    aria-label="Model"
+                    onChange={(event) => {
+                      const [provider, model] = event.target.value.split("::");
+                      if (provider && model) {
+                        daemon.chooseModel({
+                          provider,
+                          model,
+                          ...(daemon.selectedModel?.effort
+                            ? { effort: daemon.selectedModel.effort }
+                            : {}),
+                        });
+                      }
+                    }}
+                  >
+                    {daemon.modelOptions.length === 0 && (
+                      <option value="">No models configured</option>
+                    )}
+                    {daemon.modelOptions.map((option) => (
+                      <option
+                        key={`${option.provider}::${option.model}`}
+                        value={`${option.provider}::${option.model}`}
+                      >
+                        {option.providerLabel} · {option.model}
+                      </option>
+                    ))}
+                  </select>
+                  <ChevronIcon />
+                </label>
+                <label
+                  className="model-pill model-pill-effort"
+                  title="Reasoning effort — sent to the provider as reasoning_effort"
+                >
+                  <select
+                    value={daemon.selectedModel?.effort ?? ""}
+                    aria-label="Reasoning effort"
+                    disabled={daemon.selectedModel === null}
+                    onChange={(event) => {
+                      const effort = event.target.value as ReasoningEffort | "";
+                      const current = daemon.selectedModel;
+                      if (!current) {
+                        return;
+                      }
                       daemon.chooseModel({
-                        provider,
-                        model,
-                        ...(daemon.selectedModel?.effort
-                          ? { effort: daemon.selectedModel.effort }
-                          : {}),
+                        provider: current.provider,
+                        model: current.model,
+                        ...(effort ? { effort } : {}),
                       });
-                    }
-                  }}
+                    }}
+                  >
+                    <option value="">Effort: default</option>
+                    {EFFORT_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                  <ChevronIcon />
+                </label>
+                </div>
+              </div>
+              {streaming && (
+                <div
+                  className="segmented segmented-compact composer-busy-group"
+                  role="radiogroup"
+                  aria-label="What to do while the agent is working"
                 >
-                  {daemon.modelOptions.length === 0 && (
-                    <option value="">No models configured</option>
-                  )}
-                  {daemon.modelOptions.map((option) => (
-                    <option
-                      key={`${option.provider}::${option.model}`}
-                      value={`${option.provider}::${option.model}`}
+                  <button
+                    role="radio"
+                    aria-checked={busyBehavior === "steer"}
+                    className={`segmented-option ${
+                      busyBehavior === "steer" ? "segmented-option-active" : ""
+                    }`}
+                    title="Join the running turn at its next step"
+                    onClick={() => onBusyBehaviorChange("steer")}
+                  >
+                    Steer
+                  </button>
+                  <button
+                    role="radio"
+                    aria-checked={busyBehavior === "queue"}
+                    className={`segmented-option ${
+                      busyBehavior === "queue" ? "segmented-option-active" : ""
+                    }`}
+                    title="Send automatically when the agent stops"
+                    onClick={() => onBusyBehaviorChange("queue")}
+                  >
+                    Queue
+                  </button>
+                </div>
+              )}
+              <div className="composer-bar-end">
+                <div className="composer-tools-actions">
+                  <button
+                    className="icon-button"
+                    title="Approvals"
+                    aria-label="Approvals"
+                    onClick={() => onOpenApprovals()}
+                  >
+                    <ShieldIcon />
+                    {pendingApprovalCount > 0 && (
+                      <span className="icon-badge">{pendingApprovalCount}</span>
+                    )}
+                  </button>
+                  <button
+                    className="icon-button"
+                    title="Memory and soul"
+                    aria-label="Memory and soul"
+                    onClick={() => onOpenMemory()}
+                  >
+                    <MemoryIcon />
+                  </button>
+                  <button
+                    className="icon-button"
+                    title="Settings"
+                    aria-label="Settings"
+                    onClick={() => onOpenSettings()}
+                  >
+                    <GearIcon />
+                  </button>
+                  <span
+                    className={`status-dot status-${daemon.status}`}
+                    title={STATUS_LABEL[daemon.status]}
+                  />
+                </div>
+                <button
+                  className="icon-button icon-muted composer-mic"
+                  title="Voice input — coming soon"
+                  aria-label="Voice input (coming soon)"
+                  disabled
+                >
+                  <MicIcon />
+                </button>
+                {streaming ? (
+                  <div className="composer-send-group">
+                    <button
+                      className="send-circle stop"
+                      onClick={onCancel}
+                      title="Stop"
                     >
-                      {option.providerLabel} · {option.model}
-                    </option>
-                  ))}
-                </select>
-                <ChevronIcon />
-              </label>
-              <label
-                className="model-pill model-pill-effort"
-                title="Reasoning effort — sent to the provider as reasoning_effort"
-              >
-                <select
-                  value={daemon.selectedModel?.effort ?? ""}
-                  aria-label="Reasoning effort"
-                  disabled={daemon.selectedModel === null}
-                  onChange={(event) => {
-                    const effort = event.target.value as ReasoningEffort | "";
-                    const current = daemon.selectedModel;
-                    if (!current) {
-                      return;
-                    }
-                    daemon.chooseModel({
-                      provider: current.provider,
-                      model: current.model,
-                      ...(effort ? { effort } : {}),
-                    });
-                  }}
-                >
-                  <option value="">Effort: default</option>
-                  {EFFORT_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-                <ChevronIcon />
-              </label>
-            </div>
-            <div className="composer-tools-actions">
-              <button
-                className="icon-button"
-                title="Approvals"
-                aria-label="Approvals"
-                onClick={() => onOpenApprovals()}
-              >
-                <ShieldIcon />
-                {pendingApprovalCount > 0 && (
-                  <span className="icon-badge">{pendingApprovalCount}</span>
+                      <StopIcon />
+                    </button>
+                    <button
+                      className="send-circle"
+                      onClick={onSubmit}
+                      disabled={draft.trim().length === 0}
+                      title={
+                        busyBehavior === "steer"
+                          ? "Steer the running turn"
+                          : "Queue for when the agent stops"
+                      }
+                    >
+                      <ArrowUpIcon />
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    className="send-circle"
+                    onClick={onSubmit}
+                    disabled={draft.trim().length === 0}
+                    title="Send"
+                  >
+                    <ArrowUpIcon />
+                  </button>
                 )}
-              </button>
-              <button
-                className="icon-button"
-                title="Memory and soul"
-                aria-label="Memory and soul"
-                onClick={() => onOpenMemory()}
-              >
-                <MemoryIcon />
-              </button>
-              <button
-                className="icon-button"
-                title="Settings"
-                aria-label="Settings"
-                onClick={() => onOpenSettings()}
-              >
-                <GearIcon />
-              </button>
-              <span
-                className={`status-dot status-${daemon.status}`}
-                title={STATUS_LABEL[daemon.status]}
-              />
+              </div>
             </div>
           </div>
         </footer>
@@ -873,12 +1033,18 @@ export default function App() {
   const daemon = useDaemon();
   const { theme, setTheme } = useTheme();
   const [draft, setDraft] = useState("");
+  const [busyBehavior, setBusyBehavior] = useState<ChatBusyBehavior | null>(
+    null,
+  );
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [memoryOpen, setMemoryOpen] = useState(false);
   const [approvalsOpen, setApprovalsOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
+  const [expandedThreads, setExpandedThreads] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [drawerThread, setDrawerThread] = useState<{
     threadId: string;
     row: ThreadRow;
@@ -887,6 +1053,7 @@ export default function App() {
   const [settingsBotId, setSettingsBotId] = useState<string | null>(null);
   const [watchTaskId, setWatchTaskId] = useState<string | null>(null);
   const [screenOpen, setScreenOpen] = useState(storedScreenPanelOpen);
+  const [panelTab, setPanelTab] = useState<PanelTab>(storedPanelTab);
   const [screenPlaying, setScreenPlaying] = useState(true);
   const [screenExpanded, setScreenExpanded] = useState(false);
   const [screenImageUrl, setScreenImageUrl] = useState<string | null>(null);
@@ -942,10 +1109,39 @@ export default function App() {
   const vncUrl = screenBot
     ? `${DAEMON_HTTP_URL.replace(/^http/, "ws")}/bots/${encodeURIComponent(screenBot.id)}/vnc`
     : "";
+  const terminalUrl = screenBot
+    ? `${DAEMON_HTTP_URL.replace(/^http/, "ws")}/bots/${encodeURIComponent(screenBot.id)}/terminal`
+    : "";
   const canStream = Boolean(screenBot) && !isLocalBot(screenBot);
   const vncLive = vncState === "live";
   const vncActive =
-    canStream && screenPlaying && screenOpen && screenStatus !== "vm-off";
+    canStream &&
+    screenPlaying &&
+    screenOpen &&
+    panelTab === "screen" &&
+    screenStatus !== "vm-off";
+
+  const choosePanelTab = (tab: PanelTab) => {
+    setPanelTab(tab);
+    try {
+      localStorage.setItem(PANEL_TAB_KEY, tab);
+    } catch {}
+  };
+
+  const openScreenTab = () => {
+    setScreenOpen(true);
+    choosePanelTab("screen");
+    try {
+      localStorage.setItem(SCREEN_PANEL_KEY, "open");
+    } catch {}
+  };
+
+  const closePanel = () => {
+    setScreenOpen(false);
+    try {
+      localStorage.setItem(SCREEN_PANEL_KEY, "closed");
+    } catch {}
+  };
   const screenCaption = (() => {
     if (!screenBot) {
       return "No agent selected";
@@ -1066,10 +1262,10 @@ export default function App() {
     const q = search.trim().toLowerCase();
     const matches = (...parts: Array<string | null | undefined>) =>
       !q || parts.some((part) => (part ?? "").toLowerCase().includes(q));
+    const isActive = (task: Task) =>
+      task.status === "queued" || task.status === "running";
     const byActivity = (a: Task, b: Task) => {
-      const active = (task: Task) =>
-        task.status === "queued" || task.status === "running" ? 0 : 1;
-      const byActive = active(a) - active(b);
+      const byActive = Number(isActive(b)) - Number(isActive(a));
       if (byActive !== 0) {
         return byActive;
       }
@@ -1079,17 +1275,20 @@ export default function App() {
       bot: Bot,
       depth: number,
       working: boolean,
+      hasChildren: boolean,
+      expanded: boolean,
     ): ThreadRow => ({
       id: bot.id,
       kind: "bot",
       name: bot.name,
-      color: bot.color ?? avatarColor(bot.id),
       selected: drawerRowId
         ? bot.id === drawerRowId
         : bot.id === daemon.selectedBotId,
       working,
       title: bot.role ?? bot.name,
       depth,
+      hasChildren,
+      expanded,
     });
     const taskRow = (task: Task, depth: number): ThreadRow => ({
       ...threadRowForTask(task, depth),
@@ -1100,10 +1299,10 @@ export default function App() {
     // list starts at the managers it has spun up.
     const managers = projects
       .map((manager) => {
-        const workers = daemon.tasks
-          .filter((task) => task.projectId === manager.id)
-          .sort(byActivity)
-          .slice(0, 6);
+        const projectTasks = daemon.tasks.filter(
+          (task) => task.projectId === manager.id,
+        );
+        const workers = projectTasks.sort(byActivity).slice(0, 6);
         const selfMatch = matches(manager.name, manager.role);
         const visibleWorkers =
           q && !selfMatch
@@ -1115,6 +1314,8 @@ export default function App() {
           manager,
           workers: visibleWorkers,
           visible: selfMatch || visibleWorkers.length > 0,
+          working: projectTasks.some(isActive),
+          expanded: q.length > 0 || expandedThreads.has(manager.id),
         };
       })
       .filter((group) => group.visible);
@@ -1128,16 +1329,20 @@ export default function App() {
       .slice(0, 8);
 
     managers.forEach((group) => {
-      const activeRequest = daemon.tasks.some(
-        (task) =>
-          task.projectId === group.manager.id &&
-          task.roleId === group.manager.id &&
-          (task.status === "queued" || task.status === "running"),
+      rows.push(
+        botRow(
+          group.manager,
+          0,
+          group.working,
+          group.workers.length > 0,
+          group.expanded,
+        ),
       );
-      rows.push(botRow(group.manager, 0, activeRequest));
-      group.workers.forEach((task) => {
-        rows.push(taskRow(task, 1));
-      });
+      if (group.expanded) {
+        group.workers.forEach((task) => {
+          rows.push(taskRow(task, 1));
+        });
+      }
     });
 
     looseTasks.forEach((task) => {
@@ -1146,6 +1351,18 @@ export default function App() {
 
     return rows;
   })();
+
+  const toggleThread = (row: ThreadRow) => {
+    setExpandedThreads((current) => {
+      const next = new Set(current);
+      if (next.has(row.id)) {
+        next.delete(row.id);
+      } else {
+        next.add(row.id);
+      }
+      return next;
+    });
+  };
 
   // Threads open in a drawer over the chat instead of taking it over, so the
   // conversation behind it is never swapped out.
@@ -1197,6 +1414,14 @@ export default function App() {
     ? daemon.messages
     : daemon.previewMessages;
   const drawerStreaming = drawerIsActive ? streaming : daemon.previewStreaming;
+  // The per-send override resets as soon as the turn that prompted it ends, so
+  // the next busy send follows the setting again.
+  useEffect(() => {
+    if (!streaming && !drawerStreaming) {
+      setBusyBehavior(null);
+    }
+  }, [streaming, drawerStreaming]);
+  const effectiveBusyBehavior = busyBehavior ?? daemon.chatBusyBehavior;
   const drawerActivity = drawerThreadId
     ? daemon.toolActivity.filter((item) => item.threadId === drawerThreadId)
     : [];
@@ -1249,6 +1474,7 @@ export default function App() {
   useEffect(() => {
     if (
       !screenOpen ||
+      panelTab !== "screen" ||
       !screenPlaying ||
       !windowActive ||
       !screenBot ||
@@ -1327,7 +1553,7 @@ export default function App() {
         clearTimeout(timer);
       }
     };
-  }, [screenOpen, screenPlaying, windowActive, screenBot, vncLive]);
+  }, [screenOpen, panelTab, screenPlaying, windowActive, screenBot, vncLive]);
 
   const scrollSignal = [
     daemon.messages.length,
@@ -1343,23 +1569,47 @@ export default function App() {
   ].join(":");
   const submit = () => {
     const text = draft.trim();
-    if (!text || daemon.streaming) {
+    if (!text) {
       return;
     }
-    daemon.sendMessage(text);
+    daemon.sendMessage(text, streaming ? effectiveBusyBehavior : undefined);
     setDraft("");
   };
   const submitToDrawer = () => {
     const text = draft.trim();
-    if (!text || !drawerThreadId || drawerRow?.kind !== "bot" || drawerStreaming) {
+    if (!text || !drawerThreadId || drawerRow?.kind !== "bot") {
       return;
     }
-    daemon.sendMessageToThread(drawerThreadId, drawerRow.id, text);
+    daemon.sendMessageToThread(
+      drawerThreadId,
+      drawerRow.id,
+      text,
+      drawerStreaming ? effectiveBusyBehavior : undefined,
+    );
     setDraft("");
   };
 
   return (
     <div className="shell">
+      <aside className="thread-rail">
+        <ThreadList
+          rows={threadRows}
+          query={search}
+          searchOpen={searchOpen}
+          onSearchChange={setSearch}
+          onToggleSearch={() =>
+            setSearchOpen((value) => {
+              if (value) {
+                setSearch("");
+              }
+              return !value;
+            })
+          }
+          onSelect={openThread}
+          onToggle={toggleThread}
+        />
+      </aside>
+
       <main className="chat">
         <header className="agent-badge">
           <span
@@ -1385,7 +1635,7 @@ export default function App() {
           hasUsableProvider={hasUsableProvider}
           hasProviderNeedingKey={hasProviderNeedingKey}
           onOpenSettings={() => setSettingsOpen(true)}
-          onOpenScreen={() => setScreenOpen(true)}
+          onOpenScreen={openScreenTab}
           onOpenApprovals={() => setApprovalsOpen(true)}
           onOpenMemory={() => setMemoryOpen(true)}
           screenOpen={screenOpen}
@@ -1396,6 +1646,9 @@ export default function App() {
           challenges={challenges}
           decisions={decisions}
           onCancel={daemon.cancel}
+          busyBehavior={effectiveBusyBehavior}
+          onBusyBehaviorChange={setBusyBehavior}
+          queuedMessageIds={daemon.queuedMessageIds}
         />
 
         {drawerRow && (
@@ -1461,7 +1714,7 @@ export default function App() {
                     hasUsableProvider={hasUsableProvider}
                     hasProviderNeedingKey={hasProviderNeedingKey}
                     onOpenSettings={() => setSettingsOpen(true)}
-                    onOpenScreen={() => setScreenOpen(true)}
+                    onOpenScreen={openScreenTab}
                     onOpenApprovals={() => setApprovalsOpen(true)}
                     onOpenMemory={() => setMemoryOpen(true)}
                     screenOpen={screenOpen}
@@ -1476,6 +1729,9 @@ export default function App() {
                         daemon.cancelThread(drawerThreadId);
                       }
                     }}
+                    busyBehavior={effectiveBusyBehavior}
+                    onBusyBehaviorChange={setBusyBehavior}
+                    queuedMessageIds={daemon.queuedMessageIds}
                   />
                 </>
               )}
@@ -1491,145 +1747,182 @@ export default function App() {
             screenExpanded ? "screen-panel-expanded" : ""
           }`}
         >
-          <div className="screen-panel-bar">
-            <span className="screen-panel-identity">
-              <span
-                className="screen-panel-dot"
-                style={{
-                  background:
-                    screenBot?.color ?? avatarColor(screenBot?.id ?? "assistant"),
-                }}
-              />
-              {screenBot && (
-                <span className="screen-panel-name">
-                  {screenBotName}&rsquo;s
-                </span>
-              )}
-              <span className="screen-panel-title">Computer</span>
-            </span>
-            <button
-              className="icon-button"
-              title="Collapse computer view"
-              aria-label="Collapse computer view"
-              onClick={() => {
-                setScreenOpen(false);
-                try {
-                  localStorage.setItem(SCREEN_PANEL_KEY, "closed");
-                } catch {}
-              }}
-            >
-              <svg
-                width="15"
-                height="15"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden="true"
+          {!screenExpanded && (
+            <div className="panel-tabs" role="tablist" aria-label="Agent panel">
+              {PANEL_TABS.map((tab) => (
+                <button
+                  key={tab.id}
+                  role="tab"
+                  aria-selected={panelTab === tab.id}
+                  className={`panel-tab${
+                    panelTab === tab.id ? " panel-tab-active" : ""
+                  }`}
+                  onClick={() => choosePanelTab(tab.id)}
+                >
+                  <PanelTabIcon tab={tab.id} />
+                  <span>{tab.label}</span>
+                </button>
+              ))}
+              <button
+                className="icon-button panel-collapse"
+                title="Collapse panel"
+                aria-label="Collapse panel"
+                onClick={closePanel}
               >
-                <path d="m6 17 5-5-5-5" />
-                <path d="m13 17 5-5-5-5" />
-              </svg>
-            </button>
-          </div>
-          <section className="screen-view">
-            <div
-              className={`screen-frame ${
-                screenExpanded ? "screen-frame-expanded" : ""
-              }`}
-              onClick={
-                canStream && !screenExpanded
-                  ? () => setScreenExpanded(true)
-                  : undefined
-              }
-            >
-              {canStream && (
-                <VncView
-                  url={vncUrl}
-                  active={vncActive}
-                  interactive={screenExpanded}
-                  onState={setVncState}
-                />
-              )}
-              {!vncLive && (
-                <div className="screen-fallback">
-                  {!isLocalBot(screenBot) &&
-                  screenStatus !== "vm-off" &&
-                  screenImageUrl ? (
-                    <img
-                      className="screen-image"
-                      src={screenImageUrl}
-                      alt={`${screenBotName}'s screen`}
+                <svg
+                  width="15"
+                  height="15"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="m6 17 5-5-5-5" />
+                  <path d="m13 17 5-5-5-5" />
+                </svg>
+              </button>
+            </div>
+          )}
+
+          {panelTab === "screen" && (
+            <section className="panel-tab-pane panel-pane-screen">
+              <div className="screen-panel-bar">
+                <span className="screen-panel-identity">
+                  <span
+                    className="screen-panel-dot"
+                    style={{
+                      background:
+                        screenBot?.color ??
+                        avatarColor(screenBot?.id ?? "assistant"),
+                    }}
+                  />
+                  {screenBot && (
+                    <span className="screen-panel-name">
+                      {screenBotName}&rsquo;s
+                    </span>
+                  )}
+                  <span className="screen-panel-title">Computer</span>
+                </span>
+              </div>
+              <section className="screen-view">
+                <div
+                  className={`screen-frame ${
+                    screenExpanded ? "screen-frame-expanded" : ""
+                  }`}
+                  onClick={
+                    canStream && !screenExpanded
+                      ? () => setScreenExpanded(true)
+                      : undefined
+                  }
+                >
+                  {canStream && (
+                    <VncView
+                      url={vncUrl}
+                      active={vncActive}
+                      interactive={screenExpanded}
+                      onState={setVncState}
                     />
-                  ) : (
-                    <div className="screen-empty">
-                      <MonitorIcon />
-                      <span>
-                        {vncState === "down" && screenStatus !== "vm-off"
-                          ? "Desktop stream unavailable — retrying"
-                          : screenMessage}
-                      </span>
+                  )}
+                  {!vncLive && (
+                    <div className="screen-fallback">
+                      {!isLocalBot(screenBot) &&
+                      screenStatus !== "vm-off" &&
+                      screenImageUrl ? (
+                        <img
+                          className="screen-image"
+                          src={screenImageUrl}
+                          alt={`${screenBotName}'s screen`}
+                        />
+                      ) : (
+                        <div className="screen-empty">
+                          <MonitorIcon />
+                          <span>
+                            {vncState === "down" && screenStatus !== "vm-off"
+                              ? "Desktop stream unavailable — retrying"
+                              : screenMessage}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {canStream && !screenExpanded && (
+                    <button
+                      className="screen-open"
+                      onClick={() => setScreenExpanded(true)}
+                    >
+                      <ExpandIcon />
+                      <span>Open</span>
+                    </button>
+                  )}
+                  {canStream && screenExpanded && (
+                    <div className="screen-frame-actions">
+                      <button
+                        className="screen-action"
+                        title="Collapse (Esc)"
+                        aria-label="Collapse desktop view"
+                        onClick={() => setScreenExpanded(false)}
+                      >
+                        <CollapseIcon />
+                      </button>
                     </div>
                   )}
                 </div>
-              )}
-              {canStream && !screenExpanded && (
-                <button
-                  className="screen-open"
-                  onClick={() => setScreenExpanded(true)}
-                >
-                  <ExpandIcon />
-                  <span>Open</span>
-                </button>
-              )}
-              {canStream && screenExpanded && (
-                <div className="screen-frame-actions">
-                  <button
-                    className="screen-action"
-                    title="Collapse (Esc)"
-                    aria-label="Collapse desktop view"
-                    onClick={() => setScreenExpanded(false)}
-                  >
-                    <CollapseIcon />
-                  </button>
+                <div className="screen-caption">
+                  <span className="screen-caption-status">{screenCaption}</span>
+                  {!isLocalBot(screenBot) && (
+                    <button
+                      className="icon-button"
+                      title={
+                        screenPlaying ? "Pause live view" : "Resume live view"
+                      }
+                      aria-label={
+                        screenPlaying ? "Pause live view" : "Resume live view"
+                      }
+                      onClick={() => setScreenPlaying((value) => !value)}
+                    >
+                      {screenPlaying ? <PauseIcon /> : <PlayIcon />}
+                    </button>
+                  )}
                 </div>
-              )}
-            </div>
-            <div className="screen-caption">
-              <span className="screen-caption-status">{screenCaption}</span>
-              {!isLocalBot(screenBot) && (
-                <button
-                  className="icon-button"
-                  title={screenPlaying ? "Pause live view" : "Resume live view"}
-                  aria-label={
-                    screenPlaying ? "Pause live view" : "Resume live view"
-                  }
-                  onClick={() => setScreenPlaying((value) => !value)}
-                >
-                  {screenPlaying ? <PauseIcon /> : <PlayIcon />}
-                </button>
-              )}
-            </div>
-          </section>
+              </section>
+            </section>
+          )}
 
           {!screenExpanded && (
-            <ThreadList
-              rows={threadRows}
-              query={search}
-              searchOpen={searchOpen}
-              onSearchChange={setSearch}
-              onToggleSearch={() =>
-                setSearchOpen((value) => {
-                  if (value) {
-                    setSearch("");
-                  }
-                  return !value;
-                })
-              }
-              onSelect={openThread}
-            />
+            <>
+              <section
+                className="panel-tab-pane"
+                hidden={panelTab !== "files"}
+              >
+                {screenBot && (
+                  <FilesPanel
+                    botId={screenBot.id}
+                    isMac={isLocalBot(screenBot)}
+                    active={panelTab === "files"}
+                    listFiles={daemon.listFiles}
+                    readFile={daemon.readFile}
+                  />
+                )}
+              </section>
+
+              <section
+                className="panel-tab-pane"
+                hidden={panelTab !== "terminal"}
+              >
+                {screenBot && (
+                  <TerminalPanel
+                    botId={screenBot.id}
+                    botName={screenBotName}
+                    canConnect={canStream}
+                    url={terminalUrl}
+                    active={panelTab === "terminal"}
+                  />
+                )}
+              </section>
+            </>
           )}
         </aside>
       )}
@@ -1743,6 +2036,7 @@ export default function App() {
         harness={daemon.harness}
         decision={daemon.decision}
         codex={daemon.codex}
+        chatBusyBehavior={daemon.chatBusyBehavior}
         theme={theme}
         onThemeChange={setTheme}
         onSaveProvider={daemon.saveProvider}
@@ -1761,9 +2055,11 @@ export default function App() {
 
 function MessageBubble({
   message,
+  queued,
   decisions,
 }: {
   message: Message;
+  queued?: boolean;
   decisions?: DecisionActivity[];
 }) {
   const calls = message.toolCalls ?? [];
@@ -1781,6 +2077,7 @@ function MessageBubble({
       <div className="entry entry-user">
         <div className="entry-user-row">
           <div className="entry-body">{message.content}</div>
+          {queued && <span className="queued-badge">Queued</span>}
           <button
             className="bubble-action"
             title="Copy message"

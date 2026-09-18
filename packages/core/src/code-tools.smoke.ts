@@ -13,6 +13,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Bot } from "@openbot/protocol";
+import { listComputerFiles, readComputerFile } from "./files";
 import { findTool, type ToolContext, type ToolExecutionResult } from "./tools";
 
 const workspace = mkdtempSync(join(tmpdir(), "openbot-code-tools-"));
@@ -26,6 +28,7 @@ const context: ToolContext = {
   decision: null,
   vision: false,
   onSandboxState: () => {},
+  readCache: new Map(),
 };
 
 function write(relativePath: string, content: string): void {
@@ -104,6 +107,28 @@ check("read_file honours offset and limit", async () => {
   assert.doesNotMatch(output, /one/);
   assert.doesNotMatch(output, /four/);
   assert.match(output, /offset=4 to continue/);
+});
+
+check("read_file notes an unchanged file instead of repeating it", async () => {
+  write("stable.txt", "one\ntwo\n");
+  const first = await expectOk("read_file", { path: "stable.txt" });
+  assert.match(first, /^1: one$/m);
+  const second = await expectOk("read_file", { path: "stable.txt" });
+  assert.match(second, /unchanged since your earlier read/);
+  const forced = await expectOk("read_file", {
+    path: "stable.txt",
+    force: true,
+  });
+  assert.match(forced, /^1: one$/m);
+});
+
+check("read_file returns changed content again", async () => {
+  write("changing.txt", "before\n");
+  await expectOk("read_file", { path: "changing.txt" });
+  write("changing.txt", "after\n");
+  const output = await expectOk("read_file", { path: "changing.txt" });
+  assert.match(output, /^1: after$/m);
+  assert.doesNotMatch(output, /unchanged/);
 });
 
 check("read_file keeps its paging note on a long file", async () => {
@@ -329,6 +354,99 @@ check("glob skips node_modules", async () => {
 check("glob reports no matches without failing", async () => {
   const output = await expectOk("glob", { pattern: "**/*.zzz" });
   assert.match(output, /No files match/);
+});
+
+// ---------------------------------------------------------------------------
+// list_dir
+// ---------------------------------------------------------------------------
+
+check("list_dir marks directories and file sizes", async () => {
+  write("listing/alpha.txt", "hello");
+  write("listing/sub/beta.txt", "x");
+  const output = await expectOk("list_dir", { path: "listing" });
+  assert.match(output, /^dir  sub\/$/m);
+  assert.match(output, /^file alpha\.txt \(5 bytes\)$/m);
+  assert.doesNotMatch(output, /beta\.txt/);
+});
+
+check("list_dir skips ignored directories and says so", async () => {
+  write("ignored/node_modules/pkg/index.ts", "x\n");
+  write("ignored/keep.txt", "x\n");
+  const output = await expectOk("list_dir", { path: "ignored" });
+  assert.match(output, /keep\.txt/);
+  assert.doesNotMatch(output, /^dir  node_modules\/$/m);
+  assert.match(output, /skipped 1 ignored entry/);
+});
+
+check("list_dir reports a missing directory", async () => {
+  await expectFail("list_dir", { path: "does-not-exist" }, /could not read directory/);
+});
+
+check("list_dir reports an empty directory", async () => {
+  mkdirSync(join(workspace, "empty-dir"), { recursive: true });
+  const output = await expectOk("list_dir", { path: "empty-dir" });
+  assert.match(output, /the directory is empty/);
+});
+
+// ---------------------------------------------------------------------------
+// files (the app's Files tab)
+// ---------------------------------------------------------------------------
+
+const fileOptions = {
+  dataDir: workspace,
+  artifactsDir: join(workspace, "artifacts"),
+  sandbox: null,
+  getBot: (botId: string): Bot | null =>
+    botId === "code-tools-smoke"
+      ? ({ id: botId, computer: "mac" } as Bot)
+      : null,
+};
+
+check("files.list returns entries for the Mac workspace", async () => {
+  write("workspaces/code-tools-smoke/hello.txt", "hi\n");
+  write("workspaces/code-tools-smoke/sub/inner.txt", "x\n");
+  const result = await listComputerFiles(fileOptions, "code-tools-smoke", "");
+  assert.equal(result.error, null);
+  const names = result.entries.map((entry) => entry.name);
+  assert.ok(names.includes("hello.txt"), "the file should be listed");
+  const sub = result.entries.find((entry) => entry.name === "sub");
+  assert.equal(sub?.dir, true);
+});
+
+check("files.read returns text content", async () => {
+  const result = await readComputerFile(
+    fileOptions,
+    "code-tools-smoke",
+    "hello.txt",
+  );
+  assert.equal(result.error, null);
+  assert.equal(result.kind, "text");
+  assert.equal(result.content, "hi\n");
+  assert.equal(result.truncated, false);
+});
+
+check("files.read reports a missing file", async () => {
+  const result = await readComputerFile(
+    fileOptions,
+    "code-tools-smoke",
+    "nope.txt",
+  );
+  assert.equal(result.kind, "missing");
+  assert.match(result.error ?? "", /ENOENT/);
+});
+
+check("files.read rejects a path outside the workspace", async () => {
+  const result = await readComputerFile(
+    fileOptions,
+    "code-tools-smoke",
+    "../../etc/hosts",
+  );
+  assert.match(result.error ?? "", /escapes the bot workspace/);
+});
+
+check("files.list reports an unknown agent", async () => {
+  const result = await listComputerFiles(fileOptions, "missing", "");
+  assert.match(result.error ?? "", /agent not found/);
 });
 
 // ---------------------------------------------------------------------------

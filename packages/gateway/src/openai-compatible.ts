@@ -87,7 +87,10 @@ export function createOpenAICompatibleProvider(
       if (!response.ok || !response.body) {
         const text = await response.text().catch(() => "");
         throw new Error(
-          `provider ${options.id} returned HTTP ${response.status}: ${text.slice(0, 500)}`,
+          `provider ${options.id} returned HTTP ${response.status}: ${text.slice(0, 500)}` +
+            (response.headers.get("retry-after")
+              ? ` (retry-after: ${response.headers.get("retry-after")})`
+              : ""),
         );
       }
 
@@ -184,7 +187,25 @@ function parseUsage(payload: unknown): TokenUsage | null {
   if (typeof input !== "number" || typeof output !== "number") {
     return null;
   }
-  return { inputTokens: input, outputTokens: output };
+  // OpenAI reports cached prompt tokens under prompt_tokens_details; DeepSeek
+  // reports prompt_cache_hit_tokens. Both are billed at a discount, so they
+  // are kept separate from the input total.
+  const details = usage.prompt_tokens_details as
+    | { cached_tokens?: unknown }
+    | undefined;
+  const cacheRead =
+    typeof details?.cached_tokens === "number"
+      ? details.cached_tokens
+      : typeof usage.prompt_cache_hit_tokens === "number"
+        ? usage.prompt_cache_hit_tokens
+        : undefined;
+  return {
+    inputTokens: input,
+    outputTokens: output,
+    ...(cacheRead !== undefined && cacheRead > 0
+      ? { cacheReadTokens: cacheRead }
+      : {}),
+  };
 }
 
 async function* parseSSE(

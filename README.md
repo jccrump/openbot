@@ -154,10 +154,15 @@ Ask the agent something that requires its computer — "what OS are you running
 on?" or "open Hacker News and take a screenshot". The agent streams its reply,
 the app shows a tool card, and execution pauses on an **Approval needed** card
 with the exact command and Approve/Deny buttons. Approved browser screenshots
-appear in the chat, while the screen panel on the right shows the live desktop
-and falls back to the latest captured screenshot if VNC is unavailable. A
-toggle in Settings turns the approval gate off for trusted work (local-Mac
-tools always ask).
+appear in the chat. The agent panel on the right has three tabs — **Screen**
+(the live desktop, connected only while that tab is open, with the latest
+captured screenshot as fallback), **Files** (browse the agent's computer and
+preview text or image files; on This Mac it is confined to the agent's
+workspace), and **Terminal** (an interactive shell in the agent's microVM with
+a real PTY, so `vim`, `top`, and REPLs work). The thread rail on the left lists
+project managers and their workers, each manager expandable to show its
+workers. A toggle in Settings turns the approval gate off for trusted work
+(local-Mac tools always ask).
 
 OpenBot keeps the live desktop connection warm while its window is unfocused,
 but holds framebuffer update requests and disables input until the window is
@@ -202,9 +207,22 @@ when the Codex CLI is on `PATH`.
   animation, elapsed time, and action count while it runs — that expands to the
   chronological list of tool calls, approvals, thinking, and Jev decisions
   behind the final answer.
+- **Messages sent mid-turn** either **steer** the running turn — folded in at
+  its next step so the model can change course without losing completed tool
+  work — or **queue** and send automatically when the agent stops. The default
+  lives in Settings → General, and the composer switches it per message while
+  the agent is working; queued bubbles are labeled until their turn starts.
 - **Providers** as user data: add/edit/remove/enable, presets for nine
   providers, "fetch models" from any OpenAI-compatible `/models` endpoint, and
   live rebuilds without restarting the daemon.
+- **Agent panel** on the right with Screen, Files, and Terminal tabs. Screen is
+  the on-demand live desktop (noVNC connects only while that tab is open, and
+  it falls back to the latest captured screenshot). Files browses the agent's
+  computer — breadcrumbs, sizes and dates, and a text or image preview — using
+  the same workspace confinement as the file tools on This Mac. Terminal is an
+  interactive PTY-backed shell in the microVM, with resize, reconnect, and a
+  session that survives tab switches. A thread rail on the left lists project
+  managers and their workers, with a disclosure control per manager.
 - **Agents**: create with name/role/avatar/color/model/computer, single thread
   per agent, and a centered **agent settings** modal from the gear button on
   each sidebar row. The modal edits the name, role, icon, and color, switches
@@ -214,9 +232,14 @@ when the Codex CLI is on `PATH`.
   deletes the chat history and workspace and rebuilds the computer from the
   base image, then boots it again.
 - **Firecracker computers**: one microVM per agent with a versioned rootfs,
-  persistent agent files and a per-agent Chromium profile, plus `shell`, `read_file`,
-  `write_file`, a `browser` tool (goto, click, type, text, links, screenshot,
-  back, wait), a `desktop` tool that drives the live desktop itself (screenshot,
+  persistent agent files and a per-agent Chromium profile, plus `shell`,
+  `read_file`, `write_file`, `edit`, `grep`, `glob`, `list_dir`, and
+  `update_plan` (a short working plan that persists on the thread and is
+  re-injected on later turns), a
+  `browser` tool (goto, click, type, press, select, upload, text, links,
+  snapshot, scroll, screenshot, back, wait, wait_for, tabs, and downloads,
+  which copies anything the page saved into `/root/Downloads`), a `desktop`
+  tool that drives the live desktop itself (screenshot,
   move, click, double click, click-and-drag, scroll, type, key, wait, window
   list and activation), and a `browse` tool that drives multi-page research
   itself when Jev is enabled. The pointer is drawn into desktop screenshots and
@@ -225,9 +248,19 @@ when the Codex CLI is on `PATH`.
   evidence without a separate read after every navigation. When a site serves a
   Cloudflare/Turnstile bot check, the agent waits briefly for it to clear, then
   stops retrying and asks you to complete the check once in the live screen
-  panel; the persistent profile keeps the clearance for later runs.
+  panel; the persistent profile keeps the clearance for later runs. `shell`
+  can start a server or long build with `background: true`, returning a pid and
+  log file instead of holding the call open, and every browser session records
+  a HAR network trace at `/var/lib/fc/vms/<id>/network.har` (host endpoint
+  `GET /vms/<id>/network`) for auditing or offline grading.
 - **Local-Mac computers**: shell as your user and file tools confined to the
   agent's workspace, always approval-gated.
+- **Host-side web search**: a `web_search` tool queries the live web through
+  Exa (keyless) or Parallel and returns page content with titles and URLs for
+  citation. It runs in the daemon, not the microVM, so it works on any
+  computer — including This Mac, where the browser tools are unavailable.
+  `EXA_API_KEY`/`PARALLEL_API_KEY` are optional and
+  `OPENBOT_WEBSEARCH_PROVIDER` forces the provider.
 - **Approvals** for every tool call, with approve/deny cards and denied actions
   reported back to the model.
 - **Live shared browser desktop** through Xvfb, Openbox, x11vnc, and noVNC.
@@ -327,8 +360,10 @@ Be honest with yourself about the following before filing issues:
   model when Jev is off, unauthenticated, borderline, or erroring.
 - **The browser and desktop tools only work on the microVM computer.** On This
   Mac they return a clear error.
-- **No per-bot egress allowlists.** Every microVM shares the host NAT; there is
-  no firewall policy per agent.
+- **Shell egress enforcement is allowlist-only.** A `deny` egress policy is
+  enforced with nftables on the agent's tap for its own commands; `ask` mode
+  still applies to browser navigations only, DNS is allowed to the image's
+  resolvers, and This Mac commands are never filtered.
 - **Browser, desktop, and compute isolation are split.** Shell and file tools
   run in the per-agent Firecracker microVM. Chromium and the desktop
   (Xvfb, Openbox, xterm, Thunar, driven by xdotool for the model) run in the

@@ -246,6 +246,157 @@ async function readDevToolsActivePort(deadline) {
 // ---------------------------------------------------------------------------
 
 let harnessModule = null;
+// The page target the action session is attached to, so tab actions can name
+// and switch the active tab. One browser daemon serves one bot.
+let activePageTargetId = null;
+
+// ---------------------------------------------------------------------------
+// Network trace (HAR). Every page request the action session makes is recorded
+// to the bot's network.har so a run can be audited or graded offline. The
+// file is rewritten on a short debounce and capped, so a long session cannot
+// grow without bound.
+// ---------------------------------------------------------------------------
+
+const HAR_PATH = process.env.OPENBOT_BROWSER_HAR || "";
+const HAR_MAX_ENTRIES = 2_000;
+
+function harHeaders(headers) {
+  return Object.entries(headers || {}).map(([name, value]) => ({
+    name,
+    value: String(value),
+  }));
+}
+
+function createHarRecorder() {
+  if (!HAR_PATH) {
+    return null;
+  }
+  const entries = new Map();
+  const order = [];
+  let flushTimer = null;
+  const flush = () => {
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+    try {
+      const payload = {
+        log: {
+          version: "1.2",
+          creator: { name: "openbot-browser", version: "1.0" },
+          entries: order.map((id) => entries.get(id)).filter(Boolean),
+        },
+      };
+      fs.writeFileSync(HAR_PATH, JSON.stringify(payload));
+    } catch (error) {
+      log(`har write failed: ${error && error.message ? error.message : error}`);
+    }
+  };
+  const scheduleFlush = () => {
+    if (!flushTimer) {
+      flushTimer = setTimeout(flush, 1_000);
+    }
+  };
+  return {
+    flush,
+    onEvent(method, params) {
+      const requestId = params && params.requestId;
+      if (typeof requestId !== "string") {
+        return;
+      }
+      if (method === "Network.requestWillBeSent") {
+        const request = params.request || {};
+        entries.set(requestId, {
+          startedDateTime: new Date().toISOString(),
+          time: 0,
+          request: {
+            method: request.method || "GET",
+            url: request.url || "",
+            httpVersion: "HTTP/1.1",
+            headers: harHeaders(request.headers),
+            queryString: [],
+            cookies: [],
+            headersSize: -1,
+            bodySize:
+              typeof request.postData === "string"
+                ? request.postData.length
+                : -1,
+          },
+          response: {
+            status: 0,
+            statusText: "",
+            httpVersion: "HTTP/1.1",
+            headers: [],
+            cookies: [],
+            content: { size: 0, mimeType: "" },
+            redirectURL: "",
+            headersSize: -1,
+            bodySize: -1,
+          },
+          cache: {},
+          timings: { send: 0, wait: 0, receive: 0 },
+          startedAt: Date.now(),
+        });
+        order.push(requestId);
+        if (order.length > HAR_MAX_ENTRIES) {
+          entries.delete(order.shift());
+        }
+        scheduleFlush();
+        return;
+      }
+      const entry = entries.get(requestId);
+      if (!entry) {
+        return;
+      }
+      if (method === "Network.responseReceived") {
+        const response = params.response || {};
+        entry.response.status = response.status || 0;
+        entry.response.statusText = response.statusText || "";
+        entry.response.headers = harHeaders(response.headers);
+        entry.response.content.mimeType = response.mimeType || "";
+        scheduleFlush();
+      } else if (method === "Network.loadingFinished") {
+        entry.time = Date.now() - entry.startedAt;
+        entry.response.content.size = params.encodedDataLength || 0;
+        scheduleFlush();
+      } else if (method === "Network.loadingFailed") {
+        entry.time = Date.now() - entry.startedAt;
+        entry.response.statusText = params.errorText || "failed";
+        scheduleFlush();
+      }
+    },
+  };
+}
+
+function attachHarRecorder(session) {
+  const recorder = createHarRecorder();
+  if (!recorder) {
+    return null;
+  }
+  session.onEvent((method, params) => recorder.onEvent(method, params));
+  session.domains.Network.enable({}).catch(() => {
+    // Capture is best effort; the browser works without the trace.
+  });
+  return recorder;
+}
+
+// Downloads land in the bot's host-side download directory; the host service
+// copies them into the microVM when the model asks for them.
+function configureDownloads(session) {
+  const downloadPath = process.env.OPENBOT_BROWSER_DOWNLOADS || "";
+  if (!downloadPath) {
+    return;
+  }
+  session.domains.Browser.setDownloadBehavior({
+    behavior: "allow",
+    downloadPath,
+    eventsEnabled: true,
+  }).catch((error) => {
+    log(
+      `download setup failed: ${error && error.message ? error.message : error}`,
+    );
+  });
+}
 async function loadHarness() {
   if (!harnessModule) {
     harnessModule = await import("./browser-harness.mjs");
@@ -275,6 +426,18 @@ async function evaluate(session, expression) {
     awaitPromise: true,
   });
   return evaluateValue(response);
+}
+
+// File inputs need the element's remote object handle, not a by-value result,
+// so the CDP DOM domain can attach files to it.
+async function resolveElementObjectId(session, selector) {
+  const response = await session.domains.Runtime.evaluate({
+    expression:
+      `(() => { ${ELEMENT_HELPERS} return resolveOpenbotElement(${JSON.stringify(selector)}); })()`,
+    returnByValue: false,
+    awaitPromise: true,
+  });
+  return response?.result?.objectId ?? null;
 }
 
 async function pageInfo(session) {
@@ -504,6 +667,77 @@ async function pressEnter(session) {
   await session.domains.Input.dispatchKeyEvent({ type: "keyUp", ...base });
 }
 
+const KEY_DEFINITIONS = {
+  Enter: { code: "Enter", keyCode: 13, text: "\r" },
+  Tab: { code: "Tab", keyCode: 9, text: "\t" },
+  Escape: { code: "Escape", keyCode: 27 },
+  Backspace: { code: "Backspace", keyCode: 8 },
+  Delete: { code: "Delete", keyCode: 46 },
+  ArrowUp: { code: "ArrowUp", keyCode: 38 },
+  ArrowDown: { code: "ArrowDown", keyCode: 40 },
+  ArrowLeft: { code: "ArrowLeft", keyCode: 37 },
+  ArrowRight: { code: "ArrowRight", keyCode: 39 },
+  Home: { code: "Home", keyCode: 36 },
+  End: { code: "End", keyCode: 35 },
+  PageUp: { code: "PageUp", keyCode: 33 },
+  PageDown: { code: "PageDown", keyCode: 34 },
+  Space: { code: "Space", keyCode: 32, text: " " },
+};
+
+// CDP modifier bitmask: Alt=1, Control=2, Meta=4, Shift=8.
+const MODIFIER_KEY_BITS = { Alt: 1, Control: 2, Meta: 4, Shift: 8 };
+
+async function pressKey(session, key) {
+  const parts = String(key ?? "")
+    .split("+")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length === 0) {
+    throw new Error("press requires key");
+  }
+  let modifiers = 0;
+  for (const part of parts.slice(0, -1)) {
+    const bit = MODIFIER_KEY_BITS[part];
+    if (!bit) {
+      throw new Error(`unsupported modifier: ${part}`);
+    }
+    modifiers |= bit;
+  }
+  const name = parts[parts.length - 1];
+  const known = KEY_DEFINITIONS[name];
+  const single = !known && /^[a-zA-Z0-9]$/.test(name);
+  const definition =
+    known ??
+    (single
+      ? {
+          code: /[0-9]/.test(name)
+            ? `Digit${name}`
+            : `Key${name.toUpperCase()}`,
+          keyCode: name.toUpperCase().charCodeAt(0),
+          text: name,
+        }
+      : null);
+  if (!definition) {
+    throw new Error(`unsupported key: ${name}`);
+  }
+  const base = {
+    key: name,
+    code: definition.code,
+    windowsVirtualKeyCode: definition.keyCode,
+    nativeVirtualKeyCode: definition.keyCode,
+    modifiers,
+  };
+  await session.domains.Input.dispatchKeyEvent({ type: "rawKeyDown", ...base });
+  if (definition.text && modifiers === 0) {
+    await session.domains.Input.dispatchKeyEvent({
+      type: "char",
+      text: definition.text,
+      ...base,
+    });
+  }
+  await session.domains.Input.dispatchKeyEvent({ type: "keyUp", ...base });
+}
+
 async function scrollBy(session, dy) {
   const viewport = await evaluate(
     session,
@@ -710,6 +944,91 @@ async function runAction(session, action) {
       }
       return pageState();
     }
+    case "press": {
+      if (!action.key) {
+        throw new Error("press requires key");
+      }
+      if (action.selector) {
+        const focused = await evaluate(
+          session,
+          `(() => { ${ELEMENT_HELPERS} const element = resolveOpenbotElement(${JSON.stringify(action.selector)});`
+            + " if (!element) { return false; }"
+            + " element.scrollIntoView({ block: 'center', inline: 'center' });"
+            + " element.focus();"
+            + " return true; })()",
+        );
+        if (!focused) {
+          throw new Error(`element not found: ${action.selector}`);
+        }
+      }
+      await pressKey(session, action.key);
+      await waitForSettledContent(session);
+      return pageState();
+    }
+    case "select": {
+      if (!action.selector) {
+        throw new Error("select requires selector");
+      }
+      const option = String(action.option ?? "");
+      if (!option) {
+        throw new Error("select requires option");
+      }
+      const selected = await evaluate(
+        session,
+        `(() => { ${ELEMENT_HELPERS} const element = resolveOpenbotElement(${JSON.stringify(action.selector)});`
+          + " if (!element) { return 'missing'; }"
+          + " if (element.tagName !== 'SELECT') { return 'not-select'; }"
+          + ` const wanted = ${JSON.stringify(option)};`
+          + " const options = Array.from(element.options || []);"
+          + " const match = options.find((entry) => entry.value === wanted)"
+          + "   || options.find((entry) => (entry.textContent || '').trim() === wanted);"
+          + " if (!match) { return 'no-option'; }"
+          + " element.value = match.value;"
+          + " element.dispatchEvent(new Event('input', { bubbles: true }));"
+          + " element.dispatchEvent(new Event('change', { bubbles: true }));"
+          + " return 'ok'; })()",
+      );
+      if (selected !== "ok") {
+        throw new Error(
+          selected === "missing"
+            ? `element not found: ${action.selector}`
+            : selected === "not-select"
+              ? `not a select element: ${action.selector}`
+              : `option not found: ${option}`,
+        );
+      }
+      await waitForSettledContent(session);
+      return pageState();
+    }
+    case "wait_for": {
+      const timeout = Number.isFinite(action.timeoutMs)
+        ? Math.min(Math.max(action.timeoutMs, 500), 60_000)
+        : SELECTOR_TIMEOUT_MS;
+      if (action.selector) {
+        await waitForSelector(session, action.selector, timeout);
+      } else if (action.text) {
+        const deadline = Date.now() + timeout;
+        for (;;) {
+          const found = await evaluate(
+            session,
+            "(() => { const body = document.body;"
+              + ` return Boolean(body && (body.innerText || '').includes(${JSON.stringify(action.text)})); })()`,
+          );
+          if (found) {
+            break;
+          }
+          if (Date.now() >= deadline) {
+            throw new Error(
+              `text not found within ${timeout}ms: ${action.text}`,
+            );
+          }
+          await sleep(250);
+        }
+      } else {
+        throw new Error("wait_for requires selector or text");
+      }
+      return pageState();
+    }
     case "scroll": {
       if (action.selector) {
         await scrollSelectorIntoView(session, action.selector);
@@ -863,6 +1182,99 @@ async function runAction(session, action) {
         screenshot: await takeScreenshot(session),
       };
     }
+    case "upload": {
+      if (!action.selector) {
+        throw new Error("upload requires selector");
+      }
+      const files = Array.isArray(action.files)
+        ? action.files.filter((file) => typeof file === "string" && file)
+        : [];
+      if (files.length === 0) {
+        throw new Error("upload requires files");
+      }
+      const objectId = await resolveElementObjectId(session, action.selector);
+      if (!objectId) {
+        throw new Error(`element not found: ${action.selector}`);
+      }
+      await session.domains.DOM.setFileInputFiles({ files, objectId });
+      await waitForSettledContent(session);
+      return pageState();
+    }
+    case "tabs": {
+      const { targetInfos } = await session.domains.Target.getTargets({});
+      const pages = (targetInfos ?? []).filter(
+        (target) => target.type === "page",
+      );
+      const info = await pageInfo(session);
+      return {
+        url: info.url,
+        title: info.title,
+        text:
+          pages
+            .map(
+              (target, index) =>
+                `${index + 1}. ${target.title || "(untitled)"} — ${target.url}` +
+                (target.targetId === activePageTargetId ? "  [active]" : ""),
+            )
+            .join("\n") || "(no tabs)",
+      };
+    }
+    case "new_tab": {
+      const created = await session.domains.Target.createTarget({
+        url: action.url || "about:blank",
+      });
+      if (!created?.targetId) {
+        throw new Error("could not open a new tab");
+      }
+      await session.use(created.targetId);
+      activePageTargetId = created.targetId;
+      await waitForSettledContent(session);
+      return pageState();
+    }
+    case "switch_tab": {
+      const requested = Number.isInteger(action.index) ? action.index - 1 : -1;
+      const { targetInfos } = await session.domains.Target.getTargets({});
+      const pages = (targetInfos ?? []).filter(
+        (target) => target.type === "page",
+      );
+      const target = pages[requested];
+      if (!target) {
+        throw new Error(
+          `tab ${action.index ?? 0} does not exist (${pages.length} open)`,
+        );
+      }
+      await session.use(target.targetId);
+      activePageTargetId = target.targetId;
+      await waitForSettledContent(session);
+      return pageState();
+    }
+    case "close_tab": {
+      const { targetInfos } = await session.domains.Target.getTargets({});
+      const pages = (targetInfos ?? []).filter(
+        (target) => target.type === "page",
+      );
+      const target =
+        pages.find((entry) => entry.targetId === activePageTargetId) ?? pages[0];
+      if (!target) {
+        throw new Error("there are no tabs to close");
+      }
+      await session.domains.Target.closeTarget({ targetId: target.targetId });
+      const remaining = pages.filter(
+        (entry) => entry.targetId !== target.targetId,
+      );
+      if (remaining[0]) {
+        await session.use(remaining[0].targetId);
+        activePageTargetId = remaining[0].targetId;
+        await waitForSettledContent(session);
+        return pageState();
+      }
+      activePageTargetId = null;
+      return {
+        url: "",
+        title: "",
+        text: "closed the last tab; the next action opens a new one",
+      };
+    }
     default:
       throw new Error(`unknown action: ${action.action}`);
   }
@@ -879,6 +1291,12 @@ async function serve() {
   let opening = null;
   let execRunner = null;
   let actionSession = null;
+  let actionHar = null;
+  process.on("exit", () => {
+    if (actionHar) {
+      actionHar.flush();
+    }
+  });
 
   const runExec = async (action) => {
     const current = await getSession();
@@ -919,9 +1337,14 @@ async function serve() {
         ) ?? pages[0];
       if (page) {
         await actionSession.use(page.targetId);
+        activePageTargetId = page.targetId;
       } else {
         throw new Error("browser has no page target to attach to");
       }
+    }
+    if (!actionHar) {
+      actionHar = attachHarRecorder(actionSession);
+      configureDownloads(actionSession);
     }
     return actionSession;
   };
@@ -995,8 +1418,23 @@ async function serve() {
               response = { ok: true, ...(await runExec(action)) };
             } else {
               const current = await getActionSession();
-              const result = await performAction(current, action);
-              response = { ok: true, ...result };
+              // A configured egress policy is enforced at the network level for
+              // the whole action, covering subresources and XHR/fetch. If the
+              // guard cannot install, the action fails rather than running
+              // without the policy.
+              const guard =
+                action.egress && typeof action.egress === "object"
+                  ? await startNetworkGuard(current, action.egress)
+                  : null;
+              let result;
+              try {
+                result = await performAction(current, action);
+              } finally {
+                if (guard) {
+                  await guard.stop();
+                }
+              }
+              response = actionResponse(result, guard);
             }
           } catch (error) {
             const message = error && error.message ? error.message : String(error);
@@ -1069,6 +1507,94 @@ function callDaemon(payload, waitMs = 30_000) {
   });
 }
 
+/**
+ * Network-level egress guard for action runs: while an action executes with an
+ * egress policy, every request the page makes is paused and either continued or
+ * failed against the allowlist. This covers subresources, XHR/fetch, and
+ * navigations, not only the top-level URL the daemon can see. The guard is
+ * torn down when the action ends.
+ */
+async function startNetworkGuard(session, egress) {
+  const allowed = (url) => {
+    let host = "";
+    try {
+      host = new URL(url).hostname;
+    } catch {
+      return true;
+    }
+    if (!host) {
+      return true;
+    }
+    const wanted = host.toLowerCase();
+    return egress.allow.some((entry) => {
+      const suffix = String(entry).toLowerCase().replace(/^\./, "");
+      return wanted === suffix || wanted.endsWith(`.${suffix}`);
+    });
+  };
+  const blockedHosts = new Set();
+  const unsubscribe = session.onEvent((method, params) => {
+    if (method !== "Fetch.requestPaused") {
+      return;
+    }
+    const paused = params || {};
+    if (typeof paused.requestId !== "string") {
+      return;
+    }
+    const url = paused.request?.url || "";
+    const permitted = allowed(url);
+    if (!permitted) {
+      try {
+        blockedHosts.add(new URL(url).hostname);
+      } catch {
+        blockedHosts.add(url);
+      }
+    }
+    const call = permitted
+      ? session.domains.Fetch.continueRequest({ requestId: paused.requestId })
+      : session.domains.Fetch.failRequest({
+          requestId: paused.requestId,
+          errorReason: "AccessDenied",
+        });
+    call.catch(() => {
+      // The request may already be gone (aborted navigation, closed tab).
+    });
+  });
+  await session.domains.Fetch.enable({
+    patterns: [{ urlPattern: "*", requestStage: "Request" }],
+  });
+  return {
+    blockedHosts,
+    stop: async () => {
+      unsubscribe();
+      await session.domains.Fetch.disable().catch(() => {});
+    },
+  };
+}
+
+/**
+ * A guard that blocked the main navigation leaves Chromium on an error page;
+ * report that as a failed action with the policy reason so the model does not
+ * treat it as a dead site. Blocked subresources on an otherwise good page are
+ * reported as `egressBlocked` for the tool to surface.
+ */
+function actionResponse(result, guard) {
+  const blocked =
+    guard && guard.blockedHosts.size ? [...guard.blockedHosts] : null;
+  if (blocked && String(result?.url ?? "").startsWith("chrome-error://")) {
+    return {
+      ok: false,
+      error:
+        `Blocked by the approvals policy: ${blocked.join(", ")} ` +
+        "is not in the browser egress allowlist. Do not retry it.",
+    };
+  }
+  return {
+    ok: true,
+    ...result,
+    ...(blocked ? { egressBlocked: blocked } : {}),
+  };
+}
+
 async function runInline(payload) {
   const browser = await launchBrowser();
   try {
@@ -1090,6 +1616,7 @@ async function runInline(payload) {
       }
     }
     const session = new harness.Session();
+    let har = null;
     try {
       await session.connect({ wsUrl: browser.wsUrl });
       const { targetInfos } = await session.domains.Target.getTargets({});
@@ -1101,10 +1628,30 @@ async function runInline(payload) {
       );
       if (page) {
         await session.use(page.targetId);
+        activePageTargetId = page.targetId;
       }
-      const result = await performAction(session, payload);
-      return { ok: true, ...result };
+      har = attachHarRecorder(session);
+      configureDownloads(session);
+      // A configured egress policy is enforced at the network level for the
+      // whole action. If the guard cannot install, the action fails rather
+      // than running without the policy.
+      const guard =
+        payload.egress && typeof payload.egress === "object"
+          ? await startNetworkGuard(session, payload.egress)
+          : null;
+      let result;
+      try {
+        result = await performAction(session, payload);
+      } finally {
+        if (guard) {
+          await guard.stop();
+        }
+      }
+      return actionResponse(result, guard);
     } finally {
+      if (har) {
+        har.flush();
+      }
       session.close();
     }
   } catch (error) {

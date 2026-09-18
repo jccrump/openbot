@@ -142,6 +142,7 @@ export type ToolCallRecord = z.infer<typeof ToolCallRecordSchema>;
 export const TokenUsageSchema = z.object({
   inputTokens: z.number(),
   outputTokens: z.number(),
+  cacheReadTokens: z.number().optional(),
 });
 export type TokenUsage = z.infer<typeof TokenUsageSchema>;
 
@@ -165,6 +166,9 @@ export type CompactionSettings = z.infer<typeof CompactionSettingsSchema>;
 
 export const HarnessIdSchema = z.enum(["openbot", "codex"]);
 export type HarnessId = z.infer<typeof HarnessIdSchema>;
+
+export const ChatBusyBehaviorSchema = z.enum(["steer", "queue"]);
+export type ChatBusyBehavior = z.infer<typeof ChatBusyBehaviorSchema>;
 
 export const HarnessSettingsSchema = z.object({
   default: HarnessIdSchema,
@@ -227,6 +231,12 @@ export const MessageSchema = z.object({
 });
 export type Message = z.infer<typeof MessageSchema>;
 
+export const PlanStepSchema = z.object({
+  step: z.string(),
+  status: z.enum(["pending", "in_progress", "done"]),
+});
+export type PlanStep = z.infer<typeof PlanStepSchema>;
+
 export const ThreadSchema = z.object({
   id: z.string(),
   botId: z.string(),
@@ -234,6 +244,7 @@ export const ThreadSchema = z.object({
   lastMessage: z.string().nullable(),
   lastCompactedAt: z.string().nullable().optional(),
   compactionCount: z.number().optional(),
+  plan: z.array(PlanStepSchema).nullable().optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
 });

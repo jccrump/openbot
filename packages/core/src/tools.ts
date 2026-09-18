@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +7,7 @@ import { choice } from "@openbot/gateway";
 import type {
   ComputerKind,
   ModelRef,
+  PlanStep,
   PolicySettings,
   ReasoningEffort,
   TaskDisplay,
@@ -43,6 +44,12 @@ import {
 } from "./local-computer";
 import { BROWSER_SKILLS_B64 } from "./skills.generated";
 import { CODE_TOOLS_SOURCE } from "./code-tools.generated";
+import {
+  runWebSearch,
+  selectWebSearchProvider,
+  webSearchProviderLabel,
+  WEB_SEARCH_DEFAULT_RESULTS,
+} from "./websearch";
 
 const MAX_OUTPUT = 30_000;
 const MAX_TIMEOUT_SECONDS = 300;
@@ -90,6 +97,10 @@ export interface ToolContext {
   memory?: MemoryService | null;
   soul?: SoulService | null;
   memoryScope?: string;
+  /** Persist the thread's working plan (the update_plan tool). */
+  updatePlan?: (plan: PlanStep[]) => void;
+  /** Content hashes of files read this turn, keyed by path+window. */
+  readCache?: Map<string, string>;
 }
 
 export interface RoleSummary {
@@ -336,6 +347,65 @@ async function ensureGuestWorkspace(
   return task;
 }
 
+const SPILL_DIR = "/root/.openbot-spill";
+
+/**
+ * When a command's transcript is longer than the model can read in one tool
+ * result, keep the whole thing in the computer's filesystem and hand back the
+ * path: nothing is lost and the model can page through it with read_file.
+ */
+async function spillOutput(
+  context: ToolContext,
+  result: { exit: number; stdout: string; stderr: string },
+): Promise<string | null> {
+  const name = `spill-${Date.now()}-${randomUUID().slice(0, 8)}.txt`;
+  const body =
+    `exit code: ${result.exit}\n` +
+    `--- stdout ---\n${result.stdout}\n--- stderr ---\n${result.stderr}\n`;
+  try {
+    if (context.computer === "mac") {
+      ensureWorkspace(context.workspaceDir);
+      const dir = join(context.workspaceDir, ".openbot-spill");
+      mkdirSync(dir, { recursive: true });
+      const file = join(dir, name);
+      writeFileSync(file, body, "utf8");
+      return file;
+    }
+    const sandbox = context.sandbox;
+    if (!sandbox) {
+      return null;
+    }
+    const target = `${SPILL_DIR}/${name}`;
+    const encoded = Buffer.from(body, "utf8").toString("base64");
+    const written = await sandbox.exec(sandboxId(context), {
+      command:
+        `mkdir -p ${shellQuote(SPILL_DIR)} && ` +
+        `printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(target)}`,
+      cwd: "/",
+      timeoutMs: 15_000,
+    });
+    return written.exit === 0 ? target : null;
+  } catch (error) {
+    console.warn(`could not spill output: ${(error as Error).message}`);
+    return null;
+  }
+}
+
+async function formatWithSpill(
+  context: ToolContext,
+  result: { exit: number; stdout: string; stderr: string },
+): Promise<string> {
+  const formatted = formatExecResult(result);
+  if (formatted.length <= MAX_OUTPUT) {
+    return formatted;
+  }
+  const path = await spillOutput(context, result);
+  const note = path
+    ? `\n[output truncated at ${MAX_OUTPUT} characters; the full output is saved at ${path} — read it with read_file]`
+    : `\n[output truncated at ${MAX_OUTPUT} characters]`;
+  return `${formatted.slice(0, MAX_OUTPUT)}${note}`;
+}
+
 async function runCommand(
   context: ToolContext,
   command: string,
@@ -355,7 +425,7 @@ async function runCommand(
       timeoutSeconds * 1000,
     );
     return localResult(
-      truncate(formatExecResult(result)),
+      await formatWithSpill(context, result),
       result.exit === 0,
       Date.now() - startedAt,
     );
@@ -376,12 +446,12 @@ async function runCommand(
   });
   return {
     ok: result.exit === 0,
-    output: truncate(formatExecResult(result)),
+    output: await formatWithSpill(context, result),
     durationMs: Date.now() - startedAt,
   };
 }
 
-interface RawExecResult {
+export interface RawExecResult {
   exit: number;
   stdout: string;
   stderr: string;
@@ -484,7 +554,7 @@ const codeToolHelpers = new Map<string, Promise<string>>();
  * One copy per computer, best effort: a failure here surfaces as a tool error
  * rather than being cached as broken.
  */
-async function ensureCodeToolHelper(
+export async function ensureCodeToolHelper(
   context: ToolContext,
   sandbox: SandboxBackend | null,
 ): Promise<string> {
@@ -527,7 +597,7 @@ async function ensureCodeToolHelper(
 }
 
 /** Run the bundled helper in the agent's computer and return its stdout. */
-async function runCodeToolHelper(
+export async function runCodeToolHelper(
   context: ToolContext,
   payload: Record<string, unknown>,
   timeoutSeconds: number,
@@ -648,6 +718,71 @@ function readCwd(args: Record<string, unknown>, fallback: string): string {
   return typeof args.cwd === "string" && args.cwd ? args.cwd : fallback;
 }
 
+/**
+ * Start a command detached with its output in a log file, so servers, watchers,
+ * and builds that outlive the 300s command cap keep running. The wrapper
+ * redirects the standard streams, or the guest's output pump would wait on the
+ * background child forever.
+ */
+async function runBackgroundCommand(
+  context: ToolContext,
+  command: string,
+  cwd: string,
+  timeoutSeconds: number,
+): Promise<ToolExecutionResult> {
+  const startedAt = Date.now();
+  const name = `bg-${Date.now()}-${randomUUID().slice(0, 8)}.log`;
+  const wrapper = (dir: string, log: string) =>
+    `mkdir -p ${shellQuote(dir)} && { ` +
+    `nohup bash -c ${shellQuote(command)} > ${shellQuote(log)} 2>&1 < /dev/null & ` +
+    `echo $!; }`;
+
+  if (context.computer === "mac") {
+    const workspace = ensureWorkspace(context.workspaceDir);
+    const resolvedCwd = resolveLocalCwd(workspace, cwd || workspace);
+    if (resolvedCwd.error || !resolvedCwd.path) {
+      return localResult(resolvedCwd.error ?? "invalid cwd", false, 0);
+    }
+    const dir = join(workspace, ".openbot-logs");
+    const log = join(dir, name);
+    const result = await execLocal(
+      wrapper(dir, log),
+      resolvedCwd.path,
+      Math.max(timeoutSeconds, 30) * 1000,
+    );
+    const pid = result.stdout.trim().split("\n").pop()?.trim() ?? "";
+    return localResult(
+      `started in the background (pid ${pid}).\n` +
+        `log: ${log}\n` +
+        `check it with: tail -n 50 ${shellQuote(log)}; stop it with: kill ${pid}`,
+      result.exit === 0,
+      Date.now() - startedAt,
+    );
+  }
+
+  const sandbox = context.sandbox;
+  if (!sandbox) {
+    return { ok: false, output: "sandbox is not available", durationMs: 0 };
+  }
+  await ensureGuestWorkspace(context, sandbox);
+  const dir = "/root/.openbot-logs";
+  const log = `${dir}/${name}`;
+  const result = await sandbox.exec(sandboxId(context), {
+    command: wrapper(dir, log),
+    cwd: cwd || context.guestCwd,
+    timeoutMs: Math.max(timeoutSeconds, 30) * 1000,
+  });
+  const pid = result.stdout.trim().split("\n").pop()?.trim() ?? "";
+  return {
+    ok: result.exit === 0,
+    output:
+      `started in the background (pid ${pid}).\n` +
+      `log: ${log}\n` +
+      `check it with: tail -n 50 ${log}; stop it with: kill ${pid}`,
+    durationMs: Date.now() - startedAt,
+  };
+}
+
 const shellTool: Tool = {
   definition: {
     name: "shell",
@@ -660,8 +795,9 @@ const shellTool: Tool = {
       "the microVM filesystem, not the desktop: the terminal, file manager, and " +
       "browser windows on the screen belong to a separate display host, so " +
       "installing a GUI app here does not add it to the desktop. Long commands " +
-      "are allowed (up to 300 seconds); use a generous timeout for package " +
-      "installs or builds instead of backgrounding and polling.",
+      "are allowed (up to 300 seconds). For a server, watcher, or build that " +
+      "must outlive the call, set background=true: it returns immediately with " +
+      "a log file and pid, and the process keeps running.",
     parameters: {
       type: "object",
       properties: {
@@ -674,6 +810,11 @@ const shellTool: Tool = {
           type: "number",
           description: "Timeout in seconds (default 60, max 300).",
         },
+        background: {
+          type: "boolean",
+          description:
+            "Start the command detached and return its pid and log file.",
+        },
       },
       required: ["command"],
     },
@@ -684,12 +825,12 @@ const shellTool: Tool = {
       return { ok: false, output: "command is required", durationMs: 0 };
     }
     const fallback = context.computer === "mac" ? context.workspaceDir : "/root";
-    return runCommand(
-      context,
-      command,
-      readCwd(args, fallback),
-      readTimeout(args),
-    );
+    const cwd = readCwd(args, fallback);
+    const timeoutSeconds = readTimeout(args);
+    if (args.background === true) {
+      return runBackgroundCommand(context, command, cwd, timeoutSeconds);
+    }
+    return runCommand(context, command, cwd, timeoutSeconds);
   },
 };
 
@@ -719,6 +860,11 @@ const readFileTool: Tool = {
           type: "number",
           description: "Maximum bytes to read (default 100000).",
         },
+        force: {
+          type: "boolean",
+          description:
+            "Read the file even if it is unchanged since your last read.",
+        },
       },
       required: ["path"],
     },
@@ -735,6 +881,7 @@ const readFileTool: Tool = {
       READ_MAX_LINES,
     );
     const maxBytes = Math.min(Number(args.maxBytes ?? 100_000) || 100_000, 200_000);
+    const force = args.force === true;
 
     const resolved = resolveToolPath(context, path);
     if (resolved.error || !resolved.path) {
@@ -798,6 +945,20 @@ const readFileTool: Tool = {
       : text.length === 0 && offset === 1
         ? "(the file is empty)"
         : `(no lines in the requested range; the file may be shorter than offset ${offset})`;
+    // Re-reading a file that has not changed since the same window was read
+    // earlier this turn only burns context; answer with a note unless the
+    // model explicitly asks for it again.
+    const cacheKey = `${target}\u0000${offset}\u0000${limit}`;
+    const hash = createHash("sha256").update(text).digest("hex");
+    if (!force && context.readCache?.get(cacheKey) === hash) {
+      const note =
+        `(${path} is unchanged since your earlier read; the content is ` +
+        "earlier in this conversation. Pass force=true to read it again.)";
+      return context.computer === "mac"
+        ? localResult(note, true, Date.now() - startedAt)
+        : { ok: true, output: note, durationMs: Date.now() - startedAt };
+    }
+    context.readCache?.set(cacheKey, hash);
     return context.computer === "mac"
       ? localResult(body, true, Date.now() - startedAt)
       : { ok: true, output: body, durationMs: Date.now() - startedAt };
@@ -1094,6 +1255,161 @@ const globTool: Tool = {
   },
 };
 
+const updatePlanTool: Tool = {
+  definition: {
+    name: "update_plan",
+    description:
+      "Record or update your working plan for the current task so you and the " +
+      "user can see the steps and which one is in progress. Send the whole " +
+      "plan each time; keep it to 2-8 short steps, at most one in_progress, " +
+      "and mark steps done as you finish them. Use it for multi-step work, " +
+      "not for a single action or a simple question.",
+    parameters: {
+      type: "object",
+      properties: {
+        steps: {
+          type: "array",
+          description: "The full plan, in order.",
+          items: {
+            type: "object",
+            properties: {
+              step: { type: "string", description: "What the step does." },
+              status: {
+                type: "string",
+                enum: ["pending", "in_progress", "done"],
+              },
+            },
+            required: ["step", "status"],
+          },
+        },
+      },
+      required: ["steps"],
+    },
+  },
+  async execute(context, args) {
+    const raw = Array.isArray(args.steps) ? args.steps : [];
+    const plan: PlanStep[] = [];
+    for (const entry of raw.slice(0, 20)) {
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+      const record = entry as Record<string, unknown>;
+      const step = typeof record.step === "string" ? record.step.trim() : "";
+      const status =
+        record.status === "done" || record.status === "in_progress"
+          ? record.status
+          : "pending";
+      if (step) {
+        plan.push({ step, status });
+      }
+    }
+    if (!plan.length) {
+      return {
+        ok: false,
+        output: "steps is required and must not be empty",
+        durationMs: 0,
+      };
+    }
+    if (!context.updatePlan) {
+      return {
+        ok: false,
+        output: "planning is not available for this run",
+        durationMs: 0,
+      };
+    }
+    context.updatePlan(plan);
+    const rendered = plan
+      .map((item) =>
+        item.status === "done"
+          ? `[x] ${item.step}`
+          : item.status === "in_progress"
+            ? `[>] ${item.step}`
+            : `[ ] ${item.step}`,
+      )
+      .join("\n");
+    return { ok: true, output: `Plan updated:\n${rendered}`, durationMs: 0 };
+  },
+};
+
+const listDirTool: Tool = {
+  definition: {
+    name: "list_dir",
+    description:
+      "List the entries in a directory on your computer: names, which entries " +
+      "are directories, and file sizes. Use it to orient yourself before " +
+      "reading or changing files, instead of guessing paths. Entries such as " +
+      ".git, node_modules, dist, and build are skipped.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description:
+            "Directory to list. Defaults to the working directory.",
+        },
+        maxResults: {
+          type: "number",
+          description: "Maximum entries to return (default 500).",
+        },
+      },
+    },
+  },
+  async execute(context, args) {
+    const startedAt = Date.now();
+    const rawPath =
+      typeof args.path === "string" && args.path ? args.path : codeRoot(context);
+    const resolved = resolveToolPath(context, rawPath);
+    if (resolved.error || !resolved.path) {
+      return {
+        ok: false,
+        output: resolved.error ?? "invalid path",
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    const cap = Math.min(
+      Math.max(1, Math.floor(Number(args.maxResults ?? 500) || 500)),
+      2_000,
+    );
+    const result = await runCodeToolHelper(
+      context,
+      { mode: "list", root: resolved.path, cap },
+      30,
+    );
+    if (result.exit !== 0) {
+      return {
+        ok: false,
+        output:
+          result.stderr.trim() || `could not list ${resolved.path}`,
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    const output = result.stdout.trimEnd();
+    return {
+      ok: true,
+      output: output
+        ? truncate(output)
+        : `(the directory is empty: ${resolved.path})`,
+      durationMs: Date.now() - startedAt,
+    };
+  },
+};
+
+/**
+ * The run's network egress policy when it should be enforced inside the guest.
+ * A hard `deny` policy is enforced for every request (subresources, XHR/fetch),
+ * not only the top-level navigation the daemon can see. `ask` approvals happen
+ * per navigation at the daemon; a running page cannot pause to ask, so those
+ * are not forwarded.
+ */
+function policyEgress(
+  context: ToolContext,
+): { mode: "deny"; allow: string[] } | null {
+  const setting = context.policy?.egress;
+  return setting && setting.mode === "deny"
+    ? { mode: "deny", allow: setting.allow }
+    : null;
+}
+
 interface BrowserResult {
   ok?: boolean;
   error?: string;
@@ -1105,6 +1421,8 @@ interface BrowserResult {
   output?: string;
   result?: string;
   screenshots?: string[];
+  /** Hosts the guest blocked because they are not in the egress allowlist. */
+  egressBlocked?: string[];
   elements?: Array<{
     id: string;
     selector: string;
@@ -1142,6 +1460,15 @@ async function runBrowserAction(
     ...(typeof payload.pixels === "number" ? { pixels: payload.pixels } : {}),
     ...(typeof payload.href === "string" ? { href: payload.href } : {}),
     ...(typeof payload.index === "number" ? { index: payload.index } : {}),
+    ...(typeof payload.key === "string" ? { key: payload.key } : {}),
+    ...(typeof payload.option === "string" ? { option: payload.option } : {}),
+    ...(Array.isArray(payload.files)
+      ? {
+          files: payload.files.filter(
+            (file): file is string => typeof file === "string" && Boolean(file),
+          ),
+        }
+      : {}),
     ...(typeof payload.code === "string" ? { code: payload.code } : {}),
     ...(payload.egress && typeof payload.egress === "object"
       ? { egress: payload.egress as { mode: "ask" | "deny"; allow: string[] } }
@@ -1599,11 +1926,17 @@ const browserTool: Tool = {
       "before taking the next step; do not immediately call text unless you " +
       "need a focused selector or content beyond the returned preview. " +
       "Actions: goto (url), clickLink (href from links, or index), click " +
-      "(selector), type (selector, text, submit), fields (visible inputs and " +
-      "buttons with ready selectors), links (optional selector, returns link " +
-      "labels and URLs), scroll (pixels, or selector to bring an element into " +
-      "view), text (optional selector), screenshot (returns a picture), back, " +
-      "wait (selector or milliseconds). For research, collect facts from each " +
+      "(selector), type (selector, text, submit), press (key, optional " +
+      "selector to focus first), select (selector, option), upload (selector, " +
+      "files: paths in your computer), fields (visible inputs and buttons with " +
+      "ready selectors), snapshot (every interactive element with a ready " +
+      "selector), links (optional selector, returns link labels and URLs), " +
+      "scroll (pixels, or selector to bring an element into view), text " +
+      "(optional selector), screenshot (returns a picture), back, wait " +
+      "(selector or milliseconds), wait_for (selector or text with a timeout), " +
+      "tabs, new_tab (url), switch_tab (index), close_tab to manage windows, " +
+      "and downloads (copies anything the page downloaded into /root/Downloads " +
+      "and returns the paths). For research, collect facts from each " +
       "page and replace blocked, broken, or irrelevant sources before " +
       "answering. If a site serves a bot check, the run pauses and asks the " +
       "user to clear it in the Screen panel, then retries the same action; do " +
@@ -1626,6 +1959,16 @@ const browserTool: Tool = {
             "screenshot",
             "back",
             "wait",
+            "press",
+            "select",
+            "wait_for",
+            "snapshot",
+            "upload",
+            "tabs",
+            "new_tab",
+            "switch_tab",
+            "close_tab",
+            "downloads",
           ],
         },
         url: { type: "string", description: "URL for the goto action." },
@@ -1635,13 +1978,26 @@ const browserTool: Tool = {
         },
         index: {
           type: "number",
-          description: "Link index for clickLink when href is not known.",
+          description:
+            "Link index for clickLink when href is not known, or the tab " +
+            "number from tabs for switch_tab (1-based).",
+        },
+        files: {
+          type: "array",
+          description:
+            "Absolute paths in your computer to attach for upload.",
+          items: { type: "string" },
         },
         selector: {
           type: "string",
-          description: "CSS selector for click, type, wait, text, or scroll.",
+          description:
+            "CSS selector for click, type, press, select, wait, wait_for, " +
+            "text, or scroll.",
         },
-        text: { type: "string", description: "Text to type." },
+        text: {
+          type: "string",
+          description: "Text to type, or the text wait_for should wait for.",
+        },
         submit: {
           type: "boolean",
           description: "Press Enter after typing.",
@@ -1649,6 +2005,22 @@ const browserTool: Tool = {
         milliseconds: {
           type: "number",
           description: "Wait duration for the wait action.",
+        },
+        key: {
+          type: "string",
+          description:
+            "Keyboard key for press, for example Enter, Tab, Escape, " +
+            "ArrowDown, or Meta+A.",
+        },
+        option: {
+          type: "string",
+          description:
+            "Option value or visible label to pick with select.",
+        },
+        timeoutMs: {
+          type: "number",
+          description:
+            "Timeout for wait_for in milliseconds (default 10000, max 60000).",
         },
         pixels: {
           type: "number",
@@ -1681,6 +2053,7 @@ const browserTool: Tool = {
     await ensureSandbox(context, sandbox);
     await ensureGuestSkills(context, sandbox);
 
+    const egress = policyEgress(context);
     const { parsed, result, durationMs } = await runBrowserAction(
       sandbox,
       browserSandboxId(context),
@@ -1694,6 +2067,11 @@ const browserTool: Tool = {
         pixels: args.pixels,
         href: args.href,
         index: args.index,
+        key: args.key,
+        option: args.option,
+        files: args.files,
+        timeoutMs: args.timeoutMs,
+        ...(egress ? { egress } : {}),
       },
       75_000,
     );
@@ -1731,6 +2109,11 @@ const browserTool: Tool = {
     let output = `url: ${parsed.url ?? ""}\ntitle: ${parsed.title ?? ""}`;
     if (parsed.text) {
       output += `\ntext:\n${parsed.text}`;
+    }
+    if (parsed.egressBlocked?.length) {
+      output +=
+        `\n[egress] blocked request(s) to ${parsed.egressBlocked.join(", ")}: ` +
+        "not in the browser egress allowlist";
     }
     const guardrail = context.decision?.settings.guardrail ?? "off";
     const decisionClient = context.decision?.client ?? null;
@@ -2078,12 +2461,14 @@ const browseTool: Tool = {
       ? Math.min(Math.max(Math.round(requestedSteps), 1), BROWSE_MAX_STEPS_CAP)
       : BROWSE_MAX_STEPS_DEFAULT;
 
+    const egress = policyEgress(context);
     const result = await runBrowseLoop({
       sandbox,
       botId: browserSandboxId(context),
       client,
       goal,
       ...(startUrl ? { startUrl } : {}),
+      ...(egress ? { egress } : {}),
       maxSteps,
       ...(context.signal ? { signal: context.signal } : {}),
       ...(context.onDecision ? { onDecision: context.onDecision } : {}),
@@ -2149,6 +2534,120 @@ const browseTool: Tool = {
       output: truncate(output),
       durationMs: result.durationMs,
     };
+  },
+};
+
+const WEB_SEARCH_YEAR = new Date().getFullYear();
+
+const webSearchTool: Tool = {
+  definition: {
+    name: "web_search",
+    description:
+      "Search the live web and get back the most relevant page content with " +
+      "titles and URLs. Use it for current events, recent facts, prices, and " +
+      "anything beyond your knowledge cutoff, and cite the URLs it returns. " +
+      "It runs on the host, not on the agent's computer, so it works on any " +
+      "computer — including This Mac, where the browser tools are " +
+      "unavailable. Use the browser tools instead when you need to interact " +
+      "with a page, sign in, or read a page the user named. One call is one " +
+      "search: phrase the query the way a person would, and search again " +
+      `rather than guessing. The current year is ${WEB_SEARCH_YEAR}; include ` +
+      "it when searching for recent information or current events.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description:
+            "The search query, phrased the way a person would type it.",
+        },
+        numResults: {
+          type: "number",
+          description: `How many results to return (default ${WEB_SEARCH_DEFAULT_RESULTS}, max 20).`,
+        },
+        type: {
+          type: "string",
+          enum: ["auto", "fast", "deep"],
+          description:
+            "Search depth: auto (balanced, default), fast (quick results), " +
+            "or deep (comprehensive).",
+        },
+        livecrawl: {
+          type: "string",
+          enum: ["fallback", "preferred"],
+          description:
+            "Live crawl mode: fallback uses cached content unless it is " +
+            "unavailable (default), preferred prioritizes fetching the live " +
+            "page.",
+        },
+        contextMaxCharacters: {
+          type: "number",
+          description:
+            "Maximum characters of context to return (default 10000, max 50000).",
+        },
+      },
+      required: ["query"],
+    },
+  },
+  async execute(context, args) {
+    const query = typeof args.query === "string" ? args.query.trim() : "";
+    if (!query) {
+      return { ok: false, output: "query is required", durationMs: 0 };
+    }
+    const provider = selectWebSearchProvider();
+    const requestedResults = Number(
+      args.numResults ?? WEB_SEARCH_DEFAULT_RESULTS,
+    );
+    const numResults = Number.isFinite(requestedResults)
+      ? Math.min(Math.max(Math.round(requestedResults), 1), 20)
+      : WEB_SEARCH_DEFAULT_RESULTS;
+    const type =
+      args.type === "fast" || args.type === "deep" ? args.type : "auto";
+    const livecrawl =
+      args.livecrawl === "preferred" ? "preferred" : "fallback";
+    const requestedContext = Number(args.contextMaxCharacters ?? 0);
+    const contextMaxCharacters =
+      Number.isFinite(requestedContext) && requestedContext > 0
+        ? Math.min(Math.max(Math.round(requestedContext), 500), 50_000)
+        : undefined;
+
+    const startedAt = Date.now();
+    try {
+      const result = await runWebSearch({
+        query,
+        provider,
+        numResults,
+        type,
+        livecrawl,
+        ...(contextMaxCharacters ? { contextMaxCharacters } : {}),
+        ...(context.signal ? { signal: context.signal } : {}),
+      });
+      if (!result.text) {
+        return {
+          ok: false,
+          output:
+            `No results for "${query}" from ${webSearchProviderLabel(provider)}. ` +
+            "Try a different query.",
+          durationMs: Date.now() - startedAt,
+        };
+      }
+      return {
+        ok: true,
+        output: truncate(result.text),
+        durationMs: Date.now() - startedAt,
+      };
+    } catch (error) {
+      const failure = error as Error;
+      const message =
+        failure.name === "TimeoutError"
+          ? "the search timed out"
+          : failure.message || String(error);
+      return {
+        ok: false,
+        output: `web search failed: ${message}`,
+        durationMs: Date.now() - startedAt,
+      };
+    }
   },
 };
 
@@ -2269,8 +2768,8 @@ const spawnWorkerTool: Tool = {
               items: { type: "string" },
               description:
                 "Tool names the worker may use (shell, read_file, write_file, " +
-                "browser, browse, desktop). Defaults to all tools the role's " +
-                "computer supports.",
+                "browser, browse, desktop, web_search). Defaults to all tools " +
+                "the role's computer supports.",
             },
             budget: {
               type: "object",
@@ -3107,11 +3606,14 @@ export const tools: Tool[] = [
   editTool,
   grepTool,
   globTool,
+  listDirTool,
+  updatePlanTool,
   browserTool,
   browserExecuteTool,
   browserStepTool,
   desktopTool,
   browseTool,
+  webSearchTool,
   listRolesTool,
   spawnWorkerTool,
   createWorkerTool,
@@ -3148,6 +3650,11 @@ const LOCAL_DEFINITIONS: Record<string, ToolDefinition> = {
           type: "number",
           description: "Timeout in seconds (default 60, max 120).",
         },
+        background: {
+          type: "boolean",
+          description:
+            "Start the command detached and return its pid and log file.",
+        },
       },
       required: ["command"],
     },
@@ -3177,6 +3684,11 @@ const LOCAL_DEFINITIONS: Record<string, ToolDefinition> = {
         maxBytes: {
           type: "number",
           description: "Maximum bytes to read (default 100000).",
+        },
+        force: {
+          type: "boolean",
+          description:
+            "Read the file even if it is unchanged since your last read.",
         },
       },
       required: ["path"],
@@ -3270,6 +3782,58 @@ const LOCAL_DEFINITIONS: Record<string, ToolDefinition> = {
       required: ["pattern"],
     },
   },
+  update_plan: {
+    name: "update_plan",
+    description:
+      "Record or update your working plan for the current task so you and the " +
+      "user can see the steps and which one is in progress. Send the whole " +
+      "plan each time; keep it to 2-8 short steps, at most one in_progress, " +
+      "and mark steps done as you finish them.",
+    parameters: {
+      type: "object",
+      properties: {
+        steps: {
+          type: "array",
+          description: "The full plan, in order.",
+          items: {
+            type: "object",
+            properties: {
+              step: { type: "string", description: "What the step does." },
+              status: {
+                type: "string",
+                enum: ["pending", "in_progress", "done"],
+              },
+            },
+            required: ["step", "status"],
+          },
+        },
+      },
+      required: ["steps"],
+    },
+  },
+  list_dir: {
+    name: "list_dir",
+    description:
+      "List the entries in a directory in this agent's workspace on the user's " +
+      "Mac: names, which entries are directories, and file sizes. Entries such " +
+      "as .git, node_modules, dist, and build are skipped. Paths outside the " +
+      "workspace are rejected.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description:
+            "Directory to list, relative to the workspace or absolute inside " +
+            "it. Defaults to the workspace root.",
+        },
+        maxResults: {
+          type: "number",
+          description: "Maximum entries to return (default 500).",
+        },
+      },
+    },
+  },
   write_file: {
     name: "write_file",
     description:
@@ -3296,11 +3860,17 @@ export function toolDefinitions(
 ): ToolDefinition[] {
   const browse = Boolean(options.browse) && computer !== "mac";
   const delegate = Boolean(options.delegate);
+  // Deterministic evaluations replace the web with fixtures; the live search
+  // tool would silently bypass them, so it is disabled there.
+  const webSearch = process.env.OPENBOT_WEBSEARCH_DISABLED !== "1";
   return tools
     .filter((tool) => {
       const name = tool.definition.name;
       if (name === "browse") {
         return browse;
+      }
+      if (name === "web_search") {
+        return webSearch;
       }
       if (ORCHESTRATION_TOOL_NAMES.has(name) || MEMORY_TOOL_NAMES.has(name)) {
         return delegate;

@@ -5,6 +5,10 @@ import type {
   DesktopActionResult,
   ExecRequest,
   ExecResult,
+  FileListRequest,
+  FileListResponse,
+  FileReadRequest,
+  FileReadResponse,
   SandboxBackend,
   SandboxStatus,
 } from "./types";
@@ -12,15 +16,23 @@ import type {
 export interface HttpSandboxBackendOptions {
   url: string;
   fetchImpl?: typeof fetch;
+  /**
+   * Stable id for this daemon's data directory. The host records it on each
+   * VM so startup pruning can remove this daemon's orphans without touching
+   * another daemon's VMs.
+   */
+  owner?: string;
 }
 
 export class HttpSandboxBackend implements SandboxBackend {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly owner: string;
 
   constructor(options: HttpSandboxBackendOptions) {
     this.baseUrl = options.url.replace(/\/+$/, "");
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.owner = options.owner ?? "default";
   }
 
   status(botId: string): Promise<SandboxStatus> {
@@ -128,6 +140,34 @@ export class HttpSandboxBackend implements SandboxBackend {
     });
   }
 
+  filesList(
+    botId: string,
+    request: FileListRequest,
+  ): Promise<FileListResponse> {
+    return this.request(`/vms/${encodeURIComponent(botId)}/files`, {
+      method: "POST",
+      body: JSON.stringify({
+        op: "list",
+        root: request.path,
+        cap: request.cap,
+      }),
+    });
+  }
+
+  filesRead(
+    botId: string,
+    request: FileReadRequest,
+  ): Promise<FileReadResponse> {
+    return this.request(`/vms/${encodeURIComponent(botId)}/files`, {
+      method: "POST",
+      body: JSON.stringify({
+        op: "read",
+        path: request.path,
+        maxBytes: request.maxBytes,
+      }),
+    });
+  }
+
   stop(botId: string): Promise<SandboxStatus> {
     return this.request(`/vms/${encodeURIComponent(botId)}/stop`, {
       method: "POST",
@@ -140,6 +180,23 @@ export class HttpSandboxBackend implements SandboxBackend {
     });
   }
 
+  prune(keep: string[]): Promise<{ removed: string[] }> {
+    return this.request("/prune", {
+      method: "POST",
+      body: JSON.stringify({ keep }),
+    });
+  }
+
+  setNetworkPolicy(
+    botId: string,
+    policy: { mode: "deny"; allow: string[] } | null,
+  ): Promise<{ ok: boolean; ips?: string[]; error?: string }> {
+    return this.request(`/vms/${encodeURIComponent(botId)}/network-policy`, {
+      method: "POST",
+      body: JSON.stringify(policy ?? { mode: "off" }),
+    });
+  }
+
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     let response: Response;
     try {
@@ -147,6 +204,7 @@ export class HttpSandboxBackend implements SandboxBackend {
         ...init,
         headers: {
           "content-type": "application/json",
+          "x-openbot-owner": this.owner,
           ...(init.headers ?? {}),
         },
       });

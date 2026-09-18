@@ -18,6 +18,7 @@ import type {
   ComputerKind,
   Message,
   ModelRef,
+  PlanStep,
   PolicySettings,
   ServerMessage,
   TaskBudget,
@@ -46,6 +47,13 @@ import {
   rolePolicySettings,
 } from "./policy";
 import { decideRoute } from "./routing";
+import {
+  GUARDRAIL_BLOCKED,
+  GUARDRAIL_WARNING,
+  guardrailSummary,
+  looksLikeInjection,
+  screenUntrustedText,
+} from "./guardrail";
 import type { SoulService } from "./soul";
 import {
   findTool,
@@ -59,6 +67,7 @@ import {
 } from "./tools";
 import {
   annotateBrowserObservation,
+  annotateWebSearchObservation,
   buildCompletionAuditRequest,
   buildJevVerificationFeedback,
   buildVerificationFeedback,
@@ -89,12 +98,25 @@ export interface AgentDeps {
   policy?: () => PolicySettings;
 }
 
+/** Messages typed while a turn is running; the loop drains them at step
+ * boundaries so the model can change course without restarting the turn. */
+export interface SteeringChannel {
+  hasPending(): boolean;
+  drain(): string[];
+}
+
 export interface AgentInput {
   runId: string;
   botId: string;
   threadId?: string;
   text: string;
   model?: ModelRef;
+  /** Client-generated id for the persisted user message. */
+  messageId?: string;
+  /** The user message is already in the store (queued or steered delivery). */
+  skipUserMessage?: boolean;
+  /** Mid-turn user messages to fold into the running conversation. */
+  steering?: SteeringChannel;
   /** Internal trigger (task event): do not persist the user message or retitle the thread. */
   internal?: boolean;
   /** Extra system context injected for this turn only; never persisted. */
@@ -117,8 +139,50 @@ export interface AgentInput {
   budget?: TaskBudget | null;
 }
 
-const PROVIDER_STEP_TIMEOUT_MS = 60_000;
+const PROVIDER_STEP_TIMEOUT_MS = 120_000;
 const MAX_AUDIT_REVISIONS = 2;
+// A turn may chain many tool steps: a coding task can legitimately run long.
+// The cap is a runaway guard, not a policy. The turn ends with a note and the
+// user can ask the agent to continue.
+const MAX_TOOL_STEPS = 60;
+// The same failing call repeated this many times means the model is stuck on an
+// approach; stop the turn instead of burning it on identical retries.
+const MAX_REPEATED_TOOL_FAILURES = 3;
+// A sandbox request that never reached the VM (host down, VM still booting,
+// socket refused) is safe to retry once: no command ran, so nothing is
+// duplicated. Failures after the request was delivered are not retried.
+const SANDBOX_RETRY_DELAY_MS = 1_500;
+const TRANSIENT_TOOL_ERROR =
+  /(sandbox host unreachable|sandbox host returned 5\d\d|ECONNREFUSED|ECONNRESET|socket hang up|fetch failed|did not become ready|api socket did not appear|EAI_AGAIN|ETIMEDOUT|timed out waiting for)/i;
+// Some providers occasionally emit their raw tool-call markup as assistant
+// text (DeepSeek's DSML) instead of a structured tool call. Detect it so the
+// turn can nudge once and retry instead of finalizing broken markup.
+const RAW_TOOL_MARKUP = /<[｜|]{1,2}\s*(DSML|tool_calls?|function_calls?)/i;
+const MAX_MARKUP_REVISIONS = 1;
+// Provider failures worth retrying before the turn gives up. "terminated",
+// "other side closed", and "premature close" are undici's stream-cut errors.
+const TRANSIENT_PROVIDER_ERROR =
+  /(\b429\b|rate.?limit|overloaded|\b5\d\d\b|ECONNREFUSED|ECONNRESET|socket hang up|fetch failed|EAI_AGAIN|ETIMEDOUT|terminated|other side closed|premature close|UND_ERR)/i;
+const MAX_PROVIDER_RETRIES = 2;
+const PROVIDER_RETRY_BASE_MS = 1_000;
+const PROVIDER_RETRY_MAX_MS = 30_000;
+
+/**
+ * Exponential backoff with jitter. A provider's Retry-After header wins when
+ * the gateway passed it through, since the server knows better than we do.
+ */
+function providerRetryDelay(error: unknown, attempt: number): number {
+  const message = (error as Error)?.message ?? String(error);
+  const header = /retry-after:\s*(\d+)/i.exec(message);
+  if (header) {
+    return Math.min(Number(header[1]) * 1_000, PROVIDER_RETRY_MAX_MS);
+  }
+  const exponential = PROVIDER_RETRY_BASE_MS * 2 ** attempt;
+  return (
+    Math.min(exponential, PROVIDER_RETRY_MAX_MS) +
+    Math.floor(Math.random() * 500)
+  );
+}
 
 const UNKNOWN_TOOL_HINTS: Record<string, string> = {
   click:
@@ -139,21 +203,55 @@ const UNKNOWN_TOOL_HINTS: Record<string, string> = {
   activate: 'use desktop {"action":"activate","title":"..."}.',
 };
 
-function unknownToolMessage(name: string): string {
+function unknownToolMessage(name: string, available: string[]): string {
   const hint = UNKNOWN_TOOL_HINTS[name];
-  const tools = "shell, read_file, write_file, browser, browse, desktop";
+  const tools = available.length ? available.join(", ") : "none";
   return hint
     ? `unknown tool: ${name}. ${hint}`
     : `unknown tool: ${name}. Available tools: ${tools}.`;
+}
+
+/**
+ * Tool failures are written for the model, not the user: name the tool, keep
+ * the message, and say what to do next so the model can recover in the same
+ * turn instead of crashing it.
+ */
+function toolErrorText(name: string, message: string): string {
+  return (
+    `[tool error] ${name}: ${message}\n` +
+    "The tool did not run successfully. Check the arguments and try again, " +
+    "or use a different approach."
+  );
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (!signal || signal.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function addUsage(
   total: TokenUsage | null,
   usage: TokenUsage,
 ): TokenUsage {
+  const cacheRead =
+    (total?.cacheReadTokens ?? 0) + (usage.cacheReadTokens ?? 0);
   return {
     inputTokens: (total?.inputTokens ?? 0) + usage.inputTokens,
     outputTokens: (total?.outputTokens ?? 0) + usage.outputTokens,
+    ...(cacheRead > 0 ? { cacheReadTokens: cacheRead } : {}),
   };
 }
 
@@ -324,6 +422,59 @@ function buildHistory(
   return history;
 }
 
+// File and command output can carry text that pretends to be an instruction.
+// Browser tools screen their own page text; these are the tools whose output
+// arrives from the computer, so the loop screens them here.
+const SCREENED_TOOL_NAMES = new Set([
+  "read_file",
+  "shell",
+  "grep",
+  "glob",
+  "list_dir",
+  "browser_execute",
+  "web_search",
+]);
+
+async function screenToolOutput(
+  context: ToolContext,
+  toolName: string,
+  output: string,
+): Promise<string> {
+  const guardrail = context.decision?.settings.guardrail ?? "off";
+  const client = context.decision?.client ?? null;
+  if (guardrail === "off" || !client || !looksLikeInjection(output)) {
+    return output;
+  }
+  const startedAt = Date.now();
+  const verdict = await screenUntrustedText({
+    client,
+    text: output,
+    ...(context.signal ? { signal: context.signal } : {}),
+  }).catch((error) => {
+    console.warn(`guardrail check failed: ${(error as Error).message}`);
+    return null;
+  });
+  if (!verdict?.flagged) {
+    return output;
+  }
+  console.info("guardrail.flagged", {
+    botId: context.botId,
+    tool: toolName,
+    instructionOverride: verdict.instructionOverride,
+    exfiltrationRequest: verdict.exfiltrationRequest,
+  });
+  context.onDecision?.({
+    kind: "guardrail",
+    summary: guardrailSummary(verdict),
+    flagged: true,
+    latencyMs: Date.now() - startedAt,
+    model: context.decision?.settings.model ?? null,
+  });
+  return guardrail === "block"
+    ? `${GUARDRAIL_BLOCKED}\n[tool output withheld: ${toolName}]`
+    : `${GUARDRAIL_WARNING}\n${output}`;
+}
+
 async function executeToolCall(
   deps: AgentDeps,
   context: ToolContext,
@@ -332,7 +483,8 @@ async function executeToolCall(
   emit: (message: ServerMessage) => void,
   signal: AbortSignal,
   approval: { tier: ApprovalTier; reason: string },
-  browserObservationIndex: number | null,
+  observation: { prefix: "browser" | "websearch"; index: number } | null,
+  availableTools: string[],
 ): Promise<{ record: ToolCallRecord; images: ToolImage[] | null }> {
   console.info("tool.start", {
     runId: ids.runId,
@@ -373,7 +525,7 @@ async function executeToolCall(
 
   const tool = findTool(call.name);
   if (!tool) {
-    output = unknownToolMessage(call.name);
+    output = unknownToolMessage(call.name, availableTools);
   } else if (approval.tier === "deny") {
     output = `Blocked by the approvals policy: ${approval.reason}. Do not retry it.`;
     console.info("tool.blocked", {
@@ -460,12 +612,15 @@ async function executeToolCall(
     }
   }
 
-  if (browserObservationIndex !== null) {
-    output = annotateBrowserObservation(
-      output,
-      ok,
-      browserObservationIndex,
-    );
+  if (ok && output && SCREENED_TOOL_NAMES.has(call.name)) {
+    output = await screenToolOutput(context, call.name, output);
+  }
+
+  if (observation) {
+    output =
+      observation.prefix === "websearch"
+        ? annotateWebSearchObservation(output, ok, observation.index)
+        : annotateBrowserObservation(output, ok, observation.index);
   }
 
   emit({
@@ -523,7 +678,10 @@ async function runTool(
     } catch {
       return {
         ok: false,
-        output: `invalid tool arguments: ${call.arguments.slice(0, 200)}`,
+        output: toolErrorText(
+          tool.definition.name,
+          `arguments are not valid JSON: ${call.arguments.slice(0, 200)}`,
+        ),
         durationMs: 0,
       };
     }
@@ -531,7 +689,31 @@ async function runTool(
   try {
     return await tool.execute(context, args);
   } catch (error) {
-    return { ok: false, output: (error as Error).message, durationMs: 0 };
+    const message = (error as Error).message || String(error);
+    // A sandbox that is unreachable or still booting fails before the command
+    // runs, so one retry cannot duplicate a side effect.
+    if (TRANSIENT_TOOL_ERROR.test(message) && !context.signal?.aborted) {
+      await abortableDelay(SANDBOX_RETRY_DELAY_MS, context.signal);
+      if (!context.signal?.aborted) {
+        try {
+          return await tool.execute(context, args);
+        } catch (retryError) {
+          return {
+            ok: false,
+            output: toolErrorText(
+              tool.definition.name,
+              (retryError as Error).message || String(retryError),
+            ),
+            durationMs: 0,
+          };
+        }
+      }
+    }
+    return {
+      ok: false,
+      output: toolErrorText(tool.definition.name, message),
+      durationMs: 0,
+    };
   }
 }
 
@@ -557,8 +739,9 @@ export async function runAgent(
       ? requested
       : deps.store.getOrCreateThread(bot.id);
 
-  if (!input.internal) {
+  if (!input.internal && !input.skipUserMessage) {
     deps.store.addMessage({
+      id: input.messageId,
       threadId: thread.id,
       role: "user",
       content: input.text,
@@ -733,6 +916,12 @@ export async function runAgent(
     }
   }
 
+  // Turn-scoped caches: a file re-read unchanged, or a tool returning a
+  // byte-identical result, only burns context. Both are cleared when
+  // compaction rebuilds the transcript, since the earlier content may then be
+  // gone.
+  const readCache = new Map<string, string>();
+  const toolResultCache = new Map<string, string>();
   const toolContext: ToolContext | null =
     local || deps.sandbox
       ? {
@@ -747,6 +936,7 @@ export async function runAgent(
           decision: decisionRuntime,
           vision,
           signal,
+          readCache,
           onDecision: emitDecision,
           onSandboxState: (state) =>
             emit({
@@ -761,6 +951,12 @@ export async function runAgent(
           memory: deps.memory ?? null,
           soul: deps.soul ?? null,
           memoryScope: bot.kind === "lead" ? "user" : bot.id,
+          updatePlan: (plan: PlanStep[]) => {
+            const updated = deps.store.setThreadPlan(thread.id, plan);
+            if (updated) {
+              emit({ type: "thread.upserted", thread: updated });
+            }
+          },
         }
       : null;
 
@@ -804,6 +1000,18 @@ export async function runAgent(
       console.warn(`memory injection failed: ${(error as Error).message}`);
     }
   }
+  if (thread.plan?.length) {
+    const lines = thread.plan.map((step) =>
+      step.status === "done"
+        ? `- [x] ${step.step}`
+        : step.status === "in_progress"
+          ? `- [>] ${step.step}`
+          : `- [ ] ${step.step}`,
+    );
+    contextParts.push(
+      `[plan] Current plan for this task (update it with update_plan):\n${lines.join("\n")}`,
+    );
+  }
   const turnContext = contextParts.filter(Boolean).join("\n\n");
   const definitions: ToolDefinition[] = toolContext && !routeChat
     ? toolDefinitions(computer, {
@@ -822,6 +1030,21 @@ export async function runAgent(
     : (deps.policy?.() ?? DEFAULT_POLICY);
   if (toolContext) {
     toolContext.policy = policySettings;
+  }
+  // A hard shell egress policy is enforced on the VM's network interface for
+  // the whole turn, so commands cannot reach hosts the browser would refuse.
+  if (toolContext && computer === "firecracker" && deps.sandbox) {
+    const egress = policySettings.egress;
+    try {
+      await deps.sandbox.setNetworkPolicy(
+        input.computerId ?? bot.id,
+        egress && egress.mode === "deny"
+          ? { mode: "deny", allow: egress.allow }
+          : null,
+      );
+    } catch (error) {
+      console.warn(`network policy failed: ${(error as Error).message}`);
+    }
   }
   // The approvals policy decides auto/ask/deny per call. Rules can scope
   // themselves to microVM or This Mac; grants pre-approve ask-tier tools but
@@ -924,6 +1147,12 @@ export async function runAgent(
   const history = buildTurnHistory();
   const working: ChatMessage[] = [...history];
   const records: ToolCallRecord[] = [];
+  // Identical failing calls are tracked so a model stuck on one approach is
+  // stopped instead of looping until the step cap.
+  const failureCounts = new Map<string, number>();
+  const availableToolNames = definitions.map(
+    (definition) => definition.name,
+  );
   let content = "";
   let stepText = "";
   let stepRecords: ToolCallRecord[] = [];
@@ -931,8 +1160,10 @@ export async function runAgent(
   let turnUsage: TokenUsage | null = null;
   let overflowRetried = false;
   let browserObservationCount = 0;
+  let webSearchObservationCount = 0;
   let unverifiedDraftHeld = false;
   let auditRevisions = 0;
+  let markupRevisions = 0;
 
   const persistAssistant = (
     id: string,
@@ -991,49 +1222,98 @@ export async function runAgent(
         });
         return;
       }
+      if (step >= MAX_TOOL_STEPS) {
+        const message = persistAssistant(
+          assistantMessageId,
+          `I stopped after ${MAX_TOOL_STEPS} tool steps to keep this turn ` +
+            "bounded. Everything so far is preserved above; say \"continue\" " +
+            "and I will pick up from here.",
+          null,
+          turnUsage,
+        );
+        emit({ type: "chat.done", runId, threadId: thread.id, message });
+        return;
+      }
       const contentBeforeStep = content;
       stepText = "";
       stepRecords = [];
       let pendingCalls: ToolCall[] = [];
       const stepImages: ToolImage[] = [];
 
-      try {
-        const providerSignal = AbortSignal.any([
-          signal,
-          AbortSignal.timeout(PROVIDER_STEP_TIMEOUT_MS),
-        ]);
-        if (vision) {
-          pruneHistoricalImages(working);
+      // Steered messages wait for a clean step boundary; fold them in now so
+      // the next provider call sees them.
+      if (input.steering?.hasPending()) {
+        for (const steered of input.steering.drain()) {
+          working.push({ role: "user", content: steered });
         }
-        for await (const event of provider.chat({
-          model: model.model,
-          messages: working,
-          ...(definitions.length ? { tools: definitions } : {}),
-          ...(model.effort ? { reasoningEffort: model.effort } : {}),
-          signal: providerSignal,
-        })) {
-          if (event.type === "text_delta") {
-            stepText += event.text;
-            content += event.text;
-            emit({
-              type: "chat.delta",
-              runId,
-              threadId: thread.id,
-              messageId: assistantMessageId,
-              text: event.text,
-            });
-          } else if (event.type === "reasoning_delta") {
-            emit({
-              type: "chat.reasoning",
-              runId,
-              threadId: thread.id,
-              messageId: assistantMessageId,
-              text: event.text,
-            });
-          } else if (event.type === "tool_calls") {
-            pendingCalls = event.calls;
-          } else if (event.type === "usage") {
-            turnUsage = addUsage(turnUsage, event.usage);
+      }
+
+      let providerAttempt = 0;
+      try {
+        // One retry for a transient provider failure, but only when nothing
+        // was streamed yet: retrying after deltas would duplicate the reply.
+        for (;;) {
+          try {
+            const providerSignal = AbortSignal.any([
+              signal,
+              AbortSignal.timeout(PROVIDER_STEP_TIMEOUT_MS),
+            ]);
+            if (vision) {
+              pruneHistoricalImages(working);
+            }
+            for await (const event of provider.chat({
+              model: model.model,
+              messages: working,
+              ...(definitions.length ? { tools: definitions } : {}),
+              ...(model.effort ? { reasoningEffort: model.effort } : {}),
+              signal: providerSignal,
+            })) {
+              if (event.type === "text_delta") {
+                stepText += event.text;
+                content += event.text;
+                emit({
+                  type: "chat.delta",
+                  runId,
+                  threadId: thread.id,
+                  messageId: assistantMessageId,
+                  text: event.text,
+                });
+              } else if (event.type === "reasoning_delta") {
+                emit({
+                  type: "chat.reasoning",
+                  runId,
+                  threadId: thread.id,
+                  messageId: assistantMessageId,
+                  text: event.text,
+                });
+              } else if (event.type === "tool_calls") {
+                pendingCalls = event.calls;
+              } else if (event.type === "usage") {
+                turnUsage = addUsage(turnUsage, event.usage);
+              }
+            }
+            break;
+          } catch (error) {
+            const retryable =
+              !signal.aborted &&
+              providerAttempt < MAX_PROVIDER_RETRIES &&
+              stepText === "" &&
+              pendingCalls.length === 0 &&
+              TRANSIENT_PROVIDER_ERROR.test(
+                (error as Error).message ?? String(error),
+              );
+            if (!retryable) {
+              throw error;
+            }
+            const delay = providerRetryDelay(error, providerAttempt);
+            providerAttempt += 1;
+            content = contentBeforeStep;
+            console.warn(
+              `provider step failed, retrying in ${delay}ms ` +
+                `(attempt ${providerAttempt}/${MAX_PROVIDER_RETRIES}): ` +
+                `${(error as Error).message}`,
+            );
+            await abortableDelay(delay, signal);
           }
         }
       } catch (error) {
@@ -1071,6 +1351,8 @@ export async function runAgent(
           return;
         }
         working.splice(0, working.length, ...buildTurnHistory());
+        readCache.clear();
+        toolResultCache.clear();
         step -= 1;
         continue;
       }
@@ -1078,6 +1360,65 @@ export async function runAgent(
       finalText = stepText;
 
       if (pendingCalls.length === 0) {
+        // Raw markup as text means the provider failed to turn the tool call
+        // into a structured call; discard it and nudge once.
+        if (
+          RAW_TOOL_MARKUP.test(finalText) &&
+          markupRevisions < MAX_MARKUP_REVISIONS
+        ) {
+          markupRevisions += 1;
+          console.warn("assistant emitted raw tool-call markup; retrying");
+          emit({
+            type: "chat.delta",
+            runId,
+            threadId: thread.id,
+            messageId: assistantMessageId,
+            text: "",
+            reset: true,
+          });
+          working.push({ role: "assistant", content: finalText });
+          working.push({
+            role: "user",
+            content:
+              "[system] Your last reply contained raw tool-call markup as " +
+              "text, so nothing ran. Call the tool through the tool interface " +
+              "with valid JSON arguments and continue the task.",
+          });
+          content = contentBeforeStep;
+          finalText = "";
+          continue;
+        }
+        if (input.steering?.hasPending()) {
+          // The draft is no longer the final answer: flush it as a step
+          // message, then let the steered input redirect the turn.
+          if (stepText.trim()) {
+            const flushed = persistAssistant(randomUUID(), stepText, null, null);
+            emit({
+              type: "chat.message",
+              runId,
+              threadId: thread.id,
+              message: flushed,
+            });
+            working.push({ role: "assistant", content: stepText });
+          }
+          for (const steered of input.steering.drain()) {
+            working.push({ role: "user", content: steered });
+          }
+          emit({
+            type: "chat.delta",
+            runId,
+            threadId: thread.id,
+            messageId: assistantMessageId,
+            text: "",
+            reset: true,
+          });
+          content = "";
+          stepText = "";
+          stepRecords = [];
+          finalText = "";
+          unverifiedDraftHeld = false;
+          continue;
+        }
         if (
           decisionRuntime.settings.audit &&
           shouldAuditCompletion(records) &&
@@ -1256,6 +1597,7 @@ export async function runAgent(
         toolCalls: pendingCalls,
       });
 
+      let repeatedFailure: string | null = null;
       for (const call of pendingCalls) {
         const callBudgetIssue = budgetIssue();
         if (callBudgetIssue) {
@@ -1297,18 +1639,53 @@ export async function runAgent(
           call.name === "browser" ||
           call.name === "browser_execute" ||
           call.name === "browser_step"
-            ? browserObservationCount++
-            : null,
+            ? { prefix: "browser" as const, index: browserObservationCount++ }
+            : call.name === "web_search"
+              ? {
+                  prefix: "websearch" as const,
+                  index: webSearchObservationCount++,
+                }
+              : null,
+          availableToolNames,
         );
         records.push(record);
         stepRecords.push(record);
-        working.push({
-          role: "tool",
-          toolCallId: call.id,
-          content: record.output,
-        });
+        const signature = `${call.name}\u0000${call.arguments}`;
+        // A byte-identical result from the same call is already in the
+        // transcript; repeat a marker instead of the whole output.
+        const previousOutput = toolResultCache.get(signature);
+        if (
+          previousOutput !== undefined &&
+          previousOutput === record.output &&
+          record.output.length > 200
+        ) {
+          working.push({
+            role: "tool",
+            toolCallId: call.id,
+            content:
+              `[identical to the earlier ${call.name} call with the same ` +
+              `arguments; ${record.output.length} characters omitted]`,
+          });
+        } else {
+          toolResultCache.set(signature, record.output);
+          working.push({
+            role: "tool",
+            toolCallId: call.id,
+            content: record.output,
+          });
+        }
         if (vision && images) {
           stepImages.push(...images);
+        }
+        if (record.ok) {
+          failureCounts.delete(signature);
+        } else {
+          const count = (failureCounts.get(signature) ?? 0) + 1;
+          failureCounts.set(signature, count);
+          if (count >= MAX_REPEATED_TOOL_FAILURES) {
+            repeatedFailure = call.name;
+            break;
+          }
         }
       }
       // DeepSeek and other OpenAI-compatible providers accept images in user
@@ -1340,6 +1717,20 @@ export async function runAgent(
         text: "",
         reset: true,
       });
+
+      if (repeatedFailure) {
+        const message = persistAssistant(
+          assistantMessageId,
+          `I stopped because the ${repeatedFailure} tool failed ` +
+            `${MAX_REPEATED_TOOL_FAILURES} times with the same arguments. ` +
+            "That usually means the approach or the arguments need to change " +
+            "rather than another retry. Tell me how you would like to proceed.",
+          null,
+          turnUsage,
+        );
+        emit({ type: "chat.done", runId, threadId: thread.id, message });
+        return;
+      }
     }
   } catch (error) {
     if (signal.aborted) {

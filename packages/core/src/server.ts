@@ -14,13 +14,16 @@ import {
 import {
   ClientMessageSchema,
   type Bot,
+  type ChatBusyBehavior,
   type CompactionSettings,
   type HarnessSettings,
   type Memory,
+  type Message,
   type ModelRef,
   type PolicySettings,
   type ServerMessage,
   type Task,
+  type Thread,
 } from "@openbot/protocol";
 import type { SandboxBackend } from "@openbot/sandbox";
 import { runAgent, type AgentDeps } from "./agent";
@@ -45,6 +48,11 @@ import {
   parseHarnessId,
   parseHarnessSettings,
 } from "./harness";
+import {
+  listComputerFiles,
+  readComputerFile,
+  type FileServiceOptions,
+} from "./files";
 import { MemoryService } from "./memory";
 import { Orchestrator } from "./orchestrator";
 import {
@@ -113,11 +121,30 @@ export interface Daemon {
 
 const DEFAULT_MODEL_KEY = "defaultModel";
 const REQUIRE_APPROVAL_KEY = "requireApproval";
+const CHAT_BUSY_BEHAVIOR_KEY = "chatBusyBehavior";
 const VNC_BUFFER_HIGH_WATER_BYTES = 256 * 1024;
 
+/** Live run bookkeeping: a run can accept steering when it is a chat turn on
+ * the built-in harness. */
+interface RunHandle {
+  runId: string;
+  controller: AbortController;
+  botId: string;
+  threadId: string | null;
+  steerable: boolean;
+  steering: string[];
+}
+
+interface QueuedChat {
+  id: string;
+  botId: string;
+  text: string;
+  model?: ModelRef;
+}
+
 export function createDaemon(options: DaemonOptions): Daemon {
-  const runs = new Map<string, AbortController>();
-  const runBots = new Map<string, string>();
+  const runs = new Map<string, RunHandle>();
+  const threadQueues = new Map<string, QueuedChat[]>();
   const pending = new Set<Promise<void>>();
 
   const artifactsDir = join(options.config.dataDir, "artifacts");
@@ -198,6 +225,13 @@ export function createDaemon(options: DaemonOptions): Daemon {
 
   const codex = new CodexDetector();
 
+  const fileOptions: FileServiceOptions = {
+    dataDir: options.config.dataDir,
+    artifactsDir,
+    sandbox: options.sandbox,
+    getBot: (botId) => options.store.getBot(botId),
+  };
+
   const deps: AgentDeps = {
     store: options.store,
     providers: options.registry.map,
@@ -249,6 +283,14 @@ export function createDaemon(options: DaemonOptions): Daemon {
     deps.requireApproval = value;
   };
 
+  const readChatBusyBehavior = (): ChatBusyBehavior => {
+    const stored = options.store.getSetting(CHAT_BUSY_BEHAVIOR_KEY);
+    if (stored === "steer" || stored === "queue") {
+      return stored;
+    }
+    return options.config.chatBusyBehavior;
+  };
+
   const broadcast = (message: ServerMessage) => {
     const payload = JSON.stringify(message);
     for (const client of wss.clients) {
@@ -269,6 +311,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
       harness: readHarnessSettings(),
       decision: decisionInfo(readDecisionSettings(), process.env),
       codex: codex.info(),
+      chatBusyBehavior: readChatBusyBehavior(),
     });
   };
 
@@ -347,19 +390,128 @@ export function createDaemon(options: DaemonOptions): Daemon {
     if (!next) {
       return;
     }
-    leadRunActive = true;
+    startRun({
+      botId: lead.id,
+      threadId: options.store.getOrCreateThread(lead.id).id,
+      text: next.text,
+      contextNote: next.contextNote,
+      internal: true,
+    });
+  };
+
+  const activeRunForThread = (threadId: string): RunHandle | null => {
+    for (const run of runs.values()) {
+      if (run.threadId === threadId) {
+        return run;
+      }
+    }
+    return null;
+  };
+
+  const resolveChatThread = (botId: string, threadId?: string): Thread => {
+    const requested = threadId ? options.store.getThread(threadId) : null;
+    if (requested && requested.botId === botId) {
+      return requested;
+    }
+    if (!threadId) {
+      for (const run of runs.values()) {
+        if (run.botId !== botId || run.threadId === null) {
+          continue;
+        }
+        const active = options.store.getThread(run.threadId);
+        if (active) {
+          return active;
+        }
+      }
+    }
+    return options.store.getOrCreateThread(botId);
+  };
+
+  // A queued message is held in memory until the thread's active run stops:
+  // it must not land in the transcript early, or the running turn would read
+  // it as already delivered.
+  const drainThreadQueue = (threadId: string): void => {
+    if (activeRunForThread(threadId)) {
+      return;
+    }
+    const queue = threadQueues.get(threadId);
+    if (!queue || queue.length === 0) {
+      return;
+    }
+    const next = queue.shift();
+    if (!next) {
+      return;
+    }
+    if (queue.length === 0) {
+      threadQueues.delete(threadId);
+    }
+    broadcast({ type: "chat.dequeued", threadId, messageId: next.id });
+    startRun({
+      botId: next.botId,
+      threadId,
+      text: next.text,
+      ...(next.model ? { model: next.model } : {}),
+      messageId: next.id,
+    });
+  };
+
+  const dropQueuedChats = (botId: string): void => {
+    for (const [threadId, queue] of threadQueues) {
+      const remaining = queue.filter((item) => item.botId !== botId);
+      if (remaining.length === 0) {
+        threadQueues.delete(threadId);
+      } else {
+        threadQueues.set(threadId, remaining);
+      }
+    }
+  };
+
+  const startRun = (input: {
+    botId: string;
+    threadId: string;
+    text: string;
+    model?: ModelRef;
+    messageId?: string;
+    skipUserMessage?: boolean;
+    internal?: boolean;
+    contextNote?: string;
+  }): void => {
     const runId = randomUUID();
     const controller = new AbortController();
-    runs.set(runId, controller);
-    runBots.set(runId, lead.id);
-    const run = runAgent(
+    const handle: RunHandle = {
+      runId,
+      controller,
+      botId: input.botId,
+      threadId: input.threadId,
+      steerable: false,
+      steering: [],
+    };
+    runs.set(runId, handle);
+    const isLead = input.botId === leadBot()?.id;
+    if (isLead) {
+      leadRunActive = true;
+    }
+
+    const harness = readHarnessSettings();
+    const useCodex = !input.internal && harness.default === "codex";
+    const run = useCodex ? runCodexTurn : runAgent;
+    handle.steerable = !input.internal && !useCodex;
+    const task = run(
       deps,
       {
         runId,
-        botId: lead.id,
-        internal: true,
-        text: next.text,
-        contextNote: next.contextNote,
+        botId: input.botId,
+        threadId: input.threadId,
+        text: input.text,
+        model: input.model,
+        messageId: input.messageId,
+        skipUserMessage: input.skipUserMessage,
+        internal: input.internal,
+        contextNote: input.contextNote,
+        steering: {
+          hasPending: () => handle.steering.length > 0,
+          drain: () => handle.steering.splice(0),
+        },
       },
       broadcast,
       controller.signal,
@@ -373,13 +525,29 @@ export function createDaemon(options: DaemonOptions): Daemon {
       })
       .finally(() => {
         runs.delete(runId);
-        runBots.delete(runId);
-        pending.delete(run);
-        leadRunActive = false;
-        reflector.schedule();
-        drainLeadQueue();
+        pending.delete(task);
+        if (isLead) {
+          leadRunActive = false;
+          reflector.schedule();
+        }
+        // A steer that arrived after the last step never made it into the
+        // turn; answer it with a fresh run so it is not left hanging.
+        if (!controller.signal.aborted && handle.steering.length > 0) {
+          const leftover = handle.steering.splice(0);
+          startRun({
+            botId: input.botId,
+            threadId: input.threadId,
+            text: leftover.join("\n\n"),
+            skipUserMessage: true,
+          });
+          return;
+        }
+        drainThreadQueue(input.threadId);
+        if (isLead) {
+          drainLeadQueue();
+        }
       });
-    pending.add(run);
+    pending.add(task);
   };
 
   const orchestrator = new Orchestrator({
@@ -440,6 +608,35 @@ export function createDaemon(options: DaemonOptions): Daemon {
   codexTimer.unref();
 
   let sandboxAvailable = false;
+  let sandboxPruned = false;
+  // A delete that races a daemon or host restart can leave a multi-GB rootfs
+  // behind. Once the host answers, remove every computer this daemon owns that
+  // is no longer a bot or an active task.
+  const pruneSandboxOrphans = async () => {
+    const sandbox = options.sandbox;
+    if (!sandbox) {
+      return;
+    }
+    try {
+      const keep = [
+        ...options.store.listBots().map((bot) => bot.id),
+        ...options.store
+          .listTasks()
+          .filter(
+            (task) => task.status === "queued" || task.status === "running",
+          )
+          .map((task) => task.id),
+      ];
+      const { removed } = await sandbox.prune(keep);
+      if (removed.length) {
+        console.log(
+          `sandbox: pruned ${removed.length} orphaned computer(s): ${removed.join(", ")}`,
+        );
+      }
+    } catch (error) {
+      console.warn(`sandbox prune failed: ${(error as Error).message}`);
+    }
+  };
   const checkSandbox = async () => {
     let available = false;
     if (options.sandbox) {
@@ -459,6 +656,10 @@ export function createDaemon(options: DaemonOptions): Daemon {
       console.log(
         `sandbox: ${available ? "available" : "unavailable"} (${options.config.sandboxUrl})`,
       );
+    }
+    if (available && !sandboxPruned) {
+      sandboxPruned = true;
+      await pruneSandboxOrphans();
     }
   };
   void checkSandbox();
@@ -556,13 +757,18 @@ export function createDaemon(options: DaemonOptions): Daemon {
 
   const wss = new WebSocketServer({ noServer: true });
   const vncWss = new WebSocketServer({ noServer: true });
+  const terminalWss = new WebSocketServer({ noServer: true });
 
-  const proxyVnc = (botId: string, client: WebSocket) => {
+  const proxySandboxStream = (
+    botId: string,
+    channel: "vnc" | "terminal",
+    client: WebSocket,
+  ) => {
     const base = options.config.sandboxUrl
       .replace(/\/+$/, "")
       .replace(/^http/, "ws");
     const upstream = new WebSocket(
-      `${base}/vms/${encodeURIComponent(botId)}/vnc`,
+      `${base}/vms/${encodeURIComponent(botId)}/${channel}`,
     );
     let closed = false;
     let drainTimer: ReturnType<typeof setInterval> | null = null;
@@ -586,14 +792,14 @@ export function createDaemon(options: DaemonOptions): Daemon {
     };
 
     connectTimer = setTimeout(() => {
-      shutdown(1013, "sandbox vnc connection timed out");
+      shutdown(1013, `sandbox ${channel} connection timed out`);
     }, 15_000);
 
     const relay = (from: WebSocket, to: WebSocket) => {
       from.on("message", (data, isBinary) => {
         if (to.readyState !== to.OPEN) return;
         to.send(data, { binary: isBinary }, (error) => {
-          if (error) shutdown(1011, "vnc relay failed");
+          if (error) shutdown(1011, `${channel} relay failed`);
         });
         if (to.bufferedAmount > VNC_BUFFER_HIGH_WATER_BYTES) from.pause();
       });
@@ -609,7 +815,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
         return;
       }
       upstream.send(data, { binary: isBinary }, (error) => {
-        if (error) shutdown(1011, "vnc relay failed");
+        if (error) shutdown(1011, `${channel} relay failed`);
       });
       if (upstream.bufferedAmount > VNC_BUFFER_HIGH_WATER_BYTES) client.pause();
     });
@@ -642,13 +848,21 @@ export function createDaemon(options: DaemonOptions): Daemon {
       }, 5);
     });
     upstream.on("unexpected-response", (_request, response) => {
-      shutdown(1013, `sandbox host rejected vnc (${response.statusCode})`);
+      shutdown(
+        1013,
+        `sandbox host rejected ${channel} (${response.statusCode})`,
+      );
     });
     upstream.on("error", () => shutdown(1013, "sandbox host unreachable"));
     upstream.on("close", () => shutdown(1011, "sandbox stream closed"));
     client.on("close", () => shutdown());
     client.on("error", () => shutdown());
   };
+
+  const proxyVnc = (botId: string, client: WebSocket) =>
+    proxySandboxStream(botId, "vnc", client);
+  const proxyTerminal = (botId: string, client: WebSocket) =>
+    proxySandboxStream(botId, "terminal", client);
 
   httpServer.on("upgrade", (request, socket, head) => {
     const url = new URL(request.url ?? "/", "http://localhost");
@@ -658,6 +872,42 @@ export function createDaemon(options: DaemonOptions): Daemon {
       });
       return;
     }
+    const reject = (status: number, message: string) => {
+      socket.write(
+        `HTTP/1.1 ${status} ${message}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n`,
+      );
+      socket.destroy();
+    };
+    const originAllowed =
+      !request.headers.origin ||
+      SCREEN_ALLOWED_ORIGINS.has(request.headers.origin);
+
+    const botTerminalMatch = /^\/bots\/([^/]+)\/terminal$/.exec(url.pathname);
+    if (botTerminalMatch) {
+      if (!originAllowed) {
+        reject(403, "Forbidden");
+        return;
+      }
+      const botId = decodeURIComponent(botTerminalMatch[1] ?? "");
+      const bot = options.store.getBot(botId);
+      if (!bot) {
+        reject(404, "Not Found");
+        return;
+      }
+      if (bot.computer === "mac") {
+        reject(409, "Conflict");
+        return;
+      }
+      if (!sandboxAvailable || !options.sandbox) {
+        reject(503, "Service Unavailable");
+        return;
+      }
+      terminalWss.handleUpgrade(request, socket, head, (client) => {
+        proxyTerminal(botId, client);
+      });
+      return;
+    }
+
     const botVncMatch = /^\/bots\/([^/]+)\/vnc$/.exec(url.pathname);
     const taskVncMatch = /^\/tasks\/([^/]+)\/vnc$/.exec(url.pathname);
     const vncMatch = botVncMatch ?? taskVncMatch;
@@ -665,17 +915,8 @@ export function createDaemon(options: DaemonOptions): Daemon {
       socket.destroy();
       return;
     }
-    const reject = (status: number, message: string) => {
-      socket.write(
-        `HTTP/1.1 ${status} ${message}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n`,
-      );
-      socket.destroy();
-    };
     const vncId = decodeURIComponent(vncMatch[1] ?? "");
-    if (
-      request.headers.origin &&
-      !SCREEN_ALLOWED_ORIGINS.has(request.headers.origin)
-    ) {
+    if (!originAllowed) {
       reject(403, "Forbidden");
       return;
     }
@@ -723,6 +964,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
       harness: readHarnessSettings(),
       decision: decisionInfo(readDecisionSettings(), process.env),
       codex: codex.info(),
+      chatBusyBehavior: readChatBusyBehavior(),
     });
 
     socket.on("message", (raw) => {
@@ -848,11 +1090,12 @@ export function createDaemon(options: DaemonOptions): Daemon {
             send({ type: "chat.error", message: `unknown bot: ${message.botId}` });
             return;
           }
-          for (const [runId, botId] of runBots) {
-            if (botId === message.botId) {
-              runs.get(runId)?.abort();
+          for (const run of runs.values()) {
+            if (run.botId === message.botId) {
+              run.controller.abort();
             }
           }
+          dropQueuedChats(message.botId);
           orchestrator.cancelForRole(message.botId);
           orchestrator.cancelForProject(message.botId);
           screenCache.delete(message.botId);
@@ -883,11 +1126,12 @@ export function createDaemon(options: DaemonOptions): Daemon {
             send({ type: "chat.error", message: `unknown bot: ${message.botId}` });
             return;
           }
-          for (const [runId, botId] of runBots) {
-            if (botId === message.botId) {
-              runs.get(runId)?.abort();
+          for (const run of runs.values()) {
+            if (run.botId === message.botId) {
+              run.controller.abort();
             }
           }
+          dropQueuedChats(message.botId);
           orchestrator.cancelForRole(message.botId);
           orchestrator.cancelForProject(message.botId);
           screenCache.delete(message.botId);
@@ -968,6 +1212,66 @@ export function createDaemon(options: DaemonOptions): Daemon {
             );
           return;
         }
+        case "files.list": {
+          void listComputerFiles(
+            fileOptions,
+            message.botId,
+            message.path ?? "",
+          )
+            .then((result) =>
+              send({
+                type: "files.list",
+                requestId: message.requestId,
+                botId: message.botId,
+                path: result.path,
+                entries: result.entries,
+                error: result.error,
+              }),
+            )
+            .catch((error: unknown) =>
+              send({
+                type: "files.list",
+                requestId: message.requestId,
+                botId: message.botId,
+                path: message.path ?? "",
+                entries: [],
+                error: (error as Error).message,
+              }),
+            );
+          return;
+        }
+        case "files.read": {
+          void readComputerFile(fileOptions, message.botId, message.path)
+            .then((result) =>
+              send({
+                type: "files.read",
+                requestId: message.requestId,
+                botId: message.botId,
+                path: result.path,
+                kind: result.kind,
+                content: result.content,
+                mime: result.mime,
+                size: result.size,
+                truncated: result.truncated,
+                error: result.error,
+              }),
+            )
+            .catch((error: unknown) =>
+              send({
+                type: "files.read",
+                requestId: message.requestId,
+                botId: message.botId,
+                path: message.path,
+                kind: "missing",
+                content: null,
+                mime: null,
+                size: 0,
+                truncated: false,
+                error: (error as Error).message,
+              }),
+            );
+          return;
+        }
         case "thread.list":
           send({ type: "threads", threads: options.store.listThreads() });
           return;
@@ -979,7 +1283,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
           });
           return;
         case "chat.cancel":
-          runs.get(message.runId)?.abort();
+          runs.get(message.runId)?.controller.abort();
           return;
         case "task.cancel":
           orchestrator.cancel(message.taskId);
@@ -1226,52 +1530,81 @@ export function createDaemon(options: DaemonOptions): Daemon {
               JSON.stringify(next),
             );
           }
+          if (message.settings.chatBusyBehavior) {
+            options.store.setSetting(
+              CHAT_BUSY_BEHAVIOR_KEY,
+              message.settings.chatBusyBehavior,
+            );
+          }
           providersUpdated();
           return;
         }
         case "chat.send": {
-          const runId = randomUUID();
-          const controller = new AbortController();
-          runs.set(runId, controller);
-          runBots.set(runId, message.botId);
-          const isLead = message.botId === leadBot()?.id;
-          if (isLead) {
-            leadRunActive = true;
-          }
-
-          const harness = readHarnessSettings();
-          const run = harness.default === "codex" ? runCodexTurn : runAgent;
-          const task = run(
-            deps,
-            {
-              runId,
-              botId: message.botId,
-              threadId: message.threadId,
-              text: message.text,
-              model: message.model,
-            },
-            send,
-            controller.signal,
-          )
-            .catch((error) => {
-              send({
-                type: "chat.error",
-                runId,
-                message: (error as Error).message,
-              });
-            })
-            .finally(() => {
-              runs.delete(runId);
-              runBots.delete(runId);
-              pending.delete(task);
-              if (isLead) {
-                leadRunActive = false;
-                reflector.schedule();
-                drainLeadQueue();
-              }
+          const bot = options.store.getBot(message.botId);
+          if (!bot) {
+            send({
+              type: "chat.error",
+              message: `unknown bot: ${message.botId}`,
             });
-
-          pending.add(task);
+            return;
+          }
+          const thread = resolveChatThread(message.botId, message.threadId);
+          const messageId = message.messageId ?? randomUUID();
+          const active = activeRunForThread(thread.id);
+          if (active) {
+            const delivery = message.delivery ?? readChatBusyBehavior();
+            if (delivery === "steer" && active.steerable) {
+              // Steering joins the live turn: persist now so the transcript
+              // keeps the right order, and let the agent pick it up at its
+              // next step boundary.
+              let userMessage: Message;
+              try {
+                userMessage = options.store.addMessage({
+                  id: messageId,
+                  threadId: thread.id,
+                  role: "user",
+                  content: message.text,
+                  model: null,
+                });
+              } catch {
+                send({
+                  type: "chat.error",
+                  threadId: thread.id,
+                  message: "message id already exists",
+                });
+                return;
+              }
+              active.steering.push(message.text);
+              broadcast({
+                type: "chat.message",
+                runId: active.runId,
+                threadId: thread.id,
+                message: userMessage,
+              });
+              return;
+            }
+            const queue = threadQueues.get(thread.id) ?? [];
+            queue.push({
+              id: messageId,
+              botId: message.botId,
+              text: message.text,
+              ...(message.model ? { model: message.model } : {}),
+            });
+            threadQueues.set(thread.id, queue);
+            broadcast({
+              type: "chat.queued",
+              threadId: thread.id,
+              messageId,
+            });
+            return;
+          }
+          startRun({
+            botId: message.botId,
+            threadId: thread.id,
+            text: message.text,
+            model: message.model,
+            messageId,
+          });
           return;
         }
       }
@@ -1303,8 +1636,8 @@ export function createDaemon(options: DaemonOptions): Daemon {
       clearInterval(codexTimer);
       reflector.stop();
       await orchestrator.stop();
-      for (const controller of runs.values()) {
-        controller.abort();
+      for (const run of runs.values()) {
+        run.controller.abort();
       }
       for (const socket of wss.clients) {
         socket.close();

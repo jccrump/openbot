@@ -43,6 +43,8 @@ export interface BrowseLoopInput {
   startUrl?: string;
   maxSteps?: number;
   signal?: AbortSignal;
+  /** Network egress policy enforced inside the guest for every request. */
+  egress?: { mode: "ask" | "deny"; allow: string[] };
   screenPage?: (page: BrowsePage) => Promise<string | null>;
   onDecision?: (notice: DecisionNotice) => void;
 }
@@ -161,13 +163,24 @@ export async function runBrowseLoop(
     challenge?: boolean;
   }> => {
     browserActions += 1;
-    return input.sandbox.browser(input.botId, {
+    const result = await input.sandbox.browser(input.botId, {
       action: String(payload.action ?? ""),
       ...(typeof payload.url === "string" ? { url: payload.url } : {}),
       ...(typeof payload.href === "string" ? { href: payload.href } : {}),
       ...(typeof payload.index === "number" ? { index: payload.index } : {}),
+      ...(input.egress ? { egress: input.egress } : {}),
       timeoutMs: BROWSER_ACTION_TIMEOUT_MS,
     });
+    const blocked = (result as { egressBlocked?: string[] }).egressBlocked;
+    if (blocked?.length && result.text) {
+      return {
+        ...result,
+        text:
+          `${result.text}\n[egress] blocked request(s) to ${blocked.join(", ")}: ` +
+          "not in the browser egress allowlist",
+      };
+    }
+    return result;
   };
 
   const record = async (result: {

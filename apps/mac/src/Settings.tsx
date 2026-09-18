@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import type {
+  ChatBusyBehavior,
   CodexInfo,
   DecisionGuardrailMode,
   DecisionInfo,
@@ -36,6 +37,7 @@ interface SettingsProps {
   harness: HarnessSettings;
   decision: DecisionInfo | null;
   codex: CodexInfo | null;
+  chatBusyBehavior: ChatBusyBehavior;
   theme: ThemePreference;
   onThemeChange: (theme: ThemePreference) => void;
   onSaveProvider: (provider: ProviderInput) => void;
@@ -45,6 +47,7 @@ interface SettingsProps {
     requireApproval?: boolean;
     harness?: { default: HarnessId };
     decision?: DecisionSettingsPatch;
+    chatBusyBehavior?: ChatBusyBehavior;
   }) => void;
   onFetchModels: (input: {
     providerId?: string;
@@ -104,6 +107,11 @@ const THEME_OPTIONS: Array<{ value: ThemePreference; label: string }> = [
   { value: "system", label: "System" },
   { value: "light", label: "Light" },
   { value: "dark", label: "Dark" },
+];
+
+const CHAT_BUSY_OPTIONS: Array<{ value: ChatBusyBehavior; label: string }> = [
+  { value: "steer", label: "Steer" },
+  { value: "queue", label: "Queue" },
 ];
 
 const GUARDRAIL_OPTIONS: Array<{
@@ -633,7 +641,43 @@ export function Settings(props: SettingsProps) {
                     <span className="switch-knob" />
                   </button>
                 </div>
+                <div className="settings-row">
+                  <span>When I message while it is working</span>
+                  <div
+                    className="segmented"
+                    role="radiogroup"
+                    aria-label="When I message while it is working"
+                  >
+                    {CHAT_BUSY_OPTIONS.map((option) => (
+                      <button
+                        key={option.value}
+                        role="radio"
+                        aria-checked={props.chatBusyBehavior === option.value}
+                        className={`segmented-option ${
+                          props.chatBusyBehavior === option.value
+                            ? "segmented-option-active"
+                            : ""
+                        }`}
+                        onClick={() =>
+                          props.onUpdateSettings({
+                            chatBusyBehavior: option.value,
+                          })
+                        }
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               </section>
+            )}
+
+            {section === "general" && (
+              <p className="settings-empty">
+                Steer folds your message into the running turn at its next step
+                so it can change course. Queue holds it and sends automatically
+                when the agent stops.
+              </p>
             )}
 
             {section === "appearance" && (

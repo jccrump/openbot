@@ -75,18 +75,33 @@ function observationId(index: number, prefix = "browser"): string {
   return `${prefix}-${String(index + 1).padStart(3, "0")}`;
 }
 
-const EVIDENCE_MARKER = /\[evidence ((?:browser|browse)-\d+); source=([a-z-]+)\]/;
+const EVIDENCE_MARKER = /\[evidence ((?:browser|browse|websearch)-\d+); source=([a-z-]+)\]/;
 
-export const BROWSER_TOOL_NAMES = new Set([
+export const WEB_SEARCH_TOOL_NAME = "web_search";
+
+/**
+ * Tools whose results enter the completion audit's evidence ledger. Browser
+ * observations are page reads; web_search observations are aggregated search
+ * results, so the verifier treats them as discovery rather than confirmation.
+ */
+export const EVIDENCE_TOOL_NAMES = new Set([
   "browser",
   "browser_execute",
   "browser_step",
   "browse",
+  WEB_SEARCH_TOOL_NAME,
 ]);
 
 function extractUrl(output: string): string | null {
-  const match = /^url:\s*(\S+)/m.exec(output);
+  const match = /^url:\s*(\S+)/im.exec(output);
   return match?.[1] ?? null;
+}
+
+function fallbackKind(record: ToolCallRecord, url: string | null): EvidenceKind {
+  if (record.name === WEB_SEARCH_TOOL_NAME) {
+    return record.ok ? "search-results" : "failed";
+  }
+  return classify(record, url);
 }
 
 function classify(record: ToolCallRecord, url: string | null): EvidenceKind {
@@ -129,13 +144,29 @@ export function annotateBrowserObservation(
   );
 }
 
+/**
+ * A web search returns several pages at once, so it is one aggregated
+ * observation classified as search results: useful for discovery and for
+ * finding the URL to open, not as direct confirmation of a fact.
+ */
+export function annotateWebSearchObservation(
+  output: string,
+  ok: boolean,
+  index: number,
+): string {
+  const kind: EvidenceKind = ok ? "search-results" : "failed";
+  return (
+    `[evidence ${observationId(index, "websearch")}; source=${kind}]\n` + output
+  );
+}
+
 export function buildEvidenceLedger(
   records: ToolCallRecord[],
 ): EvidenceObservation[] {
   let browserIndex = 0;
   const observations: EvidenceObservation[] = [];
   for (const record of records) {
-    if (!BROWSER_TOOL_NAMES.has(record.name)) {
+    if (!EVIDENCE_TOOL_NAMES.has(record.name)) {
       continue;
     }
     if (record.name === "browse") {
@@ -154,14 +185,20 @@ export function buildEvidenceLedger(
       }
       continue;
     }
-    const id = observationId(browserIndex);
-    browserIndex += 1;
+    const marker = EVIDENCE_MARKER.exec(record.output);
     const url = extractUrl(record.output);
+    const id =
+      marker?.[1] ??
+      observationId(
+        browserIndex,
+        record.name === WEB_SEARCH_TOOL_NAME ? "websearch" : "browser",
+      );
+    browserIndex += 1;
     observations.push({
       id,
       tool: record.name,
       ok: record.ok,
-      kind: classify(record, url),
+      kind: (marker?.[2] as EvidenceKind | undefined) ?? fallbackKind(record, url),
       url,
       arguments: record.arguments,
       output: record.output,
@@ -266,7 +303,7 @@ export function buildVerificationFeedback(audit: CompletionAudit): string {
 }
 
 export function shouldAuditCompletion(records: ToolCallRecord[]): boolean {
-  return records.some((record) => BROWSER_TOOL_NAMES.has(record.name));
+  return records.some((record) => EVIDENCE_TOOL_NAMES.has(record.name));
 }
 
 export const JEV_AUDIT_QUESTIONS = {

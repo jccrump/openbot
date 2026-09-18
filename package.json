@@ -29,8 +29,10 @@
     "egress:live": "node scripts/egress-live.mjs",
     "typecheck": "pnpm -r typecheck",
     "code-tools:smoke": "pnpm --filter @openbot/core code-tools:smoke",
+    "websearch:smoke": "pnpm --filter @openbot/core websearch:smoke",
     "smoke": "node scripts/smoke.mjs",
     "eval:validate": "node scripts/eval-validate.mjs",
-    "eval": "node scripts/eval.mjs"
+    "eval": "node scripts/eval.mjs",
+    "polyglot:eval": "node scripts/polyglot-eval.mjs"
   }
 }

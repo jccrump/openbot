@@ -20,6 +20,7 @@ const TOOLS = [
   "write_file",
   "browser",
   "browse",
+  "web_search",
   "desktop",
 ];
 

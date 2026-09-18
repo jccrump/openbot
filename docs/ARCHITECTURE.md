@@ -93,16 +93,28 @@ docs/                      This document and screenshots
   development it also runs in a browser via `pnpm dev:app`.
 - Talks to the daemon exclusively over the WebSocket protocol. Reconnects
   automatically; the daemon can restart underneath it.
-- Surfaces today: the lead pinned above a Team section and a Work list, search
-  across roles and tasks, a per-role settings modal (including the delegation
-  switch), and the model picker in the sidebar; chat with streaming text and a
-  three-dot typing bubble while the model is thinking (reasoning deltas are
-  received but hidden by default); a workboard strip with task chips and
-  worker approvals; a task detail with grant, budget, usage, child workers,
-  live transcript, cancel, and a Watch overlay for the task's own desktop;
-  tool cards with output and screenshots; inline approval cards; a collapsible
-  live noVNC screen panel with screenshot fallback and a draggable resizer;
-  create-role modal; and Settings.
+- Surfaces today: the thread rail on the left (project managers and their
+  workers, each manager expandable); chat with streaming text, a three-dot
+  typing bubble while the model is thinking (reasoning deltas are received but
+  hidden by default), collapsible **Worked N actions** groups, tool cards with
+  output and screenshots, and inline approval cards; a thread drawer with the
+  task detail (grant, budget, usage, child workers, live transcript, cancel,
+  and a Watch overlay for the task's own desktop); the agent panel with Screen,
+  Files, and Terminal tabs and a draggable resizer; and the approvals, memory,
+  agent-settings, and Settings modals.
+- **Agent panel.** The Screen tab is the live noVNC view with screenshot
+  fallback and full-screen takeover; the VNC socket is only opened while that
+  tab is active, so the desktop is never streamed in the background. The Files
+  tab lists the agent's computer through `files.list`/`files.read`: on This Mac
+  the daemon runs the workspace-confined `code-tools.mjs` helper, and in the
+  guest the long-running Python agent answers `list`/`read` ops natively. The
+  native path matters: the guest's Node binary is 122 MB and a Node cold start
+  costs ~800 ms there, while the in-process op answers a directory in ~10 ms.
+  The Terminal tab opens `ws://…/bots/:id/terminal`, proxied to the sandbox
+  host and then to a PTY bridge in the guest, and renders it with xterm.js;
+  input, resize, and base64 output are newline-delimited JSON frames, and the
+  session stays alive across tab switches and ends when the panel closes or the
+  agent changes.
 - Background or unfocused windows keep their RFB connection and last rendered
   canvas warm, but hold framebuffer update requests, disable input, and suspend
   screenshot polling. The pending update is released on focus, avoiding a new
@@ -196,7 +208,26 @@ mode.
 1. **OpenBot loop** (`agent.ts`) — the daemon owns the agent loop and the
    tools. Approvals surface in the app, streaming maps directly onto the
    protocol, reasoning deltas are hidden by the UI (the typing bubble signals
-   thinking), and any OpenAI-compatible model works. This is the default.
+   thinking), and any OpenAI-compatible model works. This is the default. The
+   loop is completion-driven and bounded: it keeps taking tool steps until the
+   model returns a final answer, with a step cap (60) that ends the turn with
+   a note instead of looping forever, a duplicate-failure stop after three
+   identical failing calls, one retry for transient sandbox and provider
+   failures, model-readable `[tool error]` results so a failed call can be
+   recovered in the same turn, and automatic compaction on context overflow.
+   Tool output longer than the model's budget is spilled to a file inside the
+   computer and named in the result, so nothing is lost. Tool failures never
+   crash a turn: the model sees what happened and adapts. Within a turn, a file
+   re-read unchanged and a byte-identical repeat of the same call collapse to
+   short notes, so a long run does not pay for the same content twice; both
+   caches clear when compaction rebuilds the transcript. `update_plan` stores a
+   short working plan on the thread — it is injected into later turns as
+   `[plan]`, so it survives compaction and context growth. File and command
+   output is screened for prompt injection: output that looks like it addresses
+   the agent goes to the decision model, and `annotate` warns while `block`
+   withholds it. `shell` can detach a command with `background: true` — a
+   server, watcher, or build keeps running past the command timeout with its
+   output in a log file the model can tail or kill by pid.
 2. **Codex** (`codex.ts`) — the daemon spawns `codex exec --json` with
    `--ignore-user-config --skip-git-repo-check --ephemeral --sandbox
    read-only`, registers `packages/mcp` as the only MCP server, and maps Codex
@@ -531,13 +562,37 @@ esbuild into a single `service.mjs`, installed into the Lima VM at
 - `POST /vms/:botId/desktop` runs a mouse, keyboard, scroll, drag, or window
   action on the agent's desktop display with xdotool (installed in the outer
   Lima VM), and captures screenshots with scrot
+- `ws://…/vms/:botId/terminal` relays a PTY session: the host connects to
+  guest vsock port 5001, where `agent.py` spawns `/bin/bash -l` on a pty and
+  frames input, resize, and base64 output as newline-delimited JSON
+- `POST /vms/:botId/files` sends `{ op: "list" | "read", … }` to the guest
+  agent over vsock and returns its JSON answer, so the app's file browser does
+  not spawn a process per folder
 - `POST /vms/:botId/stop` and `POST /vms/:botId/destroy`
+- `GET /vms/:botId/network` returns the browser session's HAR network trace
+  (`/var/lib/fc/vms/<botId>/network.har`), recorded per page request with a
+  bounded, debounced rewrite. A browser `upload` action stages guest files as
+  host copies the browser account can read before attaching them to a file
+  input, since Chromium runs on the host while the agent's files live in the
+  microVM; a `downloads` action copies the host download directory back into
+  `/root/Downloads` in the VM for the same reason
+- `POST /vms/:botId/network-policy` sets a hard shell egress allowlist for the
+  VM. The host resolves the hostnames to IPv4 addresses and rebuilds the
+  `inet openbot_egress` table, whose forward hook jumps to a per-tap chain that
+  drops everything outside the allowlist (plus DNS to the image's resolvers
+  and established traffic). Rules re-apply on boot and are removed with the VM
 
 Per-agent state lives in `/var/lib/fc/vms/<botId>/` (rootfs copy and version,
 newest recovery image, browser profile/log, `api.sock`, `vsock.sock`,
 `serial.log`). Task computers use the same paths keyed by the task id: they
 boot from the base image, and `destroy` stops the VM and removes its rootfs,
-browser profile, and Linux account, so per-task computers leave nothing behind. `sandbox:setup`
+browser profile, and Linux account, so per-task computers leave nothing behind.
+Each VM records the daemon that created it (`owner`, a hash of the data dir).
+On startup a daemon calls `POST /prune` with every computer it still knows
+(bots plus queued/running tasks); the host removes that owner's stopped VM
+directories that are not in the list. A delete lost to a daemon or host restart
+therefore costs disk only until the next start, and one daemon can never prune
+another's (or an eval runner's) computers. `sandbox:setup`
 hashes the managed guest payload into `/var/lib/fc/rootfs.version`. On a version
 mismatch, the host checks and mounts the stopped old image, creates a fresh
 rootfs from the base, copies durable data from `/root`, `/home`, `/srv`, and
@@ -549,11 +604,14 @@ newest compressed rollback image.
 
 The host exposes RFB only as `ws://127.0.0.1:4171/vms/:id/vnc`; the daemon
 validates the bot and browser origin and relays it as
-`ws://127.0.0.1:4170/bots/:id/vnc`. noVNC uses exponential reconnect backoff
-with jitter and disposes canvases, sockets, and timers when the panel changes.
-`pnpm vnc:smoke` performs an RFB 3.8 handshake, requests Raw encoding, and
-requires actual framebuffer bytes, so an HTTP/WebSocket upgrade alone cannot
-pass.
+`ws://127.0.0.1:4170/bots/:id/vnc`. The terminal follows the same shape:
+`ws://127.0.0.1:4171/vms/:id/terminal` relayed as
+`ws://127.0.0.1:4170/bots/:id/terminal`, with the same origin check and a
+Firecracker-only rule (This Mac gets a clear message in the UI). noVNC uses
+exponential reconnect backoff with jitter and disposes canvases, sockets, and
+timers when the panel changes. `pnpm vnc:smoke` performs an RFB 3.8 handshake,
+requests Raw encoding, and requires actual framebuffer bytes, so an
+HTTP/WebSocket upgrade alone cannot pass.
 
 **Networking.** Each microVM gets a tap device and a static IP
 (`172.16.<slot>.2`) with NAT through the Lima VM's uplink. Set
@@ -576,7 +634,7 @@ and point-in-time restore do not.
 
 ### Tools and approvals
 
-The daemon exposes six tools to any model that supports function calling:
+The daemon exposes these tools to any model that supports function calling:
 
 - `shell` — run a command on the agent's computer
 - `read_file` — read a file from the agent's computer
@@ -632,6 +690,14 @@ The daemon exposes six tools to any model that supports function calling:
   is the collected evidence with `browse-00N` observation IDs, which the
   completion audit expands into one observation per page. It cannot type or
   sign in; the plain `browser` tool remains for that.
+- `web_search` — search the live web from the daemon process through a hosted
+  MCP endpoint (Exa by default, Parallel when configured) and return the
+  provider's LLM-ready context text with titles and URLs. It never touches the
+  agent's computer, so it also works on This Mac, where the browser tools are
+  unavailable. `EXA_API_KEY` and `PARALLEL_API_KEY` are optional — the Exa
+  endpoint is keyless — and `OPENBOT_WEBSEARCH_PROVIDER=exa|parallel` forces
+  the provider. Search is an ordinary approval-gated tool call; the `read-only`
+  policy preset auto-allows it and `locked` denies it.
 
 **Bot checks.** Chromium launches with
 `--disable-blink-features=AutomationControlled` and a consistent `en-US` locale,
@@ -719,9 +785,15 @@ points that always keep the built-in deny rules. Each role can carry a
 **role policy** (`bots.policy`): a preset that can only make things stricter
 than the global policy, since tool tiers take the stricter of the two, rules
 accumulate, and timeouts take the shorter. **Egress** adds an allowlist for
-browser navigation: with mode `ask` or `deny`, a host outside the list is
-asked for or blocked, and subdomains of an entry count as allowed. Egress
-currently covers the browser tools only; shell egress is not parsed.
+browser traffic: with mode `ask` or `deny`, a host outside the list is asked
+for or blocked, and subdomains of an entry count as allowed. In `deny` mode
+the guest enforces the allowlist at the network level for every request the
+page makes — subresources and XHR/fetch included — so a denied host cannot be
+reached through a frame or a script. `ask` mode approves per navigation at the
+daemon. In `deny` mode the host also enforces the allowlist for the VM's own
+shell traffic: the daemon pushes the resolved policy per turn, and nftables on
+the VM's tap permits only allowlisted addresses, DNS to the image's resolvers,
+and established traffic. This Mac commands are never filtered.
 
 Every request and decision is persisted with its tier, reason, and who decided
 (`user`, `timeout`, `abort`); unanswered requests auto-deny after the
@@ -759,15 +831,20 @@ confirmation dialog.
 Client to server:
 
 - `hello` — client identification
-- `chat.send` — `{ botId, threadId?, text, model? }`
+- `chat.send` — `{ botId, threadId?, text, model?, messageId?, delivery? }`;
+  `messageId` is the client-generated id echoed by the persisted transcript,
+  and `delivery` (`steer` | `queue`) decides what happens when the thread
+  already has a run, defaulting to the busy-turn setting
 - `chat.cancel` — `{ runId }`
 - `thread.list`, `thread.messages`
 - `bots.create`, `bots.update` (name, role, avatar, color, computer),
   `bots.delete`, `bots.reset`, `bots.power`, `sandbox.status`
+- `files.list` — `{ botId, path? }`, lists a directory on the agent's computer
+- `files.read` — `{ botId, path }`, reads one file for the Files preview
 - `provider.upsert`, `provider.remove`, `provider.fetchModels`
 - `settings.update` — default model, approval toggle, harness, compaction,
   decision-model settings (enabled, base URL, model, key or env var, audit,
-  browse, guardrail, timeout)
+  browse, guardrail, timeout), busy-turn delivery default
 - `approval.respond`
 - `challenge.respond`
 - `task.cancel` — `{ taskId }`, aborts the task's worker run
@@ -775,12 +852,14 @@ Client to server:
 Server to client:
 
 - `hello` — snapshot: bots, threads, tasks, providers, presets, default model,
-  approval setting, harness, decision-model info, Codex info
+  approval setting, harness, decision-model info, Codex info, busy-turn default
 - `threads`, `thread.messages`, `thread.upserted`
 - `chat.start`, `chat.delta`, `chat.reasoning`, `chat.done`, `chat.message`,
   `chat.error`, `chat.compaction` — streaming text and live reasoning deltas
   (rendered in the expanded work group while a run is active; reasoning is not
   persisted); `chat.message` appends a persisted step message mid-run
+- `chat.queued`, `chat.dequeued` — a busy-thread message was held for the next
+  run, and that run has now started
 - `chat.decision` — one Jev evaluation (audit, browse step, or guardrail
   screen) with its summary, latency, model, and whether it flagged something;
   the app renders these in the per-turn work group
@@ -792,6 +871,10 @@ Server to client:
 - `challenge.request` — pauses the run on a bot check until the user retries or
   skips it
 - `sandbox.state` — agent computer state (stopped, booting, running, error)
+- `files.list` — directory entries (name, dir, size, mtime) and the resolved
+  path, or a readable error (for example, the computer is not running)
+- `files.read` — `{ kind: text | image | binary | dir | missing, content, mime,
+  size, truncated }`; images arrive base64 for the preview
 - `bot.created`, `bot.updated`, `bot.deleted`, `bot.reset`, `providers.updated`,
   `provider.models`
 - `task.upserted` — a task row changed (status, result, budget, error); the
@@ -1064,8 +1147,11 @@ timeout; an inbox shows pending plus history so a fan-out cannot strand a run
 on an unseen card. Presets are one-click starting points that keep the built-in
 deny floor, and role policies narrow the global policy the same way grants
 narrow a task: a role can only be stricter. Egress allowlists gate browser
-navigation per host, with shell egress explicitly out of scope until a real
-network policy exists. Rejected: per-action risk scoring that auto-approves
+traffic per host; a `deny` policy is enforced inside the guest for every
+request the page makes, while `ask` approves per navigation at the daemon, and
+shell egress is enforced at the network layer in `deny` mode (nftables on the
+VM's tap; DNS to the image's resolvers stays open, and This Mac is out of
+scope). Rejected: per-action risk scoring that auto-approves
 (approvals stay human) and policy in the prompt (the model must not be able to
 widen its own permissions).
 
@@ -1086,6 +1172,22 @@ user decision. Rejected: ephemeral anonymous workers (the team never
 accumulates capability, and every task pays to re-derive the role);
 auto-creating a role per task (roster sprawl and duplicate specialists);
 letting workers hire workers (unbounded fan-out and cost).
+
+**ADR-020: Messages sent mid-turn steer or queue.** Sending while the agent
+works used to be dropped by the composer, and a second client's message would
+start a concurrent run in the daemon. Now the daemon serializes per thread: a
+`chat.send` that lands on a thread with an active run is either steered —
+persisted immediately, folded into the running turn at its next step boundary
+so the model can change course without losing completed tool work — or queued,
+held in memory (never written to the transcript early, or the running turn
+would read it as already delivered) and started as a fresh run when the thread
+goes idle. The default is the `chatBusyBehavior` setting (`steer` or `queue`),
+overridable per send; runs that cannot take steering (internal task turns, the
+Codex harness) fall back to queueing, and a steer that lands after the last
+step is answered by a follow-up run so it is never left hanging. Rejected:
+abort-and-resend (throws away completed tool work and re-bills the turn); a
+client-side-only queue (lost on reload, no cross-window consistency); injecting
+mid-provider-call (a stream cannot accept a new user turn).
 
 **ADR-017 amendment: memory and soul adapt automatically, but stay legible.**
 The user asked for memory and soul to change over time without being told to,

@@ -1,4 +1,7 @@
 import { execFileSync, execSync, spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { lookup } from "node:dns/promises";
 import {
   createServer,
   request as httpRequest,
@@ -21,7 +24,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { extname, join } from "node:path";
 import { connect } from "node:net";
 import { deflateSync } from "node:zlib";
 import { WebSocket, WebSocketServer } from "ws";
@@ -39,6 +42,7 @@ const KERNEL = join(FC_DIR, "vmlinux");
 const VMS_DIR = join(FC_DIR, "vms");
 const PORT = Number(process.env.OPENBOT_HOST_PORT ?? 4171);
 const VSOCK_PORT = 5000;
+const PTY_VSOCK_PORT = 5001;
 const VNC_VSOCK_PORT = 5900;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const BOOT_TIMEOUT_MS = 120_000;
@@ -46,6 +50,9 @@ const VNC_READY_TIMEOUT_MS = 30_000;
 const VNC_BUFFER_HIGH_WATER_BYTES = 256 * 1024;
 const ROOTFS_BACKUP_RETENTION = 1;
 const NETWORK_ENABLED = process.env.OPENBOT_SANDBOX_NETWORK !== "false";
+// Which daemon owns a VM. Carried per request so VM directories can be garbage
+// collected without one daemon pruning another's (or an eval runner's) VMs.
+const requestOwner = new AsyncLocalStorage<string>();
 const BOOT_ARGS =
   "console=ttyS0 reboot=k panic=1 init=/usr/local/bin/openbot-agent.py";
 
@@ -140,6 +147,131 @@ function setupNat() {
     }
   }
   log(`network: nat enabled via ${uplinkInterface}`);
+}
+
+// ---------------------------------------------------------------------------
+// Per-VM shell egress. A hard `deny` policy is enforced with nftables on the
+// VM's tap interface: only the resolved allowlist, DNS to the image's
+// resolvers, and established/related traffic leave the VM. The browser runs on
+// this host, so it is not affected by these rules.
+// ---------------------------------------------------------------------------
+
+const EGRESS_TABLE = "openbot_egress";
+const EGRESS_DNS_SERVERS = ["1.1.1.1", "8.8.8.8"];
+const EGRESS_MAX_HOSTS = 50;
+const egressPolicies = new Map<string, { allow: string[]; ips: string[] }>();
+
+function isIpAddress(value: string): boolean {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(value);
+}
+
+async function resolveAllowlist(hosts: string[]): Promise<string[]> {
+  const ips = new Set<string>();
+  for (const host of hosts.slice(0, EGRESS_MAX_HOSTS)) {
+    const name = host.trim().replace(/^\./, "");
+    if (!name) {
+      continue;
+    }
+    if (isIpAddress(name)) {
+      ips.add(name);
+      continue;
+    }
+    try {
+      const results = await lookup(name, { all: true });
+      for (const result of results) {
+        if (result.family === 4) {
+          ips.add(result.address);
+        }
+      }
+    } catch {
+      // An unresolvable host simply has no addresses; the rest still apply.
+    }
+  }
+  return [...ips];
+}
+
+function egressScript(): string {
+  const lines = [
+    `add table inet ${EGRESS_TABLE}`,
+    `add chain inet ${EGRESS_TABLE} forward { type filter hook forward priority -10; policy accept; }`,
+  ];
+  for (const [botId, policy] of egressPolicies) {
+    const record = vms.get(botId);
+    if (!record?.network) {
+      continue;
+    }
+    const chain = `vm_${record.network.tap}`;
+    const set = `${chain}_ips`;
+    lines.push(`add chain inet ${EGRESS_TABLE} ${chain}`);
+    lines.push(
+      `add rule inet ${EGRESS_TABLE} forward iifname "${record.network.tap}" jump ${chain}`,
+    );
+    lines.push(
+      `add rule inet ${EGRESS_TABLE} ${chain} ct state established,related accept`,
+    );
+    // The tap is IPv4-only, but drop IPv6 anyway so a future route cannot
+    // bypass the allowlist.
+    lines.push(`add rule inet ${EGRESS_TABLE} ${chain} meta nfproto ipv6 drop`);
+    for (const server of EGRESS_DNS_SERVERS) {
+      lines.push(
+        `add rule inet ${EGRESS_TABLE} ${chain} ip daddr ${server} udp dport 53 accept`,
+      );
+      lines.push(
+        `add rule inet ${EGRESS_TABLE} ${chain} ip daddr ${server} tcp dport 53 accept`,
+      );
+    }
+    lines.push(
+      `add rule inet ${EGRESS_TABLE} ${chain} icmp type echo-request accept`,
+    );
+    lines.push(
+      `add set inet ${EGRESS_TABLE} ${set} { type ipv4_addr; flags interval; }`,
+    );
+    const allowed = policy.ips ?? [];
+    if (allowed.length > 0) {
+      lines.push(
+        `add element inet ${EGRESS_TABLE} ${set} { ${allowed.join(", ")} }`,
+      );
+    }
+    lines.push(
+      `add rule inet ${EGRESS_TABLE} ${chain} ip daddr @${set} accept`,
+    );
+    lines.push(`add rule inet ${EGRESS_TABLE} ${chain} drop`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function applyEgressRules(): { ok: boolean; error?: string } {
+  const scriptPath = join("/tmp", "openbot-egress.nft");
+  try {
+    tryExec(`nft delete table inet ${EGRESS_TABLE}`);
+    if (egressPolicies.size === 0) {
+      return { ok: true };
+    }
+    // nft on this image refuses `-f -`; hand it a real file.
+    writeFileSync(scriptPath, egressScript());
+    execFileSync("nft", ["-f", scriptPath]);
+    return { ok: true };
+  } catch (error) {
+    const message = (error as Error).message;
+    log(`egress rules failed: ${message}`);
+    return { ok: false, error: message };
+  } finally {
+    rmSync(scriptPath, { force: true });
+  }
+}
+
+async function setEgressPolicy(
+  botId: string,
+  policy: { mode: "deny"; allow: string[] } | null,
+): Promise<{ ok: boolean; ips?: string[]; error?: string }> {
+  if (!policy || policy.mode !== "deny") {
+    egressPolicies.delete(botId);
+    return applyEgressRules();
+  }
+  const ips = await resolveAllowlist(policy.allow);
+  egressPolicies.set(botId, { allow: policy.allow, ips });
+  const applied = applyEgressRules();
+  return { ...applied, ips };
 }
 
 function networkFor(slot: number): VmNetwork {
@@ -272,16 +404,27 @@ function pruneRootfsBackups(dir: string, keep = ROOTFS_BACKUP_RETENTION) {
   }
 }
 
+/**
+ * Free space and the space one new agent rootfs needs. Reported by /health so
+ * a caller can tell the user before an agent starts that no computer fits.
+ */
+function imageCapacity(): { freeBytes: number; requiredBytes: number } {
+  const filesystem = statfsSync(FC_DIR);
+  const freeBytes = filesystem.bavail * filesystem.bsize;
+  const baseBlocks = statSync(BASE_ROOTFS).blocks ?? 0;
+  const baseAllocatedBytes = baseBlocks * 512;
+  return {
+    freeBytes,
+    requiredBytes: baseAllocatedBytes + 512 * 1024 * 1024,
+  };
+}
+
 function requireImageCapacity(dir: string) {
   // Image upgrades used to retain every prior base image indefinitely. Keep a
   // single rollback point so routine image refreshes cannot fill the host and
   // prevent the next VM from starting.
   pruneRootfsBackups(dir);
-  const filesystem = statfsSync(dir);
-  const freeBytes = filesystem.bavail * filesystem.bsize;
-  const baseBlocks = statSync(BASE_ROOTFS).blocks ?? 0;
-  const baseAllocatedBytes = baseBlocks * 512;
-  const requiredBytes = baseAllocatedBytes + 512 * 1024 * 1024;
+  const { freeBytes, requiredBytes } = imageCapacity();
   if (freeBytes < requiredBytes) {
     const gib = (value: number) => (value / 1024 ** 3).toFixed(1);
     throw new Error(
@@ -349,6 +492,10 @@ function prepareRootfs(botId: string): RootfsUpgrade | null {
       copySparse(BASE_ROOTFS, rootfs);
       checkExt4(rootfs, "new rootfs");
       writeFileSync(vmVersionFile(botId), `${baseVersion}\n`);
+      writeFileSync(
+        join(dir, "owner"),
+        `${requestOwner.getStore() ?? "default"}\n`,
+      );
     } catch (error) {
       rmSync(rootfs, { force: true });
       throw error;
@@ -675,6 +822,73 @@ function vsockExec(
   });
 }
 
+// File browsing is a native guest-agent operation: the agent answers list and
+// read requests in-process, so the app does not pay a Node cold start (the
+// guest's Node binary is large and V8 init is ~800ms) per folder.
+function vsockFiles(
+  udsPath: string,
+  payload: Record<string, unknown>,
+  timeoutMs: number,
+): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(udsPath);
+    let buffer = "";
+    let phase: "handshake" | "response" = "handshake";
+    let settled = false;
+
+    const finish = (error: Error | null, result?: Record<string, unknown>) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      if (error) {
+        reject(error);
+      } else {
+        resolve(result!);
+      }
+    };
+
+    const timer = setTimeout(
+      () => finish(new Error(`sandbox files timed out after ${timeoutMs}ms`)),
+      timeoutMs + 5000,
+    );
+
+    socket.on("connect", () => {
+      socket.write(`CONNECT ${VSOCK_PORT}\n`);
+    });
+
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+
+      if (phase === "handshake") {
+        const newline = buffer.indexOf("\n");
+        if (newline === -1) return;
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (!line.startsWith("OK")) {
+          finish(new Error(`vsock handshake failed: ${line.slice(0, 120)}`));
+          return;
+        }
+        phase = "response";
+        socket.write(JSON.stringify(payload) + "\n");
+      }
+
+      if (phase === "response") {
+        const newline = buffer.indexOf("\n");
+        if (newline === -1) return;
+        const line = buffer.slice(0, newline);
+        try {
+          finish(null, JSON.parse(line) as Record<string, unknown>);
+        } catch {
+          finish(new Error(`bad agent response: ${line.slice(0, 200)}`));
+        }
+      }
+    });
+
+    socket.on("error", (error) => finish(error));
+  });
+}
+
 function attachVnc(botId: string, client: WebSocket) {
   const socket = connect(vsockSock(botId));
   let pending = Buffer.alloc(0);
@@ -868,6 +1082,113 @@ function attachBrowserVnc(botId: string, client: WebSocket) {
   client.on("error", () => shutdown(1011, "client websocket failed"));
 }
 
+// The terminal is a newline-delimited JSON stream in both directions: the
+// guest pty bridge frames base64 data, input, and resize messages that way, so
+// the host relays whole lines and the client parses them.
+function attachTerminal(botId: string, client: WebSocket) {
+  const socket = connect(vsockSock(botId));
+  let pending = Buffer.alloc(0);
+  const pendingClient: Buffer[] = [];
+  let handshake = false;
+  let closed = false;
+  let resumeTimer: ReturnType<typeof setInterval> | null = null;
+
+  const shutdown = (code = 1011, reason = "terminal stream closed") => {
+    if (closed) return;
+    closed = true;
+    if (resumeTimer) {
+      clearInterval(resumeTimer);
+      resumeTimer = null;
+    }
+    socket.destroy();
+    try {
+      client.close(code, reason);
+    } catch {
+      // already closed
+    }
+  };
+
+  const pauseUntilClientDrains = () => {
+    socket.pause();
+    if (resumeTimer) return;
+    resumeTimer = setInterval(() => {
+      if (closed || client.readyState !== client.OPEN) {
+        if (resumeTimer) clearInterval(resumeTimer);
+        resumeTimer = null;
+        return;
+      }
+      if (client.bufferedAmount < VNC_BUFFER_HIGH_WATER_BYTES) {
+        if (resumeTimer) clearInterval(resumeTimer);
+        resumeTimer = null;
+        socket.resume();
+      }
+    }, 5);
+  };
+
+  socket.on("connect", () => {
+    socket.setTimeout(15_000);
+    socket.setNoDelay(true);
+    socket.write(`CONNECT ${PTY_VSOCK_PORT}\n`);
+  });
+
+  socket.on("data", (chunk: Buffer) => {
+    if (closed) return;
+    let payload = chunk;
+    if (!handshake) {
+      pending = Buffer.concat([pending, chunk]);
+      const newline = pending.indexOf(0x0a);
+      if (newline === -1) return;
+      const line = pending.subarray(0, newline).toString("utf8");
+      pending = pending.subarray(newline + 1);
+      if (!line.startsWith("OK")) {
+        log(`terminal ${botId}: vsock handshake failed: ${line.slice(0, 120)}`);
+        shutdown();
+        return;
+      }
+      handshake = true;
+      socket.setTimeout(0);
+      log(`terminal ${botId}: session open`);
+      for (const queued of pendingClient.splice(0)) {
+        if (!socket.write(queued)) {
+          client.pause();
+          break;
+        }
+      }
+      if (pending.length === 0) return;
+      payload = pending;
+      pending = Buffer.alloc(0);
+    }
+    client.send(payload, { binary: false }, (error) => {
+      if (error) shutdown(1011, "client relay failed");
+    });
+    if (client.bufferedAmount > VNC_BUFFER_HIGH_WATER_BYTES) {
+      pauseUntilClientDrains();
+    }
+  });
+
+  socket.on("drain", () => {
+    if (!closed) client.resume();
+  });
+  socket.on("timeout", () => shutdown(1013, "guest terminal handshake timed out"));
+  socket.on("error", () => shutdown(1011, "guest terminal unavailable"));
+  socket.on("close", () => shutdown(1011, "guest terminal stream closed"));
+
+  client.on("message", (data, isBinary) => {
+    if (closed) return;
+    const text = isBinary
+      ? (data as Buffer).toString("utf8")
+      : String(data);
+    const payload = Buffer.from(text.endsWith("\n") ? text : `${text}\n`);
+    if (!handshake) {
+      pendingClient.push(payload);
+      return;
+    }
+    if (!socket.write(payload)) client.pause();
+  });
+  client.on("close", () => shutdown(1000, "client closed"));
+  client.on("error", () => shutdown(1011, "client websocket failed"));
+}
+
 async function ensureVmUnlocked(botId: string): Promise<VmRecord> {
   const existing = vms.get(botId);
   if (existing && (existing.state === "running" || existing.state === "booting")) {
@@ -898,6 +1219,10 @@ async function ensureVmUnlocked(botId: string): Promise<VmRecord> {
   }
   if (record.network) {
     createTap(record.network);
+    // Re-apply this VM's egress rules against the fresh tap.
+    if (egressPolicies.has(botId)) {
+      applyEgressRules();
+    }
   }
 
   mkdirSync(record.dir, { recursive: true });
@@ -1014,7 +1339,12 @@ async function ensureVmUnlocked(botId: string): Promise<VmRecord> {
 function ensureVm(botId: string): Promise<VmRecord> {
   const active = ensures.get(botId);
   if (active) return active;
-  const pending = ensureVmUnlocked(botId)
+  const pending = (async () => {
+    // Wait for in-flight VM destruction so the capacity check sees the space
+    // those destroys are about to free.
+    await destroyQueue.catch(() => {});
+    return ensureVmUnlocked(botId);
+  })()
     .catch((error) => {
       const record = vms.get(botId);
       if (record) {
@@ -1548,6 +1878,8 @@ function browserEnvironment(botId: string): NodeJS.ProcessEnv {
     OPENBOT_BROWSER_PROFILE: browserProfile(botId),
     OPENBOT_BROWSER_RUNTIME: HOST_BROWSER_RUNTIME,
     OPENBOT_BROWSER_SOCKET: browserSocket(botId),
+    OPENBOT_BROWSER_HAR: join(vmDir(botId), "network.har"),
+    OPENBOT_BROWSER_DOWNLOADS: join(vmDir(botId), "browser-downloads"),
   };
 }
 
@@ -1563,6 +1895,20 @@ async function ensureBrowserDaemon(botId: string) {
   }
   mkdirSync(vmDir(botId), { recursive: true });
   const identity = prepareBrowserIdentity(botId);
+  // The browser daemon runs as the unprivileged browser account; give it a
+  // writable network trace file before it starts.
+  const harPath = join(vmDir(botId), "network.har");
+  if (!existsSync(harPath)) {
+    writeFileSync(
+      harPath,
+      '{"log":{"version":"1.2","creator":{"name":"openbot-browser","version":"1.0"},"entries":[]}}',
+    );
+  }
+  chownSync(harPath, identity.uid, identity.gid);
+  chmodSync(harPath, 0o600);
+  const downloadsDir = join(vmDir(botId), "browser-downloads");
+  mkdirSync(downloadsDir, { recursive: true });
+  chownSync(downloadsDir, identity.uid, identity.gid);
   rmSync(browserSocket(botId), { force: true });
   // A host-service restart leaves the previous daemon untracked. Kill it so
   // the new process loads the current browser script instead of stale code.
@@ -1599,6 +1945,111 @@ async function ensureBrowserDaemon(botId: string) {
     await sleep(50);
   }
   log(`browser ${botId}: daemon ready (pid ${child.pid})`);
+}
+
+const MAX_UPLOAD_BYTES = 32 * 1024 * 1024;
+
+/**
+ * File inputs live in the browser, which runs on this host, while the agent's
+ * files live in its microVM. An upload stages each guest path as a host copy
+ * the browser account can read, then the browser action references those.
+ */
+async function stageUploadFiles(
+  botId: string,
+  guestPaths: unknown[],
+): Promise<string[]> {
+  const identity = browserIdentity(botId);
+  const dir = join(browserRuntimeDir(botId), "uploads");
+  mkdirSync(dir, { recursive: true });
+  const staged: string[] = [];
+  for (const rawPath of guestPaths) {
+    const guestPath = String(rawPath ?? "");
+    if (!guestPath) {
+      throw new Error("each upload file needs a path in the computer");
+    }
+    const result = await vsockExec(
+      vsockSock(botId),
+      `base64 -w0 -- ${shellQuote(guestPath)}`,
+      "/",
+      30_000,
+    );
+    if (result.exit !== 0) {
+      throw new Error(
+        result.stderr.trim() || `could not read ${guestPath} in the computer`,
+      );
+    }
+    const data = Buffer.from(result.stdout.replace(/\s+/g, ""), "base64");
+    if (data.length > MAX_UPLOAD_BYTES) {
+      throw new Error(
+        `${guestPath} is larger than the ${MAX_UPLOAD_BYTES / 1024 / 1024}MB upload limit`,
+      );
+    }
+    const target = join(
+      dir,
+      `upload-${randomUUID()}${extname(guestPath).slice(0, 12)}`,
+    );
+    writeFileSync(target, data);
+    chownSync(target, identity.uid, identity.gid);
+    chmodSync(target, 0o600);
+    staged.push(target);
+  }
+  return staged;
+}
+
+const MAX_DOWNLOAD_FETCH_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Downloads save on this host (where Chromium runs), but the model works in
+ * its microVM, so a `downloads` action copies them into /root/Downloads and
+ * returns those paths.
+ */
+async function fetchDownloads(botId: string): Promise<Record<string, unknown>> {
+  const dir = join(vmDir(botId), "browser-downloads");
+  if (!existsSync(dir)) {
+    return { ok: true, url: "", title: "", text: "no downloads yet" };
+  }
+  const files = readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && !entry.name.endsWith(".crdownload"))
+    .map((entry) => {
+      const path = join(dir, entry.name);
+      return { name: entry.name, size: statSync(path).size, path };
+    });
+  if (files.length === 0) {
+    return { ok: true, url: "", title: "", text: "no downloads yet" };
+  }
+  const guestDir = "/root/Downloads";
+  const lines: string[] = [];
+  for (const file of files) {
+    if (file.size > MAX_DOWNLOAD_FETCH_BYTES) {
+      lines.push(
+        `${file.name} (${file.size} bytes) — too large to copy into the computer`,
+      );
+      continue;
+    }
+    const encoded = readFileSync(file.path).toString("base64");
+    const result = await vsockExec(
+      vsockSock(botId),
+      `mkdir -p ${shellQuote(guestDir)} && ` +
+        `printf %s ${shellQuote(encoded)} | base64 -d > ` +
+        shellQuote(`${guestDir}/${file.name}`),
+      "/",
+      60_000,
+    );
+    if (result.exit !== 0) {
+      lines.push(
+        `${file.name} (${file.size} bytes) — copy failed: ` +
+          `${result.stderr.trim().slice(0, 120)}`,
+      );
+      continue;
+    }
+    lines.push(`${guestDir}/${file.name} (${file.size} bytes)`);
+  }
+  return {
+    ok: true,
+    url: "",
+    title: "",
+    text: `Downloads copied into the computer:\n${lines.join("\n")}`,
+  };
 }
 
 async function runBrowserAction(
@@ -2084,11 +2535,32 @@ async function stopVm(record: VmRecord) {
   log(`vm ${record.botId}: stopped`);
 }
 
-async function destroyVm(botId: string) {
+/**
+ * Rootfs cleanup and creation must not race: destroying a VM frees several GiB
+ * that the next VM's capacity check and rootfs copy need. Creation waits for
+ * in-flight destroys before it checks capacity, so deleting an agent and
+ * immediately creating another cannot fail on space that is already being
+ * freed.
+ */
+let destroyQueue: Promise<unknown> = Promise.resolve();
+
+function destroyVm(botId: string): Promise<void> {
+  const run = destroyQueue.then(
+    () => destroyVmUnlocked(botId),
+    () => destroyVmUnlocked(botId),
+  );
+  destroyQueue = run.catch(() => {});
+  return run;
+}
+
+async function destroyVmUnlocked(botId: string) {
   const record = vms.get(botId);
   if (record) {
     await stopVm(record);
     vms.delete(botId);
+  }
+  if (egressPolicies.delete(botId)) {
+    applyEgressRules();
   }
   // Worker sessions key their browser by task id and have no VM of their own,
   // so the browser daemon and profile still need to be released here.
@@ -2100,6 +2572,43 @@ async function destroyVm(botId: string) {
   if (spawnSync("id", ["-u", user]).status === 0) {
     spawnSync("userdel", [user], { stdio: "ignore" });
   }
+}
+
+/**
+ * Remove stopped VM directories this owner no longer uses. A daemon calls this
+ * on startup with every computer id it still knows; anything else it owns was
+ * deleted while the daemon or host was down, and its rootfs would otherwise
+ * sit on disk forever. VMs owned by another daemon, and VMs without an owner
+ * marker (created before ownership was recorded), are left alone.
+ */
+function pruneOwnedVms(keep: Set<string>, owner: string): string[] {
+  if (!existsSync(VMS_DIR)) {
+    return [];
+  }
+  const removed: string[] = [];
+  for (const entry of readdirSync(VMS_DIR, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const id = entry.name;
+    if (keep.has(id)) continue;
+    const record = vms.get(id);
+    if (record?.pid) continue;
+    const ownerFile = join(VMS_DIR, id, "owner");
+    const vmOwner = existsSync(ownerFile)
+      ? readFileSync(ownerFile, "utf8").trim()
+      : "";
+    if (vmOwner !== owner) continue;
+    stopBrowser(id);
+    vms.delete(id);
+    rmSync(join(VMS_DIR, id), { recursive: true, force: true });
+    rmSync(browserRuntimeDir(id), { recursive: true, force: true });
+    browserIdentities.delete(id);
+    const user = browserUserName(id);
+    if (spawnSync("id", ["-u", user]).status === 0) {
+      spawnSync("userdel", [user], { stdio: "ignore" });
+    }
+    removed.push(id);
+  }
+  return removed;
 }
 
 function readJsonBody(request: IncomingMessage): Promise<unknown> {
@@ -2139,10 +2648,54 @@ function sendJson(response: ServerResponse, status: number, payload: unknown) {
 const server = createServer(async (request, response) => {
   const url = new URL(request.url ?? "/", "http://localhost");
   const parts = url.pathname.split("/").filter(Boolean);
+  const owner =
+    String(request.headers["x-openbot-owner"] ?? "").trim() || "default";
 
+  await requestOwner.run(owner, async () => {
   try {
     if (request.method === "GET" && url.pathname === "/health") {
-      sendJson(response, 200, { ok: true, vms: vms.size });
+      const capacity = imageCapacity();
+      sendJson(response, 200, {
+        ok: true,
+        vms: vms.size,
+        disk: {
+          freeBytes: capacity.freeBytes,
+          requiredBytes: capacity.requiredBytes,
+          canStartVm: capacity.freeBytes >= capacity.requiredBytes,
+        },
+      });
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/prune") {
+      const body = (await readJsonBody(request)) as { keep?: unknown };
+      const keep = new Set(
+        Array.isArray(body.keep) ? body.keep.map((id) => String(id)) : [],
+      );
+      const owner = requestOwner.getStore() ?? "default";
+      const removed = pruneOwnedVms(keep, owner);
+      log(
+        `prune ${owner}: kept ${keep.size}, removed ${removed.length}` +
+          (removed.length ? ` (${removed.join(", ")})` : ""),
+      );
+      sendJson(response, 200, { removed });
+      return;
+    }
+
+    if (
+      request.method === "GET" &&
+      parts[0] === "vms" &&
+      parts[1] &&
+      parts[2] === "network"
+    ) {
+      const botId = decodeURIComponent(parts[1]);
+      const harPath = join(vmDir(botId), "network.har");
+      if (!existsSync(harPath)) {
+        sendJson(response, 404, { error: "no network trace yet" });
+        return;
+      }
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(readFileSync(harPath));
       return;
     }
 
@@ -2153,6 +2706,19 @@ const server = createServer(async (request, response) => {
 
     const botId = decodeURIComponent(parts[1]);
     const action = parts[2];
+
+    if (request.method === "POST" && action === "network-policy") {
+      const body = (await readJsonBody(request)) as Record<string, unknown>;
+      const allow = Array.isArray(body.allow)
+        ? body.allow.map((entry) => String(entry)).filter(Boolean)
+        : [];
+      const result =
+        body.mode === "deny"
+          ? await setEgressPolicy(botId, { mode: "deny", allow })
+          : await setEgressPolicy(botId, null);
+      sendJson(response, 200, result);
+      return;
+    }
 
     if (request.method === "GET" && action === "status") {
       const record = await adoptVmIfRunning(botId);
@@ -2234,6 +2800,19 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "POST" && action === "files") {
+      const body = (await readJsonBody(request)) as Record<string, unknown>;
+      const op = body.op;
+      if (op !== "list" && op !== "read") {
+        sendJson(response, 400, { error: "op must be list or read" });
+        return;
+      }
+      await ensureVm(botId);
+      const result = await vsockFiles(vsockSock(botId), body, 20_000);
+      sendJson(response, 200, result);
+      return;
+    }
+
     if (request.method === "POST" && action === "browser" && parts[3] === "reset") {
       sendJson(response, 200, resetBrowserProfile(botId));
       return;
@@ -2253,10 +2832,27 @@ const server = createServer(async (request, response) => {
         Math.max(requested ?? (isExec ? 60_000 : 75_000), 1_000),
         isExec ? 300_000 : 90_000,
       );
+      if (body.action === "downloads") {
+        sendJson(response, 200, await fetchDownloads(botId));
+        return;
+      }
       const { timeoutMs: _ignored, ...payload } = body;
+      let actionPayload = payload;
+      if (body.action === "upload") {
+        const files = Array.isArray(body.files) ? body.files : [];
+        try {
+          actionPayload = {
+            ...payload,
+            files: await stageUploadFiles(botId, files),
+          };
+        } catch (error) {
+          sendJson(response, 400, { error: (error as Error).message });
+          return;
+        }
+      }
       const result = await runBrowserAction(
         botId,
-        isExec ? { ...payload, timeoutMs } : payload,
+        isExec ? { ...actionPayload, timeoutMs } : actionPayload,
         isExec ? timeoutMs + 15_000 : timeoutMs,
       );
       sendJson(response, 200, result);
@@ -2307,12 +2903,36 @@ const server = createServer(async (request, response) => {
     log(`request failed: ${(error as Error).message}`);
     sendJson(response, 500, { error: (error as Error).message });
   }
+  });
 });
 
 const vncWss = new WebSocketServer({ noServer: true });
+const terminalWss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (request, socket, head) => {
   const url = new URL(request.url ?? "/", "http://localhost");
+  const terminalMatch = /^\/vms\/([^/]+)\/terminal$/.exec(url.pathname);
+  if (terminalMatch) {
+    const botId = decodeURIComponent(terminalMatch[1] ?? "");
+    void adoptVmIfRunning(botId)
+      .then((record) => {
+        if (!record || record.state !== "running") {
+          socket.write(
+            "HTTP/1.1 409 Conflict\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+          );
+          socket.destroy();
+          return;
+        }
+        terminalWss.handleUpgrade(request, socket, head, (client) => {
+          attachTerminal(botId, client);
+        });
+      })
+      .catch((error) => {
+        log(`terminal ${botId}: ${(error as Error).message}`);
+        socket.destroy();
+      });
+    return;
+  }
   const match = /^\/vms\/([^/]+)\/vnc$/.exec(url.pathname);
   if (!match) {
     socket.destroy();
@@ -2365,6 +2985,9 @@ function cleanup() {
 cleanup();
 setupNat();
 mkdirSync(VMS_DIR, { recursive: true });
+// A restart drops the in-memory policies; clear any rules they left behind so
+// the daemon re-applies them per turn.
+tryExec(`nft delete table inet ${EGRESS_TABLE}`);
 
 server.listen(PORT, "127.0.0.1", () => {
   log(`openbot sandbox host listening on http://127.0.0.1:${PORT}`);

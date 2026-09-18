@@ -18,7 +18,6 @@
   --logo-bg: rgba(0, 0, 0, 0.05);
   --badge-bg: rgba(0, 0, 0, 0.06);
   --scrollbar: rgba(0, 0, 0, 0.15);
-  --composer-bg: rgba(252, 252, 252, 0.7);
   --switch-off: rgba(0, 0, 0, 0.15);
   --switch-knob: #ffffff;
   --accent: #2f6fed;
@@ -27,6 +26,9 @@
   --primary: #111111;
   --primary-text: #ffffff;
   --primary-disabled: rgba(0, 0, 0, 0.15);
+  --send-bg: rgba(0, 0, 0, 0.08);
+  --send-bg-hover: rgba(0, 0, 0, 0.14);
+  --send-icon: #111111;
   --green: #1f8a65;
   --green-soft: rgba(31, 138, 101, 0.14);
   --green-border: rgba(31, 138, 101, 0.35);
@@ -48,7 +50,6 @@
   --segment-active-bg: #ffffff;
   --segment-active-text: #0a0a0a;
   --segment-active-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
-  --shadow-composer: 0 1px 2px rgba(0, 0, 0, 0.03);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.25);
   --shadow-toast: 0 8px 24px rgba(0, 0, 0, 0.18);
   --toast-bg: #111111;
@@ -56,24 +57,12 @@
   --toast-muted: rgba(255, 255, 255, 0.7);
   --screen-bg: #f0f0f2;
   --overlay: rgba(0, 0, 0, 0.35);
-  /* Liquid-glass surfaces: translucent fills over the ambient gradient. */
-  --glass: rgba(255, 255, 255, 0.5);
-  --glass-strong: rgba(255, 255, 255, 0.72);
-  /* Panels use a flat translucent tint under the frosted blur, so they read
-     as glass over any backdrop, in either theme. */
-  --glass-fill: rgba(255, 255, 255, 0.58);
-  --glass-soft: rgba(255, 255, 255, 0.34);
-  --glass-border: rgba(255, 255, 255, 0.7);
-  --glass-hairline: rgba(120, 140, 180, 0.16);
-  --glass-shadow: 0 10px 34px rgba(90, 120, 190, 0.12);
-  --glass-blur: 26px;
-  --bubble-glass: rgba(255, 255, 255, 0.58);
-  --bubble-user: rgba(233, 240, 255, 0.72);
-  --bubble-highlight: rgba(255, 255, 255, 0.75);
-  --bubble-shadow: 0 8px 24px rgba(90, 120, 190, 0.1);
-  --ambient-1: rgba(0, 0, 0, 0.07);
-  --ambient-2: rgba(0, 0, 0, 0.05);
-  --ambient-3: rgba(0, 0, 0, 0.06);
+  /* Flat surfaces: containers share the page background and are separated
+     only by a hairline border — no translucency, blur, or glow. */
+  --glass-fill: var(--bg-chat);
+  --glass-soft: rgba(0, 0, 0, 0.05);
+  --bubble-glass: rgba(0, 0, 0, 0.03);
+  --bubble-user: rgba(0, 0, 0, 0.06);
   font-family: system-ui, -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif;
   -webkit-font-smoothing: antialiased;
 }
@@ -83,22 +72,21 @@
   --text: #f5f5f5;
   --text-secondary: #b3b3b5;
   --text-muted: #9a9a9c;
-  --bg-chat: #0a0a0a;
-  --bg-elevated: #1e1e20;
-  --bg-detail: #19191b;
-  --bg-chat-fade: rgba(10, 10, 10, 0);
+  --bg-chat: #1a1a1a;
+  --bg-elevated: #242424;
+  --bg-detail: #202020;
+  --bg-chat-fade: rgba(26, 26, 26, 0);
   --hover: rgba(255, 255, 255, 0.08);
   --bubble: rgba(255, 255, 255, 0.12);
-  --row-selected: #222224;
-  --border: #2a2a2a;
-  --hairline: #2a2a2a;
+  --row-selected: #262626;
+  --border: rgba(255, 255, 255, 0.14);
+  --hairline: rgba(255, 255, 255, 0.1);
   --search-bg: #242427;
   --search-border: #333338;
   --field-focus-border: #55555c;
   --logo-bg: rgba(255, 255, 255, 0.08);
   --badge-bg: rgba(255, 255, 255, 0.1);
   --scrollbar: rgba(255, 255, 255, 0.2);
-  --composer-bg: #18181a;
   --switch-off: rgba(255, 255, 255, 0.18);
   --switch-knob: #f5f5f5;
   --accent: #4a9eff;
@@ -107,6 +95,9 @@
   --primary: #ffffff;
   --primary-text: #0a0a0a;
   --primary-disabled: rgba(255, 255, 255, 0.18);
+  --send-bg: rgba(255, 255, 255, 0.16);
+  --send-bg-hover: rgba(255, 255, 255, 0.24);
+  --send-icon: #0a0a0a;
   --green: #34d399;
   --green-soft: rgba(52, 211, 153, 0.16);
   --green-border: rgba(52, 211, 153, 0.35);
@@ -121,21 +112,10 @@
   --red-tint: rgba(248, 113, 113, 0.1);
   --approval-bg: #1c1710;
   --approval-border: rgba(251, 191, 36, 0.28);
-  --glass: rgba(28, 30, 40, 0.5);
-  --glass-strong: rgba(30, 32, 44, 0.72);
-  --glass-fill: rgba(255, 255, 255, 0.06);
-  --glass-soft: rgba(30, 32, 44, 0.34);
-  --glass-border: rgba(255, 255, 255, 0.09);
-  --glass-hairline: rgba(255, 255, 255, 0.07);
-  --glass-shadow: 0 10px 34px rgba(0, 0, 0, 0.4);
-  --glass-blur: 26px;
-  --bubble-glass: rgba(38, 42, 56, 0.55);
-  --bubble-user: rgba(58, 74, 118, 0.5);
-  --bubble-highlight: rgba(255, 255, 255, 0.09);
-  --bubble-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
-  --ambient-1: rgba(255, 255, 255, 0.07);
-  --ambient-2: rgba(255, 255, 255, 0.05);
-  --ambient-3: rgba(255, 255, 255, 0.06);
+  --glass-fill: var(--bg-chat);
+  --glass-soft: rgba(255, 255, 255, 0.08);
+  --bubble-glass: rgba(255, 255, 255, 0.04);
+  --bubble-user: rgba(255, 255, 255, 0.08);
   --status-connected: #34d399;
   --status-connecting: #fbbf24;
   --status-disconnected: #f87171;
@@ -143,7 +123,6 @@
   --segment-active-bg: #333338;
   --segment-active-text: #ffffff;
   --segment-active-shadow: none;
-  --shadow-composer: 0 1px 2px rgba(0, 0, 0, 0.5);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.5);
   --shadow-toast: 0 8px 24px rgba(0, 0, 0, 0.6);
   --toast-bg: #26262a;
@@ -236,33 +215,62 @@ body {
   background: var(--row-selected);
 }
 
+.thread-disclosure {
+  width: 14px;
+  height: 14px;
+  margin-left: 4px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transform: rotate(-90deg);
+  transition: transform 120ms ease, color 120ms ease;
+}
+
+.thread-disclosure:hover {
+  color: var(--text);
+}
+
+.thread-disclosure-open {
+  transform: rotate(0deg);
+}
+
+.thread-disclosure-spacer {
+  width: 14px;
+  margin-left: 4px;
+  flex-shrink: 0;
+}
+
 .thread-dot {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
   border-radius: 9999px;
   flex-shrink: 0;
+  background: var(--text-muted);
+  opacity: 0.5;
 }
 
-/* A thread shows a dot on the right only while it is working. */
-.thread-working {
-  width: 7px;
-  height: 7px;
-  border-radius: 9999px;
-  flex-shrink: 0;
-  margin-left: 8px;
+.thread-dot-working {
   background: var(--green);
-  animation: thread-working-pulse 1.4s ease-in-out infinite;
+  opacity: 1;
+  animation: thread-pulse 1.6s ease-in-out infinite;
 }
 
-@keyframes thread-working-pulse {
+@keyframes thread-pulse {
   0%,
   100% {
     opacity: 1;
     transform: scale(1);
   }
   50% {
-    opacity: 0.45;
-    transform: scale(0.82);
+    opacity: 0.4;
+    transform: scale(0.85);
   }
 }
 
@@ -549,12 +557,14 @@ body.resizing .screen-panel * {
   display: flex;
   align-items: center;
   height: 26px;
+  min-width: 0;
   padding: 0 8px;
   border-radius: 8px;
   color: var(--text-secondary);
   font-size: 12px;
   letter-spacing: -0.08px;
   cursor: pointer;
+  overflow: hidden;
 }
 
 .model-pill:hover {
@@ -571,7 +581,9 @@ body.resizing .screen-panel * {
   padding: 0 14px 0 0;
   outline: none;
   cursor: pointer;
+  min-width: 0;
   max-width: 190px;
+  text-overflow: ellipsis;
 }
 
 .model-pill svg {
@@ -628,12 +640,9 @@ body.resizing .screen-panel * {
 
 .entry-user .entry-body,
 .entry-assistant .entry-body {
-  -webkit-backdrop-filter: blur(20px) saturate(1.6);
-  backdrop-filter: blur(20px) saturate(1.6);
-  border: 0.5px solid var(--glass-border);
-  border-radius: 18px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
   padding: 8px 12px;
-  box-shadow: var(--bubble-shadow), inset 0 0.5px 0 var(--bubble-highlight);
 }
 
 .entry-user .entry-body {
@@ -671,6 +680,19 @@ body.resizing .screen-panel * {
 .bubble-action:hover {
   background: var(--hover);
   color: var(--text);
+}
+
+.queued-badge {
+  flex-shrink: 0;
+  align-self: center;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  border: 0.5px solid var(--border);
+  background: var(--glass-fill);
+  color: var(--text-muted);
+  font-size: 11px;
+  letter-spacing: -0.05px;
+  white-space: nowrap;
 }
 
 .markdown {
@@ -899,29 +921,51 @@ body.resizing .screen-panel * {
   max-width: 760px;
   margin: 0 auto;
   display: flex;
-  align-items: flex-end;
+  flex-direction: column;
   gap: 6px;
-  padding: 8px;
-  border-radius: 9999px;
-  background: var(--glass-fill);
-  -webkit-backdrop-filter: blur(20px) saturate(1.6);
-  backdrop-filter: blur(20px) saturate(1.6);
-  border: 0.5px solid var(--glass-border);
-  box-shadow: var(--glass-shadow);
+  padding: 12px 14px 10px;
+  border-radius: 16px;
+  background: var(--bg-chat);
+  border: 1px solid var(--border);
+}
+
+/* Controls sit in a single row inside the composer, under the textarea. The
+   right-hand cluster wraps below the model controls when space runs out. */
+.composer-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.composer-bar-end {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.composer-bar-start {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 170px;
 }
 
 .composer-plus {
-  width: 30px;
-  height: 30px;
+  width: 26px;
+  height: 26px;
   align-self: center;
-  border: 0.5px solid var(--border);
   border-radius: 50%;
   flex-shrink: 0;
 }
 
 .composer-mic {
-  width: 30px;
-  height: 30px;
+  width: 28px;
+  height: 28px;
   align-self: center;
   border-radius: 50%;
   flex-shrink: 0;
@@ -939,39 +983,26 @@ body.resizing .screen-panel * {
   line-height: 20px;
   letter-spacing: -0.15px;
   color: var(--text);
-  padding: 6px 2px;
-  max-height: 120px;
+  padding: 4px 2px 0;
+  max-height: 160px;
 }
 
 .composer textarea::placeholder {
   color: var(--text-muted);
 }
 
-/* Model, approvals, memory and settings sit under the message bar. */
-.composer-tools {
-  max-width: 760px;
-  margin: 6px auto 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 0 6px;
-}
-
 .composer-tools-actions {
   display: flex;
   align-items: center;
   gap: 2px;
-}
-
-.model-pill-composer {
-  margin-left: -8px;
+  flex-shrink: 0;
 }
 
 .composer-model-group {
   display: flex;
   align-items: center;
   gap: 2px;
+  flex: 1 1 auto;
   min-width: 0;
 }
 
@@ -980,12 +1011,12 @@ body.resizing .screen-panel * {
 }
 
 .send-circle {
-  width: 32px;
-  height: 32px;
-  border-radius: 9999px;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
   border: none;
-  background: var(--primary);
-  color: var(--primary-text);
+  background: var(--send-bg);
+  color: var(--send-icon);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -993,9 +1024,31 @@ body.resizing .screen-panel * {
   flex-shrink: 0;
 }
 
+.send-circle:hover {
+  background: var(--send-bg-hover);
+}
+
 .send-circle:disabled {
   background: var(--primary-disabled);
+  color: var(--text-muted);
   cursor: default;
+}
+
+.composer-send-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.composer-busy-group {
+  flex-shrink: 0;
+}
+
+.segmented-compact .segmented-option {
+  height: 20px;
+  padding: 0 8px;
+  font-size: 11px;
 }
 
 /* Harness pill */
@@ -1586,15 +1639,378 @@ body.resizing .screen-panel * {
   flex-shrink: 1;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 10px;
   padding: 14px;
-  overflow-y: auto;
-  background: var(--glass-fill);
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.5);
-  backdrop-filter: blur(var(--glass-blur)) saturate(1.5);
-  border: 0.5px solid var(--glass-hairline);
+  overflow: hidden;
+  background: var(--bg-chat);
+  border: 1px solid var(--border);
   border-radius: 14px;
-  box-shadow: var(--glass-shadow);
+}
+
+.panel-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+  padding-bottom: 6px;
+  border-bottom: 0.5px solid var(--hairline);
+}
+
+.panel-tab {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 8px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  letter-spacing: -0.1px;
+  cursor: pointer;
+}
+
+.panel-tab:hover {
+  background: var(--hover);
+  color: var(--text-secondary);
+}
+
+.panel-tab-active,
+.panel-tab-active:hover {
+  background: var(--row-selected);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.panel-collapse {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.panel-tab-pane {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: 8px;
+}
+
+.panel-tab-pane[hidden] {
+  display: none;
+}
+
+.panel-pane-screen {
+  gap: 10px;
+}
+
+/* Files */
+
+.files-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: 8px;
+}
+
+.files-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.files-toolbar .icon-button {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+}
+
+.files-toolbar .icon-button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.files-breadcrumb {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex: 1;
+  overflow-x: auto;
+  white-space: nowrap;
+  scrollbar-width: none;
+}
+
+.files-breadcrumb::-webkit-scrollbar {
+  display: none;
+}
+
+.files-crumb-group {
+  display: inline-flex;
+  align-items: center;
+}
+
+.files-crumb {
+  border: none;
+  background: transparent;
+  padding: 3px 5px;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.files-crumb:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.files-crumb:disabled {
+  color: var(--text);
+  font-weight: 600;
+  cursor: default;
+}
+
+.files-crumb-sep {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.files-list {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  gap: 1px;
+}
+
+.files-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.files-row:hover {
+  background: var(--hover);
+}
+
+.files-row-icon {
+  display: flex;
+  align-items: center;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.files-row-icon.is-dir {
+  color: var(--accent);
+}
+
+.files-row-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.files-row-meta {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.files-note {
+  margin: 0;
+  padding: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.files-error {
+  margin: 0;
+  padding: 8px;
+  font-size: 12px;
+  color: var(--red);
+  overflow-wrap: anywhere;
+}
+
+.files-error-block {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.files-retry {
+  margin: 0 8px 8px;
+  padding: 4px 10px;
+  border-radius: 9999px;
+  border: 0.5px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.files-retry:hover {
+  background: var(--hover);
+}
+
+.files-preview {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.files-preview-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.files-preview-text {
+  margin: 0;
+  padding: 8px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+
+.files-preview-image {
+  max-width: 100%;
+  border-radius: 10px;
+  border: 0.5px solid var(--border);
+  background: var(--screen-bg);
+}
+
+/* Terminal */
+
+.terminal-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: 6px;
+}
+
+.terminal-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.terminal-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.terminal-status::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: var(--text-muted);
+}
+
+.terminal-status-open::before {
+  background: var(--status-connected);
+}
+
+.terminal-status-connecting::before {
+  background: var(--status-connecting);
+}
+
+.terminal-status-error::before {
+  background: var(--status-disconnected);
+}
+
+.terminal-toolbar-spacer {
+  flex: 1;
+}
+
+.terminal-button {
+  padding: 3px 9px;
+  border-radius: 9999px;
+  border: 0.5px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.terminal-button:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.terminal-message {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.terminal-host {
+  flex: 1;
+  min-height: 180px;
+  border-radius: 10px;
+  border: 0.5px solid var(--border);
+  background: #0d0d0f;
+  padding: 6px;
+  overflow: hidden;
+}
+
+.terminal-host .xterm {
+  height: 100%;
+}
+
+.terminal-caption {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.terminal-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 18px 12px;
+  border-radius: 14px;
+  border: 0.5px dashed var(--border);
+  text-align: center;
+}
+
+.terminal-empty p {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
 }
 
 .screen-panel-bar {
@@ -1653,9 +2069,8 @@ body.resizing .screen-panel * {
   overflow: hidden;
 }
 
-/* The expanded screen is the panel itself: a fixed descendant of the panel
-   cannot escape it, because the panel's backdrop-filter creates a containing
-   block. */
+/* The expanded screen is the panel itself: it breaks out of the layout and
+   covers the window. */
 .screen-panel-expanded {
   position: fixed;
   inset: 10px;
@@ -1664,8 +2079,7 @@ body.resizing .screen-panel * {
   min-width: 0;
   max-width: none;
   border-radius: 14px;
-  border: 0.5px solid var(--glass-hairline);
-  box-shadow: var(--glass-shadow);
+  border: 1px solid var(--border);
   overflow: hidden;
 }
 
@@ -1811,13 +2225,27 @@ body.resizing .screen-panel * {
   flex-shrink: 0;
 }
 
-/* Threads live under the computer view in the same panel. */
+/* The thread rail floats left of the chat and grows with its list. */
+.thread-rail {
+  flex: 0 1 auto;
+  width: 232px;
+  min-width: 168px;
+  align-self: flex-start;
+  max-height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 10px;
+  background: var(--bg-chat);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+}
+
 .panel-threads {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding-top: 12px;
-  border-top: 0.5px solid var(--hairline);
+  min-height: 0;
 }
 
 .panel-threads-head {
@@ -1838,7 +2266,9 @@ body.resizing .screen-panel * {
 }
 
 .panel-thread-list {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
   padding: 0;
   gap: 0;
 }
@@ -1909,11 +2339,8 @@ body.resizing .screen-panel * {
   display: flex;
   flex-direction: column;
   border-radius: 18px;
-  border: 0.5px solid var(--glass-border);
-  background: var(--glass-fill);
-  -webkit-backdrop-filter: blur(30px) saturate(1.6);
-  backdrop-filter: blur(30px) saturate(1.6);
-  box-shadow: var(--glass-shadow);
+  border: 1px solid var(--border);
+  background: var(--bg-chat);
 }
 
 .modal-head {
@@ -2146,11 +2573,8 @@ body.resizing .screen-panel * {
   z-index: 27;
   display: flex;
   border-radius: 14px;
-  border: 0.5px solid var(--glass-hairline);
-  background: var(--glass-fill);
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.5);
-  backdrop-filter: blur(var(--glass-blur)) saturate(1.5);
-  box-shadow: var(--glass-shadow);
+  border: 1px solid var(--border);
+  background: var(--bg-chat);
   overflow: hidden;
 }
 
@@ -2161,7 +2585,7 @@ body.resizing .screen-panel * {
   flex-direction: column;
   padding: 14px 10px 10px;
   background: transparent;
-  border-right: 0.5px solid var(--glass-hairline);
+  border-right: 1px solid var(--border);
 }
 
 .settings-brand {
@@ -2260,7 +2684,7 @@ body.resizing .screen-panel * {
 
 .settings-nav-item-active {
   background: var(--glass-soft);
-  border: 0.5px solid var(--glass-border);
+  border: 1px solid var(--border);
   color: var(--text);
   font-weight: 500;
 }
@@ -2340,11 +2764,8 @@ body.resizing .screen-panel * {
 
 .settings-card {
   border-radius: 14px;
-  border: 0.5px solid var(--glass-hairline);
-  background: var(--glass-fill);
-  -webkit-backdrop-filter: blur(14px) saturate(1.4);
-  backdrop-filter: blur(14px) saturate(1.4);
-  box-shadow: var(--bubble-shadow);
+  border: 1px solid var(--border);
+  background: var(--bg-chat);
   overflow: hidden;
 }
 
@@ -3176,12 +3597,9 @@ body.resizing .screen-panel * {
   flex-direction: column;
   height: min(88%, 940px);
   border-radius: 18px 18px 0 0;
-  border: 0.5px solid var(--glass-border);
+  border: 1px solid var(--border);
   border-bottom: none;
-  background: var(--glass-fill);
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.5);
-  backdrop-filter: blur(var(--glass-blur)) saturate(1.5);
-  box-shadow: 0 -12px 40px rgba(0, 0, 0, 0.16);
+  background: var(--bg-chat);
   overflow: hidden;
   animation: drawer-in 0.24s cubic-bezier(0.22, 1, 0.36, 1);
 }

@@ -31,6 +31,9 @@ Then record the current system before changing it:
 pnpm eval -- --label pre-decision-change --runs 5
 ```
 
+The runner disables the live `web_search` tool for the run
+(`OPENBOT_WEBSEARCH_DISABLED=1`) so the fixture pages stay authoritative.
+
 The runner uses `OPENBOT_EVAL_API_KEY`, then `DEEPSEEK_API_KEY`, then the saved
 DeepSeek key in `.openbot-dev/openbot.db`. The key is passed by environment
 reference and is never included in the report.

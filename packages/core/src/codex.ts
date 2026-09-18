@@ -310,12 +310,15 @@ export async function runCodexTurn(
       ? requested
       : deps.store.getOrCreateThread(bot.id);
 
-  deps.store.addMessage({
-    threadId: thread.id,
-    role: "user",
-    content: input.text,
-    model: null,
-  });
+  if (!input.skipUserMessage) {
+    deps.store.addMessage({
+      id: input.messageId,
+      threadId: thread.id,
+      role: "user",
+      content: input.text,
+      model: null,
+    });
+  }
 
   if (thread.title === DEFAULT_THREAD_TITLE) {
     const updated = deps.store.touchThread(thread.id, {

@@ -37,6 +37,12 @@ export interface BrowserActionRequest {
   pixels?: number;
   href?: string;
   index?: number;
+  /** `press` only: keyboard key, optionally with modifiers (e.g. "Meta+A"). */
+  key?: string;
+  /** `select` only: option value or visible label to pick. */
+  option?: string;
+  /** `upload` only: file paths in the agent's computer to attach. */
+  files?: string[];
   timeoutMs?: number;
   /** `exec` only: JavaScript snippet run against the persistent CDP session. */
   code?: string;
@@ -103,6 +109,39 @@ export interface DesktopActionResult {
   durationMs: number;
 }
 
+export interface FileListRequest {
+  path: string;
+  cap?: number;
+}
+
+export interface FileListEntry {
+  name: string;
+  dir: boolean;
+  size: number | null;
+  mtime: number | null;
+}
+
+export interface FileListResponse {
+  entries: FileListEntry[];
+  total: number;
+  skipped: number;
+  error: string | null;
+}
+
+export interface FileReadRequest {
+  path: string;
+  maxBytes?: number;
+}
+
+export interface FileReadResponse {
+  kind: "text" | "image" | "binary" | "dir" | "missing";
+  content: string | null;
+  mime: string | null;
+  size: number;
+  truncated: boolean;
+  error: string | null;
+}
+
 export interface SandboxBackend {
   status(botId: string): Promise<SandboxStatus>;
   ensure(botId: string): Promise<SandboxStatus>;
@@ -115,6 +154,21 @@ export interface SandboxBackend {
     botId: string,
     request: DesktopActionRequest,
   ): Promise<DesktopActionResult>;
+  filesList(
+    botId: string,
+    request: FileListRequest,
+  ): Promise<FileListResponse>;
+  filesRead(
+    botId: string,
+    request: FileReadRequest,
+  ): Promise<FileReadResponse>;
   stop(botId: string): Promise<SandboxStatus>;
   destroy(botId: string): Promise<SandboxStatus>;
+  /** Remove stopped VMs this owner no longer references (startup GC). */
+  prune(keep: string[]): Promise<{ removed: string[] }>;
+  /** Enforce a hard shell egress allowlist for this computer (null clears). */
+  setNetworkPolicy(
+    botId: string,
+    policy: { mode: "deny"; allow: string[] } | null,
+  ): Promise<{ ok: boolean; ips?: string[]; error?: string }>;
 }
