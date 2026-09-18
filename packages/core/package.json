@@ -9,7 +9,8 @@
   "scripts": {
     "dev": "tsx watch src/bin/openbotd.ts",
     "start": "tsx src/bin/openbotd.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "code-tools:smoke": "tsx src/code-tools.smoke.ts"
   },
   "dependencies": {
     "@openbot/gateway": "workspace:*",

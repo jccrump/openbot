@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ToolDefinition } from "@openbot/gateway";
 import { choice } from "@openbot/gateway";
@@ -41,6 +42,7 @@ import {
   resolveWorkspacePath,
 } from "./local-computer";
 import { BROWSER_SKILLS_B64 } from "./skills.generated";
+import { CODE_TOOLS_SOURCE } from "./code-tools.generated";
 
 const MAX_OUTPUT = 30_000;
 const MAX_TIMEOUT_SECONDS = 300;
@@ -379,6 +381,261 @@ async function runCommand(
   };
 }
 
+interface RawExecResult {
+  exit: number;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+}
+
+/**
+ * Run a command and hand back its raw streams. `runCommand` formats a terminal
+ * transcript for the model to read; the code tools need untouched stdout so
+ * they can slice lines, count matches, and parse paths.
+ */
+async function runCapture(
+  context: ToolContext,
+  command: string,
+  cwd: string,
+  timeoutSeconds: number,
+): Promise<RawExecResult> {
+  const startedAt = Date.now();
+  if (context.computer === "mac") {
+    const workspace = ensureWorkspace(context.workspaceDir);
+    const resolvedCwd = resolveLocalCwd(workspace, cwd || workspace);
+    if (resolvedCwd.error || !resolvedCwd.path) {
+      return {
+        exit: 1,
+        stdout: "",
+        stderr: resolvedCwd.error ?? "invalid cwd",
+        durationMs: 0,
+      };
+    }
+    const result = await execLocal(
+      command,
+      resolvedCwd.path,
+      timeoutSeconds * 1000,
+    );
+    return {
+      exit: result.exit,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      durationMs: Date.now() - startedAt,
+    };
+  }
+
+  const sandbox = context.sandbox;
+  if (!sandbox) {
+    return {
+      exit: 1,
+      stdout: "",
+      stderr: "sandbox is not available",
+      durationMs: 0,
+    };
+  }
+  await ensureGuestWorkspace(context, sandbox);
+  const result = await sandbox.exec(sandboxId(context), {
+    command,
+    cwd: cwd || context.guestCwd,
+    timeoutMs: timeoutSeconds * 1000,
+  });
+  return {
+    exit: result.exit,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    durationMs: Date.now() - startedAt,
+  };
+}
+
+/** Resolve a tool path against the computer that owns it. */
+function resolveToolPath(
+  context: ToolContext,
+  path: string,
+): { path: string | null; error: string | null } {
+  if (context.computer === "mac") {
+    ensureWorkspace(context.workspaceDir);
+    return resolveWorkspacePath(context.workspaceDir, path);
+  }
+  // The guest has no confinement, so a relative path is taken from the
+  // session's working directory rather than the process's.
+  return {
+    path: path.startsWith("/") ? path : join(codeRoot(context), path),
+    error: null,
+  };
+}
+
+/** The directory a code tool starts from when the model gives no path. */
+function codeRoot(context: ToolContext): string {
+  if (context.computer === "mac") {
+    return context.workspaceDir;
+  }
+  return context.guestCwd ?? "/root";
+}
+
+function codeCwd(context: ToolContext): string {
+  return context.computer === "mac" ? context.workspaceDir : "/root";
+}
+
+const CODE_TOOL_HELPER_NAME = "openbot-code-tools.mjs";
+const codeToolHelpers = new Map<string, Promise<string>>();
+
+/**
+ * Write the grep/glob helper into the agent's computer and return its path.
+ * One copy per computer, best effort: a failure here surfaces as a tool error
+ * rather than being cached as broken.
+ */
+async function ensureCodeToolHelper(
+  context: ToolContext,
+  sandbox: SandboxBackend | null,
+): Promise<string> {
+  if (context.computer === "mac") {
+    const dir = join(tmpdir(), "openbot-code-tools");
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, CODE_TOOL_HELPER_NAME);
+    writeFileSync(file, CODE_TOOLS_SOURCE, "utf8");
+    return file;
+  }
+  if (!sandbox) {
+    throw new Error("sandbox is not available");
+  }
+  const id = sandboxId(context);
+  const existing = codeToolHelpers.get(id);
+  if (existing) {
+    return existing;
+  }
+  const task = (async () => {
+    await ensureSandbox(context, sandbox);
+    const target = `/tmp/${CODE_TOOL_HELPER_NAME}`;
+    const encoded = Buffer.from(CODE_TOOLS_SOURCE, "utf8").toString("base64");
+    const result = await sandbox.exec(id, {
+      command: `printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(target)}`,
+      cwd: "/",
+      timeoutMs: 30_000,
+    });
+    if (result.exit !== 0) {
+      throw new Error(
+        result.stderr.trim() || "could not install the code-tools helper",
+      );
+    }
+    return target;
+  })().catch((error) => {
+    codeToolHelpers.delete(id);
+    throw error;
+  });
+  codeToolHelpers.set(id, task);
+  return task;
+}
+
+/** Run the bundled helper in the agent's computer and return its stdout. */
+async function runCodeToolHelper(
+  context: ToolContext,
+  payload: Record<string, unknown>,
+  timeoutSeconds: number,
+): Promise<RawExecResult> {
+  const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString(
+    "base64",
+  );
+  const attempt = async (): Promise<RawExecResult> => {
+    let helper: string;
+    try {
+      helper = await ensureCodeToolHelper(context, context.sandbox);
+    } catch (error) {
+      return {
+        exit: 1,
+        stdout: "",
+        stderr: (error as Error).message,
+        durationMs: 0,
+      };
+    }
+    return runCapture(
+      context,
+      `node ${shellQuote(helper)} ${shellQuote(encoded)}`,
+      codeCwd(context),
+      timeoutSeconds,
+    );
+  };
+
+  const first = await attempt();
+  // A rebuilt computer (start fresh, an image upgrade) comes back without the
+  // helper in /tmp, so drop the cached path and install it again once.
+  if (first.exit !== 0 && /Cannot find module|MODULE_NOT_FOUND/.test(first.stderr)) {
+    codeToolHelpers.delete(sandboxId(context));
+    return attempt();
+  }
+  return first;
+}
+
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) {
+    return 0;
+  }
+  let count = 0;
+  let index = haystack.indexOf(needle);
+  while (index !== -1) {
+    count += 1;
+    index = haystack.indexOf(needle, index + needle.length);
+  }
+  return count;
+}
+
+const MAX_EDIT_BYTES = 200_000;
+
+async function readRawFile(
+  context: ToolContext,
+  path: string,
+  maxBytes: number,
+): Promise<
+  { ok: true; content: string; truncated: boolean } | { ok: false; error: string }
+> {
+  const resolved = resolveToolPath(context, path);
+  if (resolved.error || !resolved.path) {
+    return { ok: false, error: resolved.error ?? "invalid path" };
+  }
+  const target = resolved.path;
+  const result = await runCapture(
+    context,
+    `if [ ! -e ${shellQuote(target)} ]; then echo ${shellQuote(`no such file: ${path}`)} >&2; exit 1; fi; ` +
+      `if [ -d ${shellQuote(target)} ]; then echo ${shellQuote(`is a directory: ${path}`)} >&2; exit 1; fi; ` +
+      `head -c ${Math.floor(maxBytes)} -- ${shellQuote(target)}`,
+    codeCwd(context),
+    30,
+  );
+  if (result.exit !== 0) {
+    return { ok: false, error: result.stderr.trim() || `could not read ${path}` };
+  }
+  return {
+    ok: true,
+    content: result.stdout,
+    truncated: result.stdout.length >= maxBytes,
+  };
+}
+
+async function writeRawFile(
+  context: ToolContext,
+  path: string,
+  content: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const resolved = resolveToolPath(context, path);
+  if (resolved.error || !resolved.path) {
+    return { ok: false, error: resolved.error ?? "invalid path" };
+  }
+  const target = resolved.path;
+  const encoded = Buffer.from(content, "utf8").toString("base64");
+  const result = await runCapture(
+    context,
+    // The command substitution is quoted so a path containing spaces is not
+    // word-split into several directories.
+    `mkdir -p -- "$(dirname ${shellQuote(target)})" && ` +
+      `printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(target)}`,
+    codeCwd(context),
+    30,
+  );
+  if (result.exit !== 0) {
+    return { ok: false, error: result.stderr.trim() || `could not write ${path}` };
+  }
+  return { ok: true };
+}
+
 function readTimeout(args: Record<string, unknown>): number {
   const value = Number(args.timeoutSeconds ?? 60);
   if (!Number.isFinite(value) || value <= 0) {
@@ -436,15 +693,28 @@ const shellTool: Tool = {
   },
 };
 
+const READ_DEFAULT_LINES = 2_000;
+const READ_MAX_LINES = 10_000;
+
 const readFileTool: Tool = {
   definition: {
     name: "read_file",
     description:
-      "Read a file from your computer. Returns the file contents as text.",
+      "Read a file from your computer. Each line comes back with its line " +
+      "number, so you can target a change precisely with the edit tool. Use " +
+      "offset and limit to page through a file that is longer than the window.",
     parameters: {
       type: "object",
       properties: {
         path: { type: "string", description: "Absolute path to the file." },
+        offset: {
+          type: "number",
+          description: "First line to return, 1-based. Defaults to 1.",
+        },
+        limit: {
+          type: "number",
+          description: `Maximum lines to return (default ${READ_DEFAULT_LINES}).`,
+        },
         maxBytes: {
           type: "number",
           description: "Maximum bytes to read (default 100000).",
@@ -458,26 +728,79 @@ const readFileTool: Tool = {
     if (!path) {
       return { ok: false, output: "path is required", durationMs: 0 };
     }
+    const startedAt = Date.now();
+    const offset = Math.max(1, Math.floor(Number(args.offset ?? 1) || 1));
+    const limit = Math.min(
+      Math.max(1, Math.floor(Number(args.limit ?? READ_DEFAULT_LINES) || READ_DEFAULT_LINES)),
+      READ_MAX_LINES,
+    );
     const maxBytes = Math.min(Number(args.maxBytes ?? 100_000) || 100_000, 200_000);
-    if (context.computer === "mac") {
-      ensureWorkspace(context.workspaceDir);
-      const resolved = resolveWorkspacePath(context.workspaceDir, path);
-      if (resolved.error || !resolved.path) {
-        return localResult(resolved.error ?? "invalid path", false, 0);
-      }
-      return runCommand(
-        context,
-        `head -c ${Math.floor(maxBytes)} -- ${shellQuote(resolved.path)}`,
-        context.workspaceDir,
-        30,
-      );
+
+    const resolved = resolveToolPath(context, path);
+    if (resolved.error || !resolved.path) {
+      const message = resolved.error ?? "invalid path";
+      return context.computer === "mac"
+        ? localResult(message, false, Date.now() - startedAt)
+        : { ok: false, output: message, durationMs: Date.now() - startedAt };
     }
-    return runCommand(
+    const target = resolved.path;
+    const end = offset + limit - 1;
+    const result = await runCapture(
       context,
-      `head -c ${Math.floor(maxBytes)} -- ${shellQuote(path)}`,
-      "/root",
+      `if [ ! -e ${shellQuote(target)} ]; then echo ${shellQuote(`no such file: ${path}`)} >&2; exit 1; fi; ` +
+        `if [ -d ${shellQuote(target)} ]; then echo ${shellQuote(`is a directory: ${path}`)} >&2; exit 1; fi; ` +
+        `sed -n ${shellQuote(`${offset},${end}p;${end}q`)} ${shellQuote(target)} | head -c ${Math.floor(maxBytes)}`,
+      codeCwd(context),
       30,
     );
+    if (result.exit !== 0) {
+      const message = result.stderr.trim() || `could not read ${path}`;
+      return context.computer === "mac"
+        ? localResult(message, false, Date.now() - startedAt)
+        : { ok: false, output: message, durationMs: Date.now() - startedAt };
+    }
+
+    const text = result.stdout;
+    const lines =
+      text.length === 0 ? [] : text.replace(/\n$/, "").split("\n");
+    const cappedBytes = text.length >= maxBytes;
+
+    // Number the window up to the shared output budget rather than numbering
+    // everything and truncating afterwards, so the paging note always survives
+    // and names the line the model actually reached.
+    const shown: string[] = [];
+    let used = 0;
+    for (const [index, line] of lines.entries()) {
+      const entry = `${offset + index}: ${line}`;
+      if (used + entry.length + 1 > MAX_OUTPUT) {
+        if (shown.length === 0) {
+          shown.push(`${offset + index}: ${line.slice(0, MAX_OUTPUT)}\n[line truncated]`);
+        }
+        break;
+      }
+      shown.push(entry);
+      used += entry.length + 1;
+    }
+    const lastLine = offset + shown.length - 1;
+    const clipped = shown.length < lines.length;
+    const notes: string[] = [];
+    if (clipped || lines.length >= limit) {
+      notes.push(`use offset=${lastLine + 1} to continue`);
+    }
+    if (cappedBytes) {
+      notes.push(`output capped at ${maxBytes} bytes`);
+    }
+    const trailer = notes.length
+      ? `\n[showing lines ${offset}-${lastLine}; ${notes.join("; ")}]`
+      : "";
+    const body = shown.length
+      ? `${shown.join("\n")}${trailer}`
+      : text.length === 0 && offset === 1
+        ? "(the file is empty)"
+        : `(no lines in the requested range; the file may be shorter than offset ${offset})`;
+    return context.computer === "mac"
+      ? localResult(body, true, Date.now() - startedAt)
+      : { ok: true, output: body, durationMs: Date.now() - startedAt };
   },
 };
 
@@ -508,11 +831,266 @@ const writeFileTool: Tool = {
       if (resolved.error || !resolved.path) {
         return localResult(resolved.error ?? "invalid path", false, 0);
       }
-      const command = `mkdir -p -- $(dirname ${shellQuote(resolved.path)}) && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(resolved.path)} && wc -c < ${shellQuote(resolved.path)}`;
+      const command = `mkdir -p -- "$(dirname ${shellQuote(resolved.path)})" && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(resolved.path)} && wc -c < ${shellQuote(resolved.path)}`;
       return runCommand(context, command, context.workspaceDir, 30);
     }
-    const command = `mkdir -p -- $(dirname ${shellQuote(path)}) && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(path)} && wc -c < ${shellQuote(path)}`;
+    const command = `mkdir -p -- "$(dirname ${shellQuote(path)})" && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(path)} && wc -c < ${shellQuote(path)}`;
     return runCommand(context, command, "/root", 30);
+  },
+};
+
+const editTool: Tool = {
+  definition: {
+    name: "edit",
+    description:
+      "Change an existing file by replacing an exact string. Prefer this over " +
+      "write_file for edits: it preserves everything around the change, so a " +
+      "small fix stays a small diff. `oldString` must match the file exactly, " +
+      "including indentation and line breaks. If it appears more than once, " +
+      "include more surrounding lines to make it unique, or set replaceAll to " +
+      "change every occurrence. Read the file first so the match is exact.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to the file." },
+        oldString: {
+          type: "string",
+          description: "Exact text to find, including indentation.",
+        },
+        newString: { type: "string", description: "Replacement text." },
+        replaceAll: {
+          type: "boolean",
+          description: "Replace every occurrence (default false).",
+        },
+      },
+      required: ["path", "oldString", "newString"],
+    },
+  },
+  async execute(context, args) {
+    const path = typeof args.path === "string" ? args.path : "";
+    const oldString = typeof args.oldString === "string" ? args.oldString : "";
+    const newString = typeof args.newString === "string" ? args.newString : "";
+    const replaceAll = args.replaceAll === true;
+    if (!path) {
+      return { ok: false, output: "path is required", durationMs: 0 };
+    }
+    if (!oldString) {
+      return { ok: false, output: "oldString is required", durationMs: 0 };
+    }
+    if (oldString === newString) {
+      return {
+        ok: false,
+        output: "oldString and newString are identical; there is nothing to change.",
+        durationMs: 0,
+      };
+    }
+
+    const startedAt = Date.now();
+    const read = await readRawFile(context, path, MAX_EDIT_BYTES);
+    if (!read.ok) {
+      return { ok: false, output: read.error, durationMs: Date.now() - startedAt };
+    }
+    if (read.truncated) {
+      // Editing a partial read would write the truncated text back and destroy
+      // the rest of the file, so refuse rather than risk it.
+      return {
+        ok: false,
+        output:
+          `${path} is larger than the ${MAX_EDIT_BYTES} byte limit for edit. ` +
+          "Use shell to change it, or write_file if you intend to replace it entirely.",
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    const content = read.content;
+    const count = countOccurrences(content, oldString);
+    if (count === 0) {
+      const trimmed = oldString.trim();
+      const hint =
+        trimmed && content.includes(trimmed)
+          ? " The text is present but the surrounding whitespace differs, so check the indentation."
+          : "";
+      return {
+        ok: false,
+        output: `oldString was not found in ${path}.${hint}`,
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    if (count > 1 && !replaceAll) {
+      return {
+        ok: false,
+        output:
+          `oldString appears ${count} times in ${path}. Include more surrounding ` +
+          "context to make it unique, or set replaceAll to replace every occurrence.",
+        durationMs: Date.now() - startedAt,
+      };
+    }
+
+    const updated = replaceAll
+      ? content.split(oldString).join(newString)
+      : content.replace(oldString, newString);
+    const write = await writeRawFile(context, path, updated);
+    if (!write.ok) {
+      return { ok: false, output: write.error, durationMs: Date.now() - startedAt };
+    }
+    return {
+      ok: true,
+      output: `Replaced ${count} occurrence(s) in ${path}.`,
+      durationMs: Date.now() - startedAt,
+    };
+  },
+};
+
+const grepTool: Tool = {
+  definition: {
+    name: "grep",
+    description:
+      "Search file contents with a regular expression and return " +
+      "`path:line:text` for every match. Skips .git, node_modules, dist, " +
+      "build, and similar directories. Use include to narrow by filename " +
+      "(for example \"*.ts\", which is matched recursively). Results are " +
+      "capped, so narrow the pattern or the path when a search is too broad.",
+    parameters: {
+      type: "object",
+      properties: {
+        pattern: {
+          type: "string",
+          description: "Regular expression matched against each line.",
+        },
+        path: {
+          type: "string",
+          description:
+            "File or directory to search. Defaults to the working directory.",
+        },
+        include: {
+          type: "string",
+          description: "Glob filter for filenames, for example \"*.ts\".",
+        },
+        maxResults: {
+          type: "number",
+          description: "Maximum matches to return (default 200).",
+        },
+      },
+      required: ["pattern"],
+    },
+  },
+  async execute(context, args) {
+    const pattern = typeof args.pattern === "string" ? args.pattern : "";
+    if (!pattern) {
+      return { ok: false, output: "pattern is required", durationMs: 0 };
+    }
+    const startedAt = Date.now();
+    const rawPath =
+      typeof args.path === "string" && args.path ? args.path : codeRoot(context);
+    const resolved = resolveToolPath(context, rawPath);
+    if (resolved.error || !resolved.path) {
+      return {
+        ok: false,
+        output: resolved.error ?? "invalid path",
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    const cap = Math.min(
+      Math.max(1, Math.floor(Number(args.maxResults ?? 200) || 200)),
+      500,
+    );
+    const result = await runCodeToolHelper(
+      context,
+      {
+        mode: "grep",
+        root: resolved.path,
+        pattern,
+        ...(typeof args.include === "string" && args.include
+          ? { include: args.include }
+          : {}),
+        cap,
+      },
+      60,
+    );
+    if (result.exit !== 0) {
+      return {
+        ok: false,
+        output: result.stderr.trim() || "grep failed",
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    const output = result.stdout.trim();
+    return {
+      ok: true,
+      output: output
+        ? truncate(output)
+        : `No matches for /${pattern}/ under ${resolved.path}`,
+      durationMs: Date.now() - startedAt,
+    };
+  },
+};
+
+const globTool: Tool = {
+  definition: {
+    name: "glob",
+    description:
+      "Find files by path pattern, for example \"**/*.ts\" or \"src/**/*.js\". " +
+      "A pattern with no slash is matched recursively, so \"*.json\" finds " +
+      "JSON anywhere in the tree. Skips .git, node_modules, dist, build, and " +
+      "similar directories. Use this to locate files before reading them.",
+    parameters: {
+      type: "object",
+      properties: {
+        pattern: {
+          type: "string",
+          description: "Glob pattern, for example \"**/*.ts\".",
+        },
+        path: {
+          type: "string",
+          description: "Directory to search. Defaults to the working directory.",
+        },
+        maxResults: {
+          type: "number",
+          description: "Maximum files to return (default 200).",
+        },
+      },
+      required: ["pattern"],
+    },
+  },
+  async execute(context, args) {
+    const pattern = typeof args.pattern === "string" ? args.pattern : "";
+    if (!pattern) {
+      return { ok: false, output: "pattern is required", durationMs: 0 };
+    }
+    const startedAt = Date.now();
+    const rawPath =
+      typeof args.path === "string" && args.path ? args.path : codeRoot(context);
+    const resolved = resolveToolPath(context, rawPath);
+    if (resolved.error || !resolved.path) {
+      return {
+        ok: false,
+        output: resolved.error ?? "invalid path",
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    const cap = Math.min(
+      Math.max(1, Math.floor(Number(args.maxResults ?? 200) || 200)),
+      500,
+    );
+    const result = await runCodeToolHelper(
+      context,
+      { mode: "glob", root: resolved.path, pattern, cap },
+      60,
+    );
+    if (result.exit !== 0) {
+      return {
+        ok: false,
+        output: result.stderr.trim() || "glob failed",
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    const output = result.stdout.trim();
+    return {
+      ok: true,
+      output: output
+        ? truncate(output)
+        : `No files match ${pattern} under ${resolved.path}`,
+      durationMs: Date.now() - startedAt,
+    };
   },
 };
 
@@ -2526,6 +3104,9 @@ export const tools: Tool[] = [
   shellTool,
   readFileTool,
   writeFileTool,
+  editTool,
+  grepTool,
+  globTool,
   browserTool,
   browserExecuteTool,
   browserStepTool,
@@ -2574,8 +3155,9 @@ const LOCAL_DEFINITIONS: Record<string, ToolDefinition> = {
   read_file: {
     name: "read_file",
     description:
-      "Read a file from this agent's workspace folder on the user's Mac. " +
-      "Returns the file contents as text. Paths outside the workspace are rejected.",
+      "Read a file from this agent's workspace folder on the user's Mac. Each " +
+      "line comes back with its line number, so you can target a change " +
+      "precisely with the edit tool. Paths outside the workspace are rejected.",
     parameters: {
       type: "object",
       properties: {
@@ -2584,12 +3166,108 @@ const LOCAL_DEFINITIONS: Record<string, ToolDefinition> = {
           description:
             "Path to the file, relative to the workspace or absolute inside it.",
         },
+        offset: {
+          type: "number",
+          description: "First line to return, 1-based. Defaults to 1.",
+        },
+        limit: {
+          type: "number",
+          description: "Maximum lines to return (default 2000).",
+        },
         maxBytes: {
           type: "number",
           description: "Maximum bytes to read (default 100000).",
         },
       },
       required: ["path"],
+    },
+  },
+  edit: {
+    name: "edit",
+    description:
+      "Change a file in this agent's workspace on the user's Mac by replacing " +
+      "an exact string. Prefer this over write_file for edits: it preserves " +
+      "everything around the change. `oldString` must match exactly, including " +
+      "indentation; if it appears more than once, add surrounding lines or set " +
+      "replaceAll. Paths outside the workspace are rejected.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description:
+            "Path to the file, relative to the workspace or absolute inside it.",
+        },
+        oldString: {
+          type: "string",
+          description: "Exact text to find, including indentation.",
+        },
+        newString: { type: "string", description: "Replacement text." },
+        replaceAll: {
+          type: "boolean",
+          description: "Replace every occurrence (default false).",
+        },
+      },
+      required: ["path", "oldString", "newString"],
+    },
+  },
+  grep: {
+    name: "grep",
+    description:
+      "Search file contents in this agent's workspace on the user's Mac with a " +
+      "regular expression, returning `path:line:text`. Skips .git, " +
+      "node_modules, dist, and build. Paths outside the workspace are rejected.",
+    parameters: {
+      type: "object",
+      properties: {
+        pattern: {
+          type: "string",
+          description: "Regular expression matched against each line.",
+        },
+        path: {
+          type: "string",
+          description:
+            "File or directory to search, relative to the workspace or " +
+            "absolute inside it. Defaults to the workspace root.",
+        },
+        include: {
+          type: "string",
+          description: "Glob filter for filenames, for example \"*.ts\".",
+        },
+        maxResults: {
+          type: "number",
+          description: "Maximum matches to return (default 200).",
+        },
+      },
+      required: ["pattern"],
+    },
+  },
+  glob: {
+    name: "glob",
+    description:
+      "Find files in this agent's workspace on the user's Mac by path pattern, " +
+      "for example \"**/*.ts\". A pattern with no slash is matched recursively. " +
+      "Skips .git, node_modules, dist, and build. Paths outside the workspace " +
+      "are rejected.",
+    parameters: {
+      type: "object",
+      properties: {
+        pattern: {
+          type: "string",
+          description: "Glob pattern, for example \"**/*.ts\".",
+        },
+        path: {
+          type: "string",
+          description:
+            "Directory to search, relative to the workspace or absolute " +
+            "inside it. Defaults to the workspace root.",
+        },
+        maxResults: {
+          type: "number",
+          description: "Maximum files to return (default 200).",
+        },
+      },
+      required: ["pattern"],
     },
   },
   write_file: {
