@@ -9,6 +9,7 @@ import { loadConfig, defaultWorkspaceRoots } from "../config";
 import { openDatabase } from "../db";
 import { ProviderRegistry } from "../provider-registry";
 import { createDaemon } from "../server";
+import { collectSelfInfo } from "../self";
 import { Store } from "../store";
 import { WorkspaceService } from "../workspaces";
 
@@ -48,6 +49,8 @@ const sandbox = new HttpSandboxBackend({
 const approvals = new ApprovalBroker({ store });
 const challenges = new ChallengeBroker();
 const workspaces = new WorkspaceService(store, config.workspaceRoots);
+const artifactsDir = join(config.dataDir, "artifacts");
+const self = collectSelfInfo({ dataDir: config.dataDir, artifactsDir });
 const daemon = createDaemon({
   config,
   store,
@@ -57,6 +60,7 @@ const daemon = createDaemon({
   challenges,
   presets: providerPresetList(),
   workspaces,
+  self,
 });
 const { port } = await daemon.start();
 

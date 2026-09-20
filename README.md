@@ -265,6 +265,16 @@ when the Codex CLI is on `PATH`.
   routine commands in a repo you trust skip the approval card — deny rules and
   ask rules still win, and file writes keep asking. Discovery only proposes:
   nothing is reachable until you register it.
+- **Access modes**: a This Mac agent's reach is a per-agent setting — project
+  folder only, the whole home folder, or full filesystem access. The lead runs
+  with full access on your machine; managers default to their project; workers
+  inherit their manager's. Approvals stay the guardrail: local actions always
+  ask unless the project trusts the command.
+- **Self-knowledge**: the daemon knows how it is installed and where it runs
+  (dev checkout or packaged app, source and app paths, version, git revision,
+  data directory, launch command, check commands), tells the lead in its prompt,
+  and answers any agent through the `system_info` tool — so an agent asked to
+  work on OpenBot can find its own source and explain how to restart it.
 - **Host-side web search**: a `web_search` tool queries the live web through
   Exa (keyless) or Parallel and returns page content with titles and URLs for
   citation. It runs in the daemon, not the microVM, so it works on any
@@ -451,16 +461,20 @@ Layout:
 
 ### Working on OpenBot with OpenBot
 
-The registry exists so an agent can work in this repo:
+The lead already runs with full access on your machine, so it can work in this
+repo directly. The registry is what gives it the project's context and trust:
 
 1. **Settings → Workspaces** → **Scan now**: `open-bot` shows up under your dev
    root (add a scan root if it does not), or add the folder by path.
-2. **Settings → Team → Hire a role**: pick **This Mac**, then the `open-bot`
-   project folder. The agent's shell and file tools now start in the repo.
-3. **Workspaces → Trust** on `open-bot`: add patterns such as
+2. **Workspaces → Trust** on `open-bot`: add patterns such as
    `^pnpm (typecheck|smoke|code-tools:smoke|websearch:smoke)$` and
    `^git (status|diff|log)$` so routine commands skip the approval card. Deny
    rules still win and file writes keep asking.
+3. Ask the lead to work on it, or hire a dedicated **This Mac** agent with the
+   `open-bot` project folder and `project` access to keep it contained.
+
+The lead can call `system_info` to see exactly where the daemon, app, and data
+live before it changes anything.
 
 If the daemon runs with `tsx watch` (`pnpm dev:daemon`), an edit under
 `packages/core` restarts it and kills the agent's in-flight turn — point the
@@ -474,11 +488,12 @@ Single-user by design. The daemon binds `127.0.0.1` only, bot computers are
 isolated microVMs, API keys live in the data directory (`0600` inside a `0700`
 directory) or your environment, and commands require approval by default. The
 sandbox is a real boundary: the model can only touch its own microVM. Local-Mac
-agents are the exception — they run as you, restricted to their registered
-project folder (or a managed scratch folder) for file tools, and always require
-approval unless the project's trust patterns allow a command. There is no
-per-bot network policy yet, so treat microVMs as sharing one network with your
-Mac.
+agents are the exception — they run as you, with a reach you choose per agent
+(project folder, home folder, or the whole filesystem), and always require
+approval unless the project's trust patterns allow a command. In a packaged app
+macOS TCC is the outer boundary; in a dev checkout the daemon inherits your
+terminal's permissions. There is no per-bot network policy yet, so treat
+microVMs as sharing one network with your Mac.
 
 ## License
 

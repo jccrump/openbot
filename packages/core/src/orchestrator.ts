@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import type {
+  AccessMode,
   Bot,
   ComputerKind,
   Message,
@@ -144,6 +145,7 @@ export class Orchestrator implements OrchestratorHandle {
       model: bot.model,
       computer: bot.computer ?? null,
       computers: bot.computers,
+      access: bot.access,
       workspaceId: bot.workspaceId ?? null,
       workspace: workspace?.name ?? null,
       delegates: bot.delegates,
@@ -173,6 +175,7 @@ export class Orchestrator implements OrchestratorHandle {
     model?: ModelRef;
     computers?: ComputerKind[];
     workspaceId?: string | null;
+    access?: AccessMode;
   }): { role: RoleSummary; created: boolean } {
     const store = this.options.deps.store;
     const caller = store.getBot(input.callerBotId);
@@ -228,6 +231,7 @@ export class Orchestrator implements OrchestratorHandle {
       role: specialty,
       computers,
       workspaceId: input.workspaceId ?? caller.workspaceId ?? null,
+      access: input.access ?? caller.access,
       delegates: false,
     });
     this.options.emit({
@@ -267,6 +271,7 @@ export class Orchestrator implements OrchestratorHandle {
     model?: ModelRef;
     computers?: ComputerKind[];
     workspaceId?: string | null;
+    access?: AccessMode;
   }): ProjectSummary {
     const store = this.options.deps.store;
     const caller = store.getBot(input.callerBotId);
@@ -291,6 +296,7 @@ export class Orchestrator implements OrchestratorHandle {
       color: "#2563eb",
       computers: normalizeComputers(input.computers ?? null),
       workspaceId: input.workspaceId ?? null,
+      access: input.access ?? "project",
       delegates: true,
     });
     this.options.emit({

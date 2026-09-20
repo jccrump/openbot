@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { homedir } from "node:os";
 import type { Bot, ComputerKind, Workspace } from "@openbot/protocol";
 import type { SandboxBackend } from "@openbot/sandbox";
 import { ensureWorkspace, resolveWorkspacePath } from "./local-computer";
@@ -71,8 +72,15 @@ function workspaceFor(options: FileServiceOptions, bot: Bot): Workspace | null {
   return options.getWorkspace(bot.workspaceId);
 }
 
-/** The Mac folder file tools are confined to: the project, or the scratch folder. */
+/** The Mac folder file tools are confined to: the project, the home folder, or all. */
 function macRoot(options: FileServiceOptions, bot: Bot): string {
+  const access = bot.access ?? "project";
+  if (access === "full") {
+    return "/";
+  }
+  if (access === "home") {
+    return homedir();
+  }
   const workspace = workspaceFor(options, bot);
   return workspace ? workspace.root : ensureWorkspace(scratchDir(options, bot));
 }

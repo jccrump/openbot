@@ -237,6 +237,9 @@ export function openDatabase(dataDir: string): DatabaseSync {
   if (!botColumnNames.has("workspace_id")) {
     db.exec("ALTER TABLE bots ADD COLUMN workspace_id TEXT");
   }
+  if (!botColumnNames.has("access")) {
+    db.exec("ALTER TABLE bots ADD COLUMN access TEXT NOT NULL DEFAULT 'project'");
+  }
 
   const workspaceColumns = db
     .prepare("PRAGMA table_info(workspaces)")

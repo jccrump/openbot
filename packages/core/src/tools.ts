@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { ToolDefinition } from "@openbot/gateway";
 import { choice } from "@openbot/gateway";
 import type {
+  AccessMode,
   ComputerKind,
   FileChange,
   ModelRef,
@@ -30,6 +31,11 @@ import {
 } from "./browse";
 import type { DecisionNotice, DecisionRuntime } from "./decision";
 import { lineDiff } from "./diff";
+import {
+  collectSelfInfo,
+  renderSelfInfo,
+  type SelfInfo,
+} from "./self";
 import type { MemoryService } from "./memory";
 import type { SoulService } from "./soul";
 import {
@@ -85,6 +91,10 @@ export interface ToolContext {
   computer: ComputerKind;
   /** Every computer this agent may act on; defaults to [computer]. */
   computers?: ComputerKind[];
+  /** How far the agent's local file tools may reach (ADR-023). */
+  access?: AccessMode;
+  /** What the daemon knows about itself, for the system_info tool. */
+  self?: SelfInfo;
   sandbox: SandboxBackend | null;
   workspaceDir: string;
   artifactsDir: string;
@@ -169,6 +179,7 @@ export interface RoleSummary {
   model: ModelRef;
   computer: string | null;
   computers: ComputerKind[];
+  access: AccessMode;
   workspaceId: string | null;
   workspace: string | null;
   delegates: boolean;
@@ -244,6 +255,7 @@ export interface OrchestratorHandle {
     model?: ModelRef;
     computers?: ComputerKind[];
     workspaceId?: string | null;
+    access?: AccessMode;
   }): ProjectSummary;
   createWorker(input: {
     callerBotId: string;
@@ -253,6 +265,7 @@ export interface OrchestratorHandle {
     model?: ModelRef;
     computers?: ComputerKind[];
     workspaceId?: string | null;
+    access?: AccessMode;
   }): { role: RoleSummary; created: boolean };
   askProject(input: {
     callerBotId: string;
@@ -285,6 +298,7 @@ export function isReadOnlyOrchestrationTool(name: string): boolean {
 /** Memory reads and writes are low risk and never need an approval card. */
 export function isApprovalExemptTool(name: string): boolean {
   return (
+    name === "system_info" ||
     READ_ONLY_ORCHESTRATION_TOOL_NAMES.has(name) || MEMORY_TOOL_NAMES.has(name)
   );
 }
@@ -439,8 +453,10 @@ async function spillOutput(
     `--- stdout ---\n${result.stdout}\n--- stderr ---\n${result.stderr}\n`;
   try {
     if (context.computer === "mac") {
-      ensureWorkspace(context.workspaceDir);
-      const dir = join(context.workspaceDir, ".openbot-spill");
+      const dir =
+        accessMode(context) === "project"
+          ? join(ensureWorkspace(context.workspaceDir), ".openbot-spill")
+          : join(context.artifactsDir, "spill");
       mkdirSync(dir, { recursive: true });
       const file = join(dir, name);
       writeFileSync(file, body, "utf8");
@@ -488,8 +504,11 @@ async function runCommand(
   timeoutSeconds: number,
 ): Promise<ToolExecutionResult> {
   if (context.computer === "mac") {
-    const workspace = ensureWorkspace(context.workspaceDir);
-    const resolvedCwd = resolveLocalCwd(workspace, cwd || workspace);
+    const base =
+      accessMode(context) === "project"
+        ? ensureWorkspace(context.workspaceDir)
+        : homedir();
+    const resolvedCwd = resolveLocalCwd(base, cwd || base);
     if (resolvedCwd.error || !resolvedCwd.path) {
       return localResult(resolvedCwd.error ?? "invalid cwd", false, 0);
     }
@@ -546,8 +565,11 @@ async function runCapture(
 ): Promise<RawExecResult> {
   const startedAt = Date.now();
   if (context.computer === "mac") {
-    const workspace = ensureWorkspace(context.workspaceDir);
-    const resolvedCwd = resolveLocalCwd(workspace, cwd || workspace);
+    const base =
+      accessMode(context) === "project"
+        ? ensureWorkspace(context.workspaceDir)
+        : homedir();
+    const resolvedCwd = resolveLocalCwd(base, cwd || base);
     if (resolvedCwd.error || !resolvedCwd.path) {
       return {
         exit: 1,
@@ -598,8 +620,7 @@ function resolveToolPath(
   path: string,
 ): { path: string | null; error: string | null } {
   if (context.computer === "mac") {
-    ensureWorkspace(context.workspaceDir);
-    return resolveWorkspacePath(context.workspaceDir, path);
+    return resolveLocalPath(context, path);
   }
   // The guest has no confinement, so a relative path is taken from the
   // session's working directory rather than the process's.
@@ -609,16 +630,47 @@ function resolveToolPath(
   };
 }
 
+function accessMode(context: ToolContext): AccessMode {
+  return context.access ?? "project";
+}
+
+/**
+ * Resolve a local path for the agent's access mode: confined to the project
+ * folder, to the home folder, or free (ADR-023).
+ */
+function resolveLocalPath(
+  context: ToolContext,
+  path: string,
+): { path: string | null; error: string | null } {
+  const access = accessMode(context);
+  if (access === "full") {
+    return {
+      path: isAbsolute(path) ? resolve(path) : resolve(homedir(), path),
+      error: null,
+    };
+  }
+  if (access === "home") {
+    return resolveWorkspacePath(homedir(), path);
+  }
+  ensureWorkspace(context.workspaceDir);
+  return resolveWorkspacePath(context.workspaceDir, path);
+}
+
+/** The Mac folder the agent starts from for the current access mode. */
+function macBase(context: ToolContext): string {
+  return accessMode(context) === "project" ? context.workspaceDir : homedir();
+}
+
 /** The directory a code tool starts from when the model gives no path. */
 function codeRoot(context: ToolContext): string {
   if (context.computer === "mac") {
-    return context.workspaceDir;
+    return macBase(context);
   }
   return context.guestCwd ?? "/root";
 }
 
 function codeCwd(context: ToolContext): string {
-  return context.computer === "mac" ? context.workspaceDir : "/root";
+  return context.computer === "mac" ? macBase(context) : "/root";
 }
 
 const CODE_TOOL_HELPER_NAME = "openbot-code-tools.mjs";
@@ -868,12 +920,18 @@ async function runBackgroundCommand(
     `echo $!; }`;
 
   if (context.computer === "mac") {
-    const workspace = ensureWorkspace(context.workspaceDir);
-    const resolvedCwd = resolveLocalCwd(workspace, cwd || workspace);
+    const base =
+      accessMode(context) === "project"
+        ? ensureWorkspace(context.workspaceDir)
+        : homedir();
+    const resolvedCwd = resolveLocalCwd(base, cwd || base);
     if (resolvedCwd.error || !resolvedCwd.path) {
       return localResult(resolvedCwd.error ?? "invalid cwd", false, 0);
     }
-    const dir = join(workspace, ".openbot-logs");
+    const dir =
+      accessMode(context) === "project"
+        ? join(base, ".openbot-logs")
+        : join(context.artifactsDir, "logs");
     const log = join(dir, name);
     const result = await execLocal(
       wrapper(dir, log),
@@ -1143,13 +1201,12 @@ const writeFileTool: Tool = {
     const encoded = Buffer.from(content, "utf8").toString("base64");
     let result: ToolExecutionResult;
     if (context.computer === "mac") {
-      ensureWorkspace(context.workspaceDir);
-      const resolved = resolveWorkspacePath(context.workspaceDir, path);
+      const resolved = resolveLocalPath(context, path);
       if (resolved.error || !resolved.path) {
         return localResult(resolved.error ?? "invalid path", false, 0);
       }
       const command = `mkdir -p -- "$(dirname ${shellQuote(resolved.path)})" && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(resolved.path)} && wc -c < ${shellQuote(resolved.path)}`;
-      result = await runCommand(context, command, context.workspaceDir, 30);
+      result = await runCommand(context, command, macBase(context), 30);
     } else {
       const command = `mkdir -p -- "$(dirname ${shellQuote(path)})" && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(path)} && wc -c < ${shellQuote(path)}`;
       result = await runCommand(context, command, "/root", 30);
@@ -2875,6 +2932,32 @@ function formatElapsed(from: string, to: string | null): string {
   return `${Math.round(minutes / 60)}h`;
 }
 
+const systemInfoTool: Tool = {
+  definition: {
+    name: "system_info",
+    description:
+      "Report where this OpenBot is installed and running: run mode (dev " +
+      "checkout or packaged app), source path, app path, version, git " +
+      "revision, daemon entry and pid, data and database paths, how the " +
+      "daemon was launched, and the project's check commands. Use it before " +
+      "working on OpenBot itself or explaining how to update it.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  async execute(context) {
+    const info =
+      context.self ??
+      collectSelfInfo({
+        dataDir: dirname(context.artifactsDir),
+        artifactsDir: context.artifactsDir,
+      });
+    return { ok: true, output: renderSelfInfo(info), durationMs: 0 };
+  },
+};
+
 const listRolesTool: Tool = {
   definition: {
     name: "list_roles",
@@ -3924,6 +4007,7 @@ export const tools: Tool[] = [
   desktopTool,
   browseTool,
   webSearchTool,
+  systemInfoTool,
   listRolesTool,
   spawnWorkerTool,
   createWorkerTool,

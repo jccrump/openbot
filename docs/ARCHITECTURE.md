@@ -1237,6 +1237,24 @@ auto-assigning every discovered folder (agents would silently gain access to
 unrelated repos); deleting the project folder on Start fresh (only the scratch
 folder and the computer are rebuilt).
 
+**ADR-023: Local reach is a per-agent grant, and OpenBot knows itself.** A This
+Mac agent's `access` is `project` (its assigned folder, or a managed scratch
+folder), `home`, or `full`. The workspace registry remains how projects get
+context and trust, but it is no longer the only way an agent can reach files:
+the lead runs `full` on the user's own machine because it orchestrates, managers
+default to `project`, and workers inherit their manager's reach. In a packaged
+app macOS TCC is the real boundary — the app requests Documents/Desktop/
+Downloads and the user grants Full Disk Access — while in a dev checkout the
+terminal's permissions apply. Approvals remain the guardrail: every local action
+still asks unless the workspace's trusted patterns or a policy rule allow it.
+Separately, the daemon collects a `SelfInfo` (run mode, source and app paths,
+version, git revision, launch command, data and database paths, check commands),
+injects a compact `[self]` note into the lead's prompt, and exposes the detail
+through a `system_info` tool, so an agent asked to work on OpenBot can ground
+itself and explain how to restart or update it. Rejected: full access for every
+agent (reach should be a deliberate grant); confinement as the only model (too
+manual for a personal machine); the agent guessing its own install layout.
+
 **ADR-017 amendment: memory and soul adapt automatically, but stay legible.**
 The user asked for memory and soul to change over time without being told to,
 so reflection is automatic: a background pass extracts durable memories from

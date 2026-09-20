@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type {
+  AccessMode,
   Bot,
   ComputerKind,
   ModelRef,
@@ -24,6 +25,7 @@ export interface AgentSettingsPatch {
   color: string;
   computers: ComputerKind[];
   workspaceId: string | null;
+  access: AccessMode;
   delegates: boolean;
   policy: RolePolicy;
   model: ModelRef;
@@ -55,6 +57,7 @@ export function AgentSettingsModal({
   const [color, setColor] = useState(AVATAR_COLORS[0]!);
   const [computers, setComputers] = useState<ComputerKind[]>(["firecracker"]);
   const [workspaceId, setWorkspaceId] = useState("");
+  const [access, setAccess] = useState<AccessMode>("project");
   const [delegates, setDelegates] = useState(false);
   const [policy, setPolicy] = useState<RolePolicy>("inherit");
   const [effort, setEffort] = useState<ReasoningEffort | "">("");
@@ -69,6 +72,7 @@ export function AgentSettingsModal({
     setColor(bot.color ?? AVATAR_COLORS[0]!);
     setComputers(botComputers(bot));
     setWorkspaceId(bot.workspaceId ?? "");
+    setAccess(bot.access ?? "project");
     setDelegates(bot.delegates);
     setPolicy(bot.policy);
     setEffort(bot.model.effort ?? "");
@@ -104,6 +108,7 @@ export function AgentSettingsModal({
     color !== (bot.color ?? AVATAR_COLORS[0]!) ||
     computersChanged ||
     (workspaceId || null) !== (bot.workspaceId ?? null) ||
+    access !== (bot.access ?? "project") ||
     delegates !== bot.delegates ||
     policy !== bot.policy ||
     (effort || null) !== (bot.model.effort ?? null);
@@ -233,6 +238,28 @@ export function AgentSettingsModal({
               </p>
             </label>
 
+            <label className="field">
+              <span>This Mac access</span>
+              <select
+                value={access}
+                aria-label="Agent This Mac access"
+                onChange={(event) =>
+                  setAccess(event.target.value as AccessMode)
+                }
+              >
+                <option value="project">Project folder only</option>
+                <option value="home">Home folder</option>
+                <option value="full">Full access</option>
+              </select>
+              <p className="computer-warning">
+                {access === "project"
+                  ? "File tools and shell stay inside the project folder."
+                  : access === "home"
+                    ? "File tools and shell reach anywhere under your home folder."
+                    : "File tools and shell reach the whole filesystem as you. Every local action still asks unless the project trusts it."}
+              </p>
+            </label>
+
             <div className="field">
               <span>Delegation</span>
               <div className="agent-power-row">
@@ -338,6 +365,7 @@ export function AgentSettingsModal({
                   color,
                   computers,
                   workspaceId: workspaceId || null,
+                  access,
                   delegates,
                   policy,
                   model: {

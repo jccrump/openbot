@@ -68,6 +68,7 @@ import {
   type ToolImage,
 } from "./tools";
 import { workspaceGuestRoot } from "./workspaces";
+import { renderSelfNote, type SelfInfo } from "./self";
 import {
   annotateBrowserObservation,
   annotateWebSearchObservation,
@@ -99,6 +100,8 @@ export interface AgentDeps {
   memory?: MemoryService | null;
   soul?: SoulService | null;
   policy?: () => PolicySettings;
+  /** What the daemon knows about itself (system_info and the lead's [self] note). */
+  self?: SelfInfo;
 }
 
 /** Messages typed while a turn is running; the loop drains them at step
@@ -970,6 +973,8 @@ export async function runAgent(
           guestCwd,
           computer,
           computers,
+          access: bot.access,
+          self: deps.self,
           sandbox: deps.sandbox,
           workspaceDir,
           artifactsDir: deps.artifactsDir,
@@ -1019,6 +1024,21 @@ export async function runAgent(
           ? " The folder is currently missing on disk — tell the user."
           : ""),
     );
+  }
+  if (hasMac && bot.access !== "project") {
+    contextParts.push(
+      bot.access === "home"
+        ? "[access] This Mac access is Home: file tools and shell reach " +
+            "anywhere under the home folder, not just the project. Every " +
+            "local action still asks unless the project's trust patterns " +
+            "allow it."
+        : "[access] This Mac access is Full: file tools and shell reach the " +
+            "whole filesystem. Every local action still asks unless the " +
+            "project's trust patterns allow it.",
+    );
+  }
+  if (bot.kind === "lead" && deps.self) {
+    contextParts.push(renderSelfNote(deps.self));
   }
   if (computers.length > 1) {
     contextParts.push(

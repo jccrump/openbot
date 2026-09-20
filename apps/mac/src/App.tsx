@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import type {
+  AccessMode,
   Bot,
   ComputerKind,
   Message,
@@ -1206,6 +1207,14 @@ export default function App() {
         (workspace) => workspace.id === screenBot.workspaceId,
       ) ?? null)
     : null;
+  const filesRootLabel =
+    filesTarget !== "mac"
+      ? undefined
+      : (screenBot?.access ?? "project") === "home"
+        ? "Home"
+        : (screenBot?.access ?? "project") === "full"
+          ? "Filesystem"
+          : filesWorkspace?.name;
   useEffect(() => {
     setFilesComputer(hasVm(screenBot) ? "firecracker" : "mac");
   }, [screenBot?.id]);
@@ -2100,8 +2109,8 @@ export default function App() {
                             botId={screenBot.id}
                             computers={screenBotComputers}
                             computer={filesTarget}
-                            {...(filesTarget === "mac" && filesWorkspace
-                              ? { rootLabel: filesWorkspace.name }
+                            {...(filesRootLabel
+                              ? { rootLabel: filesRootLabel }
                               : {})}
                             onComputerChange={setFilesComputer}
                             active={!collapsed}
@@ -3401,6 +3410,7 @@ function CreateAgentModal({
   const [effort, setEffort] = useState<ReasoningEffort | "">("");
   const [computers, setComputers] = useState<ComputerKind[]>(["firecracker"]);
   const [workspaceId, setWorkspaceId] = useState("");
+  const [access, setAccess] = useState<AccessMode>("project");
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const nameRef = useRef<HTMLInputElement | null>(null);
@@ -3414,6 +3424,7 @@ function CreateAgentModal({
     setColor(AVATAR_COLORS[0]!);
     setComputers(["firecracker"]);
     setWorkspaceId("");
+    setAccess("project");
     setCreating(false);
     setError(null);
     const preferred = selectedModel ?? null;
@@ -3463,6 +3474,7 @@ function CreateAgentModal({
           : {}),
         computers,
         ...(workspaceId ? { workspaceId } : {}),
+        access,
       });
       onClose();
     } catch (err) {
@@ -3615,6 +3627,37 @@ function CreateAgentModal({
               </p>
             )}
           </label>
+
+          {computers.includes("mac") && (
+            <label className="field">
+              <span>This Mac access</span>
+              <select
+                value={access}
+                onChange={(event) =>
+                  setAccess(event.target.value as AccessMode)
+                }
+                aria-label="Agent This Mac access"
+              >
+                <option value="project">Project folder only</option>
+                <option value="home">Home folder</option>
+                <option value="full">Full access</option>
+              </select>
+              {access === "project" ? (
+                <p className="computer-warning">
+                  File tools and shell stay inside the project folder.
+                </p>
+              ) : access === "home" ? (
+                <p className="computer-warning">
+                  File tools and shell reach anywhere under your home folder.
+                </p>
+              ) : (
+                <p className="computer-warning">
+                  File tools and shell reach the whole filesystem as you. Every
+                  local action still asks unless the project trusts it.
+                </p>
+              )}
+            </label>
+          )}
 
           {error && <div className="form-error">{error}</div>}
         </div>

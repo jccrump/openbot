@@ -543,6 +543,8 @@ const mockModelServer = createServer(async (request, response) => {
           "[system] Your last reply contained raw tool-call markup",
         )
         ? { name: "shell", args: { command: "uname -a" } }
+        : last.content.startsWith("system-info:")
+        ? { name: "system_info", args: {} }
         : last.content.startsWith("write-note:")
         ? {
             name: "write_file",
@@ -1540,6 +1542,11 @@ try {
     "the seeded bot should be the lead",
   );
   assert.equal(hello.bots[0].kind, "lead", "the seeded bot should be the lead");
+  assert.equal(
+    hello.bots[0].access,
+    "full",
+    "the lead should run with full local access",
+  );
   assert.ok(Array.isArray(hello.tasks), "hello should include the task list");
   const botId = hello.bots[0].id;
 
@@ -4180,8 +4187,100 @@ try {
   await waitFor("bot.updated");
   await waitForLeadQuiet();
 
+  // Access modes (ADR-023): system_info describes the running daemon, full
+  // reach reads outside the project, and home reach stays inside the home
+  // folder.
+  const infoMarker = received.length;
+  socket.send(
+    JSON.stringify({ type: "chat.send", botId, text: "system-info:" }),
+  );
+  const infoResult = await waitForSince(
+    infoMarker,
+    (item) => item.type === "tool.result",
+  );
+  assert.equal(infoResult.ok, true);
+  assert.match(infoResult.output, /run mode: dev/);
+  assert.ok(
+    infoResult.output.includes(dataDir),
+    "system_info should report the data directory",
+  );
+  assert.equal(
+    received
+      .slice(infoMarker)
+      .some((item) => item.type === "approval.request"),
+    false,
+    "system_info should not ask for approval",
+  );
+  await waitForSince(infoMarker, (item) => item.type === "chat.done");
+
+  socket.send(
+    JSON.stringify({
+      type: "bots.create",
+      requestId: "bot-full-1",
+      name: "Full Access",
+      computer: "mac",
+      access: "full",
+    }),
+  );
+  const fullBot = await waitFor("bot.created");
+  assert.equal(fullBot.bot.access, "full");
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId: fullBot.bot.id,
+      text: "read-outside:",
+    }),
+  );
+  const fullApproval = await waitFor("approval.request");
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: fullApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const fullResult = await waitFor("tool.result");
+  assert.equal(fullResult.ok, true, "full access should read outside home");
+  assert.match(fullResult.output, /localhost/);
+  await waitFor("chat.done");
+
+  socket.send(
+    JSON.stringify({
+      type: "bots.create",
+      requestId: "bot-home-1",
+      name: "Home Access",
+      computer: "mac",
+      access: "home",
+    }),
+  );
+  const homeBot = await waitFor("bot.created");
+  assert.equal(homeBot.bot.access, "home");
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId: homeBot.bot.id,
+      text: "read-outside:",
+    }),
+  );
+  const homeApproval = await waitFor("approval.request");
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: homeApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const homeResult = await waitFor("tool.result");
+  assert.equal(homeResult.ok, false);
+  assert.match(
+    homeResult.output,
+    /escapes the bot workspace/,
+    "home access must stay inside the home folder",
+  );
+  await waitFor("chat.done");
+
   console.log(
-    `SMOKE OK — text chat, single thread per bot, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), dual-computer routing (per-call computer argument, microVM default, Mac opt-in, unavailable computer rejected), workspace registry (scan roots, marker detection, node_modules skipped, add/ignore/remove, shell and file tools rooted in the project, escape rejected, trusted commands with deny precedence, worker inheritance), agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, lead delegation (spawn_worker, task grant, in-grant tools without re-approval, out-of-grant escalation and denial, task result + evidence + usage, lead notification), dynamic team building (create_worker, immediate delegation to the new worker, duplicate-name reuse), projects (lead creates a persistent manager, list_projects routing, ask_project request on the project thread, worker sessions in the project computer with their own browser, project survives and is reused), per-task computers (own sandbox id, concurrency cap and queueing, destroyed on settle), memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-role narrowing, egress allowlist), Jev routing (conversation runs without tools, a named project gets the routing hint), harness robustness (list_dir, shell output spill, shell background, browser press/select/wait_for/snapshot/tabs/upload/downloads, duplicate-failure stop, raw-markup retry, changed-file metadata), context discipline (unchanged reads and identical results collapse), working plan (update_plan persists and is injected), output screening (injected instructions in shell output are annotated), busy-turn delivery (queue waits for the stop, steer redirects the running turn, persisted default), chat clear (transcript archived in place, title reset, fresh turn on the same thread)`,
+    `SMOKE OK — text chat, single thread per bot, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), dual-computer routing (per-call computer argument, microVM default, Mac opt-in, unavailable computer rejected), workspace registry (scan roots, marker detection, node_modules skipped, add/ignore/remove, shell and file tools rooted in the project, escape rejected, trusted commands with deny precedence, worker inheritance), access modes (full reach outside home, home confinement, system_info self-report), agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, lead delegation (spawn_worker, task grant, in-grant tools without re-approval, out-of-grant escalation and denial, task result + evidence + usage, lead notification), dynamic team building (create_worker, immediate delegation to the new worker, duplicate-name reuse), projects (lead creates a persistent manager, list_projects routing, ask_project request on the project thread, worker sessions in the project computer with their own browser, project survives and is reused), per-task computers (own sandbox id, concurrency cap and queueing, destroyed on settle), memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-role narrowing, egress allowlist), Jev routing (conversation runs without tools, a named project gets the routing hint), harness robustness (list_dir, shell output spill, shell background, browser press/select/wait_for/snapshot/tabs/upload/downloads, duplicate-failure stop, raw-markup retry, changed-file metadata), context discipline (unchanged reads and identical results collapse), working plan (update_plan persists and is injected), output screening (injected instructions in shell output are annotated), busy-turn delivery (queue waits for the stop, steer redirects the running turn, persisted default), chat clear (transcript archived in place, title reset, fresh turn on the same thread)`,
   );
 } finally {
   socket?.close();

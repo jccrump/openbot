@@ -72,6 +72,7 @@ import {
 } from "./store";
 import { captureScreen } from "./tools";
 import { WorkspaceService } from "./workspaces";
+import type { SelfInfo } from "./self";
 
 const SCREEN_CACHE_MS = 1000;
 
@@ -114,6 +115,8 @@ export interface DaemonOptions {
   challenges: ChallengeBroker;
   presets: ProviderPreset[];
   workspaces: WorkspaceService;
+  /** Collected once at startup; system_info and the lead's [self] note use it. */
+  self: SelfInfo;
 }
 
 export interface Daemon {
@@ -253,6 +256,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
     providerRecord: (id) => options.store.getProvider(id),
     resolveProviderKey: (record) => options.registry.resolveKey(record),
     policy: () => readPolicySettings(),
+    self: options.self,
   };
 
   const readDefaultModel = (): ModelRef => {
@@ -1026,6 +1030,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
             computer: message.computer ?? null,
             computers: message.computers,
             workspaceId: message.workspaceId ?? null,
+            access: message.access,
             delegates: message.delegates ?? false,
             policy: message.policy ?? "inherit",
           });
@@ -1048,6 +1053,9 @@ export function createDaemon(options: DaemonOptions): Daemon {
           }
           if (message.workspaceId !== undefined) {
             patch.workspaceId = message.workspaceId || null;
+          }
+          if (message.access !== undefined) {
+            patch.access = message.access;
           }
           if (message.delegates !== undefined) {
             patch.delegates = message.delegates;

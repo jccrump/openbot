@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
+  AccessMode,
   ApprovalRecord,
   ApprovalTier,
   Bot,
@@ -101,6 +102,7 @@ export interface CreateBotInput {
   computer?: ComputerKind;
   computers?: ComputerKind[];
   workspaceId?: string;
+  access?: AccessMode;
 }
 
 export interface FetchModelsResult {
@@ -1309,6 +1311,7 @@ export function useDaemon() {
         computer?: ComputerKind;
         computers?: ComputerKind[];
         workspaceId?: string | null;
+        access?: AccessMode;
         delegates?: boolean;
         policy?: RolePolicy;
         model?: ModelRef;

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type {
+  AccessMode,
   ApprovalDecision,
   ApprovalRecord,
   ApprovalTier,
@@ -35,6 +36,8 @@ export const DEFAULT_BOT_NAME = "Assistant";
 /** The lead orchestrates work on either side, so it gets both computers. */
 const LEAD_PRIMARY: ComputerKind = "firecracker";
 const LEAD_COMPUTERS: ComputerKind[] = [LEAD_PRIMARY, "mac"];
+/** The lead runs on the user's own machine with full reach (ADR-023). */
+const LEAD_ACCESS: AccessMode = "full";
 export const DEFAULT_THREAD_TITLE = "New chat";
 export const DEFAULT_SYSTEM_PROMPT =
   "You are OpenBot, an agent with your own computer. Your computer is a " +
@@ -301,6 +304,7 @@ interface BotRow {
   computer?: string | null;
   computers?: string | null;
   workspace_id?: string | null;
+  access?: string | null;
   delegates?: number | null;
   policy?: string | null;
 }
@@ -618,6 +622,10 @@ function computersFor(row: BotRow): ComputerKind[] {
   return normalizeComputers(row.computer ? [row.computer] : null);
 }
 
+function toAccess(value: string | null | undefined): AccessMode {
+  return value === "home" || value === "full" ? value : "project";
+}
+
 function toBot(row: BotRow): Bot {
   const effort = toEffort(row.effort);
   const computers = computersFor(row);
@@ -643,6 +651,7 @@ function toBot(row: BotRow): Bot {
     computer: computers[0] ?? null,
     computers,
     workspaceId: row.workspace_id ?? null,
+    access: toAccess(row.access),
     delegates: (row.delegates ?? 0) !== 0,
     policy: (row.policy as RolePolicy) ?? "inherit",
   };
@@ -830,11 +839,17 @@ export class Store {
           .run(DEFAULT_LEAD_SYSTEM_PROMPT, existing.id);
       }
       // The lead orchestrates work on either side of the fence, so its
-      // capability set stays open (ADR-021).
+      // capability set stays open (ADR-021), and it runs on the user's own
+      // machine with full reach (ADR-023).
       if (!LEAD_COMPUTERS.every((kind) => existing.computers.includes(kind))) {
         this.db
           .prepare("UPDATE bots SET computers = ?, computer = ? WHERE id = ?")
           .run(JSON.stringify(LEAD_COMPUTERS), LEAD_PRIMARY, existing.id);
+      }
+      if (existing.access !== LEAD_ACCESS) {
+        this.db
+          .prepare("UPDATE bots SET access = ? WHERE id = ?")
+          .run(LEAD_ACCESS, existing.id);
       }
       return this.getBot(existing.id)!;
     }
@@ -845,12 +860,13 @@ export class Store {
         : candidate.systemPrompt;
       this.db
         .prepare(
-          "UPDATE bots SET kind = 'lead', system_prompt = ?, computers = ?, computer = ? WHERE id = ?",
+          "UPDATE bots SET kind = 'lead', system_prompt = ?, computers = ?, computer = ?, access = ? WHERE id = ?",
         )
         .run(
           systemPrompt,
           JSON.stringify(LEAD_COMPUTERS),
           LEAD_PRIMARY,
+          LEAD_ACCESS,
           candidate.id,
         );
       return this.getBot(candidate.id)!;
@@ -861,6 +877,7 @@ export class Store {
       model: defaultModel,
       kind: "lead",
       computers: LEAD_COMPUTERS,
+      access: LEAD_ACCESS,
     });
   }
 
@@ -893,6 +910,7 @@ export class Store {
     computer?: string | null;
     computers?: ComputerKind[];
     workspaceId?: string | null;
+    access?: AccessMode;
     delegates?: boolean;
     policy?: RolePolicy;
   }): Bot {
@@ -915,12 +933,13 @@ export class Store {
       computer: computers[0] ?? null,
       computers,
       workspaceId: input.workspaceId ?? null,
+      access: input.access ?? "project",
       delegates: input.delegates ?? false,
       policy: input.policy ?? "inherit",
     };
     this.db
       .prepare(
-        "INSERT INTO bots (id, name, system_prompt, provider, model, effort, created_at, kind, role, avatar, color, computer, computers, workspace_id, delegates, policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO bots (id, name, system_prompt, provider, model, effort, created_at, kind, role, avatar, color, computer, computers, workspace_id, access, delegates, policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         bot.id,
@@ -937,6 +956,7 @@ export class Store {
         bot.computer ?? null,
         JSON.stringify(bot.computers),
         bot.workspaceId ?? null,
+        bot.access,
         bot.delegates ? 1 : 0,
         bot.policy,
       );
@@ -953,6 +973,7 @@ export class Store {
       computer?: string | null;
       computers?: ComputerKind[];
       workspaceId?: string | null;
+      access?: AccessMode;
       delegates?: boolean;
       policy?: RolePolicy;
       model?: ModelRef;
@@ -979,6 +1000,9 @@ export class Store {
     }
     if (patch.workspaceId !== undefined) {
       fields.push(["workspace_id", patch.workspaceId]);
+    }
+    if (patch.access !== undefined) {
+      fields.push(["access", patch.access]);
     }
     if (patch.delegates !== undefined) {
       fields.push(["delegates", patch.delegates ? 1 : 0]);

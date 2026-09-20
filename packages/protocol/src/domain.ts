@@ -46,6 +46,13 @@ export const ComputerKindSchema = z.enum(["firecracker", "mac"]);
 export type ComputerKind = z.infer<typeof ComputerKindSchema>;
 
 /**
+ * How far a This Mac agent's file tools and shell may reach: its assigned
+ * project folder, the whole home folder, or the whole filesystem (ADR-023).
+ */
+export const AccessModeSchema = z.enum(["project", "home", "full"]);
+export type AccessMode = z.infer<typeof AccessModeSchema>;
+
+/**
  * A local project folder the daemon knows about. Agents reference a workspace
  * by id instead of a path, so moving a repo updates one row and every agent
  * follows. The registry is the allowlist: an agent's file tools are confined
@@ -84,6 +91,8 @@ export const BotSchema = z.object({
   computers: z.array(ComputerKindSchema).default(["firecracker"]),
   /** The project folder this agent works in; unset means a managed scratch folder. */
   workspaceId: z.string().nullable().optional(),
+  /** File and shell reach on This Mac; defaults to the project folder. */
+  access: AccessModeSchema.default("project"),
   delegates: z.boolean().default(false),
   policy: RolePolicySchema.default("inherit"),
 });

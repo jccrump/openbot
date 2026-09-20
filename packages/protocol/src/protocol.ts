@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  AccessModeSchema,
   ApprovalDecisionSchema,
   ApprovalRecordSchema,
   ApprovalTierSchema,
@@ -54,6 +55,7 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     computer: ComputerKindSchema.optional(),
     computers: z.array(ComputerKindSchema).optional(),
     workspaceId: z.string().optional(),
+    access: AccessModeSchema.optional(),
     delegates: z.boolean().optional(),
     policy: RolePolicySchema.optional(),
   }),
@@ -69,6 +71,7 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     computer: ComputerKindSchema.optional(),
     computers: z.array(ComputerKindSchema).optional(),
     workspaceId: z.string().nullable().optional(),
+    access: AccessModeSchema.optional(),
     delegates: z.boolean().optional(),
     policy: RolePolicySchema.optional(),
     model: ModelRefSchema.optional(),
