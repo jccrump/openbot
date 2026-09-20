@@ -17,6 +17,7 @@ import type {
 } from "@openbot/protocol";
 import type { Bot } from "@openbot/protocol";
 import { HarnessLogo, ProviderLogo } from "./components/ProviderLogo";
+import { UpdateCard } from "./components/UpdateCard";
 import {
   avatarColor,
   COMPUTER_LABEL,
@@ -761,6 +762,8 @@ export function Settings(props: SettingsProps) {
                 when the agent stops.
               </p>
             )}
+
+            {section === "general" && <UpdateCard />}
 
             {section === "appearance" && (
               <>

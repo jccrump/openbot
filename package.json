@@ -13,6 +13,7 @@
     "dev:daemon:mock": "OPENBOT_DATA_DIR=$PWD/.openbot-dev pnpm --filter @openbot/core dev",
     "dev:app": "pnpm --filter @openbot/mac dev",
     "dev:mac": "pnpm --filter @openbot/mac tauri dev",
+    "app:build": "pnpm --filter @openbot/mac tauri build",
     "mock:model": "node scripts/mock-openai.mjs",
     "mcp": "pnpm --filter @openbot/mcp start",
     "mcp:smoke": "pnpm --filter @openbot/mcp exec tsx src/smoke.ts",
@@ -22,6 +23,7 @@
     "sandbox:setup": "pnpm --filter @openbot/sandbox build:browser && limactl shell openbot-fc -- sudo bash $PWD/packages/sandbox/host/setup.sh",
     "sandbox:deploy": "pnpm --filter @openbot/sandbox build:browser && bash packages/sandbox/host/deploy.sh",
     "skills:bundle": "node scripts/bundle-skills.mjs && node scripts/bundle-code-tools.mjs",
+    "sidecar:build": "node scripts/build-daemon-sidecar.mjs",
     "sandbox:logs": "limactl shell openbot-fc -- sudo journalctl -u openbot-host -n 50 --no-pager",
     "sandbox:spike": "limactl shell openbot-fc -- sudo bash $PWD/packages/sandbox/host/spike.sh",
     "browser:reset": "node scripts/browser-reset.mjs",
@@ -35,5 +37,9 @@
     "eval:validate": "node scripts/eval-validate.mjs",
     "eval": "node scripts/eval.mjs",
     "polyglot:eval": "node scripts/polyglot-eval.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "postject": "1.0.0-alpha.6"
   }
 }

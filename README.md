@@ -490,6 +490,27 @@ agent at a `git worktree` instead, or run the daemon without watch
 (`pnpm --filter @openbot/core start`). App source hot-reloads in the browser;
 the Tauri window needs `pnpm dev:mac` to rebuild.
 
+### Build the packaged app
+
+```bash
+pnpm sidecar:build                 # bundle the daemon into a Node SEA binary
+pnpm --filter @openbot/mac tauri build
+```
+
+The bundle lands in `apps/mac/src-tauri/target/release/bundle/macos/OpenBot.app`
+and contains the daemon as a sidecar, started on launch and stopped on quit.
+Because the daemon is a child of OpenBot.app, macOS attributes TCC grants
+(Documents, Desktop, Downloads, Full Disk Access) to OpenBot rather than
+Terminal; **Settings → Access** shows the state and deep-links the right pane.
+In development the app expects `pnpm dev:daemon` as before; `OPENBOT_SIDECAR=1
+pnpm dev:mac` forces the sidecar for a release-style test.
+
+Software updates use the Tauri updater: set `plugins.updater.pubkey` and
+`endpoints` in `apps/mac/src-tauri/tauri.conf.json` and build releases with
+`bundle.createUpdaterArtifacts` and the signing key. A source build has no
+channel, so Settings reports updates are not configured and you update by
+pulling and rebuilding.
+
 ## Security
 
 Single-user by design. The daemon binds `127.0.0.1` only, bot computers are

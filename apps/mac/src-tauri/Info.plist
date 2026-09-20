@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Shown in the macOS TCC prompts. The daemon runs as a sidecar of this
+       app, so grants are attributed to OpenBot rather than Terminal. -->
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>OpenBot agents work in project folders you register, including folders in Documents.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>OpenBot agents can work with files on your Desktop when you assign them.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>OpenBot agents can read and manage files in your Downloads folder when you assign them.</string>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>OpenBot agents can work with files on external volumes when you assign them.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>OpenBot uses Apple Events to open System Settings privacy panes you ask for.</string>
+</dict>
+</plist>

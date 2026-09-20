@@ -29,3 +29,6 @@ data/
 .playwright-mcp/
 evals/results/
 evals/.cache/
+
+# Built daemon sidecar (scripts/build-daemon-sidecar.mjs)
+apps/mac/src-tauri/binaries/

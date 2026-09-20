@@ -1272,6 +1272,22 @@ probing permissions at startup (prompts without consent); restarting on every
 source save in dev (the watcher already does, and it kills the turn); a silent
 restart (the tool reports exactly what will happen).
 
+**ADR-025: The packaged app ships the daemon as a sidecar.** A release build
+bundles the daemon as a Node single-executable application
+(`scripts/build-daemon-sidecar.mjs` bundles the entry with esbuild, injects it
+into a copy of the Node runtime, and ad-hoc signs it) and lists it in
+`bundle.externalBin`. The Tauri app starts it on launch and stops it on quit;
+the daemon also watches its stdin pipe and parent pid, so it cannot outlive the
+app even on a hard kill. Running the daemon as a child of OpenBot.app is what
+makes macOS attribute TCC grants to OpenBot instead of Terminal — the app's
+Info.plist carries the folder usage strings — and `system_info` reports the
+bundle path. In development the daemon still runs from a terminal
+(`OPENBOT_SIDECAR=1` forces the sidecar for a release-style test), and the
+Tauri updater is wired but inert until a release channel sets a public key and
+endpoints. Rejected: requiring Node on the user's machine (the SEA binary is
+self-contained); launching the daemon as a detached process (TCC would credit
+whoever started it, and quitting the app would leave it running).
+
 **ADR-017 amendment: memory and soul adapt automatically, but stay legible.**
 The user asked for memory and soul to change over time without being told to,
 so reflection is automatic: a background pass extracts durable memories from
