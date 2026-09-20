@@ -2979,6 +2979,60 @@ body.resizing-rows .screen-panel * {
   padding: 8px 0 0;
 }
 
+/* macOS permission report in Settings: folder, state badge, actions. */
+.access-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-top: 0.5px solid var(--hairline);
+}
+
+.access-row-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+
+.access-row-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.access-badge {
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.access-badge-granted {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent);
+}
+
+.access-badge-denied {
+  background: color-mix(in srgb, var(--amber) 18%, transparent);
+  color: var(--amber);
+}
+
+.access-badge-missing {
+  background: var(--hover);
+  color: var(--text-muted);
+}
+
+.settings-card .access-row:first-of-type {
+  border-top: 0.5px solid var(--hairline);
+}
+
 .workspace-row-body {
   display: flex;
   flex-direction: column;

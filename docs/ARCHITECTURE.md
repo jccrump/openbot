@@ -1255,6 +1255,23 @@ itself and explain how to restart or update it. Rejected: full access for every
 agent (reach should be a deliberate grant); confinement as the only model (too
 manual for a personal machine); the agent guessing its own install layout.
 
+**ADR-024: Permissions are surfaced, and the daemon can restart itself.**
+macOS gates Documents, Desktop, Downloads, and Full Disk Access behind TCC, and
+the grant belongs to the app that launched the daemon (Terminal in development,
+OpenBot once it runs as an app sidecar). Settings → Access probes each folder
+and the TCC database on demand — a probe can raise the first-time system prompt;
+a decided denial only changes in System Settings — shows the state, and
+deep-links the matching Privacy pane. Nothing is probed at startup, so OpenBot
+never prompts before the user asks. Separately, the `restart_daemon` tool lets
+an agent apply its own code changes: the request is scheduled, the current turn
+and running tasks settle, then the daemon exits — a `tsx watch` watcher is
+nudged with a touch of its entry file, a packaged app restarts its sidecar, and
+a manually started daemon re-execs itself detached. A guard file refuses more
+than three restarts in ten minutes so a broken change cannot loop. Rejected:
+probing permissions at startup (prompts without consent); restarting on every
+source save in dev (the watcher already does, and it kills the turn); a silent
+restart (the tool reports exactly what will happen).
+
 **ADR-017 amendment: memory and soul adapt automatically, but stay legible.**
 The user asked for memory and soul to change over time without being told to,
 so reflection is automatic: a background pass extracts durable memories from

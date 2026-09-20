@@ -2267,6 +2267,9 @@ export default function App() {
         onUpdateWorkspace={daemon.updateWorkspace}
         onRemoveWorkspace={daemon.removeWorkspace}
         onSaveWorkspaceRoots={daemon.saveWorkspaceRoots}
+        accessReport={daemon.accessReport}
+        onCheckAccess={daemon.checkAccess}
+        onOpenAccessPane={daemon.openAccessPane}
       />
     </div>
   );

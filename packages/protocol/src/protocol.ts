@@ -1,6 +1,8 @@
 import { z } from "zod";
 import {
   AccessModeSchema,
+  AccessPaneSchema,
+  AccessReportSchema,
   ApprovalDecisionSchema,
   ApprovalRecordSchema,
   ApprovalTierSchema,
@@ -136,6 +138,13 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("workspaces.roots"),
     roots: z.array(z.string()),
+  }),
+  z.object({
+    type: z.literal("access.check"),
+  }),
+  z.object({
+    type: z.literal("access.open"),
+    pane: AccessPaneSchema,
   }),
   z.object({
     type: z.literal("chat.send"),
@@ -339,6 +348,10 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("workspaces"),
     workspaces: z.array(WorkspaceSchema),
     roots: z.array(z.string()),
+  }),
+  z.object({
+    type: z.literal("access.report"),
+    report: AccessReportSchema,
   }),
   z.object({
     type: z.literal("thread.messages"),

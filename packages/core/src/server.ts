@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { createReadStream, existsSync, rmSync } from "node:fs";
+import { spawn } from "node:child_process";
+import {
+  createReadStream,
+  existsSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
@@ -73,6 +80,7 @@ import {
 import { captureScreen } from "./tools";
 import { WorkspaceService } from "./workspaces";
 import type { SelfInfo } from "./self";
+import { collectAccessReport, openPrivacyPane } from "./access";
 
 const SCREEN_CACHE_MS = 1000;
 
@@ -156,6 +164,13 @@ export function createDaemon(options: DaemonOptions): Daemon {
   const pending = new Set<Promise<void>>();
 
   const artifactsDir = join(options.config.dataDir, "artifacts");
+
+  // macOS attributes TCC grants to the app that launched the daemon, not the
+  // daemon itself; say which one that is so the user checks the right row.
+  const accessOwner = (): string =>
+    options.self.runMode === "dev"
+      ? "the app that launched the daemon (Terminal in development)"
+      : "OpenBot";
 
   const toMemoryInfo = (record: MemoryRecord): Memory => {
     const {
@@ -581,6 +596,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
         if (isLead) {
           drainLeadQueue();
         }
+        maybeRestart();
       });
     pending.add(task);
   };
@@ -588,9 +604,144 @@ export function createDaemon(options: DaemonOptions): Daemon {
   const orchestrator = new Orchestrator({
     deps,
     emit: broadcast,
-    onTaskSettled: (task) => scheduleLeadTurn(task),
+    onTaskSettled: (task) => {
+      scheduleLeadTurn(task);
+      maybeRestart();
+    },
   });
   deps.orchestrator = orchestrator;
+
+  // --- Self-restart (ADR-024) ---------------------------------------------
+  // The agent can ask the daemon to restart so its own code changes take
+  // effect. The restart waits for the current turn and running tasks, then
+  // exits; a watcher, the app, or a detached re-exec brings it back. A guard
+  // file refuses a restart loop.
+  const RESTART_GUARD_FILE = join(options.config.dataDir, "restart-guard.json");
+  const RESTART_WINDOW_MS = 10 * 60_000;
+  const RESTART_LIMIT = 3;
+  let restartPending: "watch" | "reexec" | "exit" | null = null;
+  let restartTimer: ReturnType<typeof setInterval> | null = null;
+
+  const shellQuote = (value: string): string =>
+    `'${value.replace(/'/g, `'\\''`)}'`;
+
+  const recentRestarts = (): string[] => {
+    try {
+      const parsed: unknown = JSON.parse(
+        readFileSync(RESTART_GUARD_FILE, "utf8"),
+      );
+      if (Array.isArray(parsed)) {
+        return parsed.filter(
+          (item): item is string => typeof item === "string",
+        );
+      }
+    } catch {
+      // no guard file yet
+    }
+    return [];
+  };
+
+  const performRestart = (mode: "watch" | "reexec" | "exit"): void => {
+    console.info("daemon.restart", { mode, pid: process.pid });
+    if (mode === "watch") {
+      // tsx watch only reruns on a file change; touch the entry to trigger it.
+      spawn(
+        "/bin/sh",
+        ["-c", `sleep 1; touch ${shellQuote(options.self.daemonEntry)}`],
+        { detached: true, stdio: "ignore" },
+      ).unref();
+    } else if (mode === "reexec") {
+      const command = [
+        process.execPath,
+        ...process.execArgv,
+        ...process.argv.slice(1),
+      ]
+        .map(shellQuote)
+        .join(" ");
+      spawn("/bin/sh", ["-c", `sleep 1; exec ${command}`], {
+        cwd: process.cwd(),
+        env: process.env,
+        detached: true,
+        stdio: "ignore",
+      }).unref();
+    }
+    setTimeout(() => process.exit(0), 300);
+  };
+
+  const maybeRestart = (): void => {
+    if (!restartPending) {
+      return;
+    }
+    if (runs.size > 0 || pending.size > 0) {
+      return;
+    }
+    const busy = orchestrator
+      .status()
+      .some((task) => task.status === "running" || task.status === "queued");
+    if (busy) {
+      return;
+    }
+    const mode = restartPending;
+    restartPending = null;
+    if (restartTimer) {
+      clearInterval(restartTimer);
+      restartTimer = null;
+    }
+    performRestart(mode);
+  };
+
+  const scheduleRestart = (): { ok: boolean; message: string } => {
+    if (restartPending) {
+      return {
+        ok: true,
+        message:
+          "A restart is already scheduled; it runs when the current work settles.",
+      };
+    }
+    const now = Date.now();
+    const recent = recentRestarts().filter(
+      (stamp) => now - Date.parse(stamp) < RESTART_WINDOW_MS,
+    );
+    if (recent.length >= RESTART_LIMIT) {
+      return {
+        ok: false,
+        message:
+          `Refusing to restart: the daemon restarted ${recent.length} times ` +
+          "in the last 10 minutes. Check the daemon log, fix the cause, and " +
+          "restart it manually.",
+      };
+    }
+    try {
+      writeFileSync(
+        RESTART_GUARD_FILE,
+        JSON.stringify([...recent, new Date(now).toISOString()]),
+      );
+    } catch {
+      // best effort; the guard is advisory
+    }
+    const mode =
+      options.self.supervised === "app"
+        ? "exit"
+        : options.self.supervised === "watch"
+          ? "watch"
+          : "reexec";
+    restartPending = mode;
+    restartTimer = setInterval(maybeRestart, 2_000);
+    restartTimer.unref();
+    return {
+      ok: true,
+      message:
+        "Restart scheduled. This turn finishes first and running tasks " +
+        "settle, then " +
+        (mode === "watch"
+          ? "the dev watcher restarts the daemon."
+          : mode === "exit"
+            ? "the app restarts the daemon."
+            : "the daemon restarts itself.") +
+        " The conversation is preserved.",
+    };
+  };
+  deps.requestRestart = scheduleRestart;
 
   options.approvals.setOnSettled((record) => {
     broadcast({
@@ -1312,6 +1463,27 @@ export function createDaemon(options: DaemonOptions): Daemon {
             type: "workspaces",
             workspaces: options.workspaces.list(),
             roots: options.workspaces.roots(),
+          });
+          return;
+        }
+        case "access.check": {
+          send({
+            type: "access.report",
+            report: collectAccessReport(accessOwner()),
+          });
+          return;
+        }
+        case "access.open": {
+          if (!openPrivacyPane(message.pane)) {
+            send({
+              type: "chat.error",
+              message: "System Settings panes are only available on macOS",
+            });
+            return;
+          }
+          send({
+            type: "access.report",
+            report: collectAccessReport(accessOwner()),
           });
           return;
         }

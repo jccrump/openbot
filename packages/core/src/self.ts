@@ -22,6 +22,8 @@ export interface SelfCheck {
  */
 export interface SelfInfo {
   runMode: "dev" | "packaged";
+  /** How the daemon can be restarted: watched, app-supervised, or manual. */
+  supervised: "watch" | "app" | "none";
   repoRoot: string | null;
   appDir: string | null;
   daemonEntry: string;
@@ -131,18 +133,25 @@ export function collectSelfInfo(input: {
   const launch = parentCommand();
   const packaged = process.env.OPENBOT_APP_PATH?.trim();
   const runMode = repoRoot ? "dev" : "packaged";
+  const supervised: SelfInfo["supervised"] = packaged
+    ? "app"
+    : launch && /tsx/.test(launch) && /watch/.test(launch)
+      ? "watch"
+      : "none";
   const appDir = packaged
     ? packaged
     : repoRoot
       ? join(repoRoot, "apps", "mac")
       : null;
-  const restartHint = packaged
-    ? "The app supervises this daemon; the app can restart it."
-    : launch && /tsx/.test(launch) && /watch/.test(launch)
-      ? "The dev watcher (tsx watch) restarts the daemon when source files change, which interrupts any running turn."
-      : "The daemon was started manually; restarting it ends this process and any running turn.";
+  const restartHint =
+    supervised === "app"
+      ? "The app supervises this daemon; the app can restart it."
+      : supervised === "watch"
+        ? "The dev watcher (tsx watch) restarts the daemon when source files change, which interrupts any running turn."
+        : "The daemon was started manually; restarting it ends this process and any running turn.";
   return {
     runMode,
+    supervised,
     repoRoot,
     appDir,
     daemonEntry: entry,
@@ -187,6 +196,7 @@ export function renderSelfNote(info: SelfInfo): string {
 export function renderSelfInfo(info: SelfInfo): string {
   const lines = [
     `run mode: ${info.runMode}`,
+    `supervision: ${info.supervised}`,
     `version: ${info.version ?? "unknown"}`,
     `daemon: ${info.daemonEntry} (pid ${info.pid})`,
     `node: ${info.nodeVersion} · ${info.platform}/${info.arch}`,

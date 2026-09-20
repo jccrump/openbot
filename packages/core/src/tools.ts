@@ -95,6 +95,8 @@ export interface ToolContext {
   access?: AccessMode;
   /** What the daemon knows about itself, for the system_info tool. */
   self?: SelfInfo;
+  /** Schedule a daemon restart once the current work settles (ADR-024). */
+  requestRestart?: () => { ok: boolean; message: string };
   sandbox: SandboxBackend | null;
   workspaceDir: string;
   artifactsDir: string;
@@ -2958,6 +2960,35 @@ const systemInfoTool: Tool = {
   },
 };
 
+const restartDaemonTool: Tool = {
+  definition: {
+    name: "restart_daemon",
+    description:
+      "Restart the OpenBot daemon so code changes take effect. Call it only " +
+      "when the user asked for a restart, or after changing the daemon's own " +
+      "source and verifying it with the project's checks. The current turn " +
+      "finishes first and running tasks settle before the restart; the " +
+      "conversation is preserved. A broken change can leave the daemon down, " +
+      "so verify before restarting.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  async execute(context) {
+    if (!context.requestRestart) {
+      return {
+        ok: false,
+        output: "Restarting the daemon is not available in this run.",
+        durationMs: 0,
+      };
+    }
+    const result = context.requestRestart();
+    return { ok: result.ok, output: result.message, durationMs: 0 };
+  },
+};
+
 const listRolesTool: Tool = {
   definition: {
     name: "list_roles",
@@ -4008,6 +4039,7 @@ export const tools: Tool[] = [
   browseTool,
   webSearchTool,
   systemInfoTool,
+  restartDaemonTool,
   listRolesTool,
   spawnWorkerTool,
   createWorkerTool,

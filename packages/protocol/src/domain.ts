@@ -52,6 +52,36 @@ export type ComputerKind = z.infer<typeof ComputerKindSchema>;
 export const AccessModeSchema = z.enum(["project", "home", "full"]);
 export type AccessMode = z.infer<typeof AccessModeSchema>;
 
+export const AccessStateSchema = z.enum(["granted", "denied", "missing"]);
+export type AccessState = z.infer<typeof AccessStateSchema>;
+
+export const AccessPaneSchema = z.enum([
+  "full-disk",
+  "files",
+  "documents",
+  "desktop",
+  "downloads",
+]);
+export type AccessPane = z.infer<typeof AccessPaneSchema>;
+
+export const AccessEntrySchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  path: z.string().nullable(),
+  state: AccessStateSchema,
+  /** The System Settings privacy pane that governs this entry. */
+  pane: AccessPaneSchema.nullable(),
+});
+export type AccessEntry = z.infer<typeof AccessEntrySchema>;
+
+export const AccessReportSchema = z.object({
+  /** Which app macOS attributes the permission to. */
+  owner: z.string(),
+  platform: z.string(),
+  entries: z.array(AccessEntrySchema),
+});
+export type AccessReport = z.infer<typeof AccessReportSchema>;
+
 /**
  * A local project folder the daemon knows about. Agents reference a workspace
  * by id instead of a path, so moving a repo updates one row and every agent

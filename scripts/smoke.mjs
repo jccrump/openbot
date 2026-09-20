@@ -4279,8 +4279,31 @@ try {
   );
   await waitFor("chat.done");
 
+  // Permissions: the daemon reports the TCC-gated folders and Full Disk
+  // Access so Settings can show status and deep-link the right pane.
+  const accessMarker = received.length;
+  socket.send(JSON.stringify({ type: "access.check" }));
+  const accessReport = await waitForSince(
+    accessMarker,
+    (item) => item.type === "access.report",
+  );
+  const entryIds = accessReport.report.entries.map((entry) => entry.id);
+  for (const id of ["documents", "desktop", "downloads", "home", "full-disk"]) {
+    assert.ok(entryIds.includes(id), `access report should include ${id}`);
+  }
+  const homeEntry = accessReport.report.entries.find(
+    (entry) => entry.id === "home",
+  );
+  assert.equal(homeEntry.state, "granted", "the home folder is never gated");
+  assert.ok(
+    accessReport.report.entries.every((entry) =>
+      ["granted", "denied", "missing"].includes(entry.state),
+    ),
+    "every access state should be one of the three known values",
+  );
+
   console.log(
-    `SMOKE OK — text chat, single thread per bot, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), dual-computer routing (per-call computer argument, microVM default, Mac opt-in, unavailable computer rejected), workspace registry (scan roots, marker detection, node_modules skipped, add/ignore/remove, shell and file tools rooted in the project, escape rejected, trusted commands with deny precedence, worker inheritance), access modes (full reach outside home, home confinement, system_info self-report), agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, lead delegation (spawn_worker, task grant, in-grant tools without re-approval, out-of-grant escalation and denial, task result + evidence + usage, lead notification), dynamic team building (create_worker, immediate delegation to the new worker, duplicate-name reuse), projects (lead creates a persistent manager, list_projects routing, ask_project request on the project thread, worker sessions in the project computer with their own browser, project survives and is reused), per-task computers (own sandbox id, concurrency cap and queueing, destroyed on settle), memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-role narrowing, egress allowlist), Jev routing (conversation runs without tools, a named project gets the routing hint), harness robustness (list_dir, shell output spill, shell background, browser press/select/wait_for/snapshot/tabs/upload/downloads, duplicate-failure stop, raw-markup retry, changed-file metadata), context discipline (unchanged reads and identical results collapse), working plan (update_plan persists and is injected), output screening (injected instructions in shell output are annotated), busy-turn delivery (queue waits for the stop, steer redirects the running turn, persisted default), chat clear (transcript archived in place, title reset, fresh turn on the same thread)`,
+    `SMOKE OK — text chat, single thread per bot, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), dual-computer routing (per-call computer argument, microVM default, Mac opt-in, unavailable computer rejected), workspace registry (scan roots, marker detection, node_modules skipped, add/ignore/remove, shell and file tools rooted in the project, escape rejected, trusted commands with deny precedence, worker inheritance), access modes (full reach outside home, home confinement, system_info self-report), permissions report, agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, lead delegation (spawn_worker, task grant, in-grant tools without re-approval, out-of-grant escalation and denial, task result + evidence + usage, lead notification), dynamic team building (create_worker, immediate delegation to the new worker, duplicate-name reuse), projects (lead creates a persistent manager, list_projects routing, ask_project request on the project thread, worker sessions in the project computer with their own browser, project survives and is reused), per-task computers (own sandbox id, concurrency cap and queueing, destroyed on settle), memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-role narrowing, egress allowlist), Jev routing (conversation runs without tools, a named project gets the routing hint), harness robustness (list_dir, shell output spill, shell background, browser press/select/wait_for/snapshot/tabs/upload/downloads, duplicate-failure stop, raw-markup retry, changed-file metadata), context discipline (unchanged reads and identical results collapse), working plan (update_plan persists and is injected), output screening (injected instructions in shell output are annotated), busy-turn delivery (queue waits for the stop, steer redirects the running turn, persisted default), chat clear (transcript archived in place, title reset, fresh turn on the same thread)`,
   );
 } finally {
   socket?.close();

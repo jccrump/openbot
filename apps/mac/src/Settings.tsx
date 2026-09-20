@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import type {
+  AccessPane,
+  AccessReport,
   ChatBusyBehavior,
   CodexInfo,
   DecisionGuardrailMode,
@@ -77,6 +79,9 @@ interface SettingsProps {
   ) => void;
   onRemoveWorkspace: (workspaceId: string) => void;
   onSaveWorkspaceRoots: (roots: string[]) => void;
+  accessReport: AccessReport | null;
+  onCheckAccess: () => void;
+  onOpenAccessPane: (pane: AccessPane) => void;
 }
 
 interface FormState {
@@ -102,6 +107,7 @@ type SectionId =
   | "providers"
   | "team"
   | "workspaces"
+  | "access"
   | "harness"
   | "decision";
 
@@ -119,6 +125,7 @@ const SECTION_LABEL: Record<SectionId, string> = {
   providers: "Providers",
   team: "Team",
   workspaces: "Workspaces",
+  access: "Access",
   harness: "Harness",
   decision: "Decision model",
 };
@@ -315,6 +322,25 @@ function WorkspacesIcon() {
   );
 }
 
+function AccessIcon() {
+  return (
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="4" y="10" width="16" height="10" rx="2" />
+      <path d="M8 10V7a4 4 0 0 1 8 0v3" />
+    </svg>
+  );
+}
+
 const NAV_ITEMS: Array<{
   id: SectionId;
   label: string;
@@ -325,6 +351,7 @@ const NAV_ITEMS: Array<{
   { id: "providers", label: "Providers", icon: ProvidersIcon },
   { id: "team", label: "Team", icon: TeamIcon },
   { id: "workspaces", label: "Workspaces", icon: WorkspacesIcon },
+  { id: "access", label: "Access", icon: AccessIcon },
   { id: "harness", label: "Harness", icon: HarnessIcon },
   { id: "decision", label: "Decision model", icon: DecisionIcon },
 ];
@@ -387,6 +414,12 @@ export function Settings(props: SettingsProps) {
     const timer = setTimeout(() => setDecisionSaved(false), 2_000);
     return () => clearTimeout(timer);
   }, [decisionSaved]);
+
+  useEffect(() => {
+    if (open && section === "access") {
+      props.onCheckAccess();
+    }
+  }, [open, section, props.onCheckAccess]);
 
   useEffect(() => {
     if (!open) {
@@ -1253,6 +1286,77 @@ export function Settings(props: SettingsProps) {
                   </div>
                 </section>
               </>
+            )}
+
+            {section === "access" && (
+              <section className="settings-card">
+                <div className="settings-row">
+                  <span>Permissions</span>
+                  <button
+                    className="ghost-button"
+                    onClick={() => props.onCheckAccess()}
+                  >
+                    Check again
+                  </button>
+                </div>
+                <p className="settings-note">
+                  macOS attributes these grants to{" "}
+                  {props.accessReport?.owner ?? "the daemon's parent app"}.
+                  Documents, Desktop, and Downloads prompt the first time; Full
+                  Disk Access is a manual toggle in System Settings.
+                </p>
+                {!props.accessReport ? (
+                  <p className="settings-empty">Checking…</p>
+                ) : (
+                  props.accessReport.entries.map((entry) => {
+                    const pane = entry.pane;
+                    return (
+                      <div key={entry.id} className="access-row">
+                        <div className="access-row-body">
+                          <span className="access-row-name">
+                            {entry.label}
+                            <span
+                              className={`access-badge access-badge-${entry.state}`}
+                            >
+                              {entry.state === "granted"
+                                ? "granted"
+                                : entry.state === "denied"
+                                  ? "denied"
+                                  : "not found"}
+                            </span>
+                          </span>
+                          {entry.path && (
+                            <span
+                              className="workspace-row-root"
+                              title={entry.path}
+                            >
+                              {entry.path}
+                            </span>
+                          )}
+                        </div>
+                        <div className="workspace-row-actions">
+                          {entry.id !== "full-disk" && entry.id !== "home" && (
+                            <button
+                              className="ghost-button"
+                              onClick={() => props.onCheckAccess()}
+                            >
+                              Request
+                            </button>
+                          )}
+                          {pane && (
+                            <button
+                              className="ghost-button"
+                              onClick={() => props.onOpenAccessPane(pane)}
+                            >
+                              Open Settings
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </section>
             )}
 
             {section === "harness" && (

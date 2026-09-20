@@ -528,6 +528,75 @@ check("files.list reports an unknown agent", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// access modes and self tools
+// ---------------------------------------------------------------------------
+
+check("home access refuses a path outside the home folder", async () => {
+  const tool = findTool("read_file");
+  assert.ok(tool);
+  const result = await tool.execute(
+    { ...context, access: "home" },
+    { path: "/etc/hosts" },
+  );
+  assert.equal(result.ok, false);
+  assert.match(result.output, /escapes the bot workspace/);
+});
+
+check("home access lists the home folder", async () => {
+  const tool = findTool("list_dir");
+  assert.ok(tool);
+  const result = await tool.execute({ ...context, access: "home" }, {});
+  assert.equal(result.ok, true);
+});
+
+check("full access reads a path outside the home folder", async () => {
+  const tool = findTool("read_file");
+  assert.ok(tool);
+  const result = await tool.execute(
+    { ...context, access: "full" },
+    { path: "/etc/hosts" },
+  );
+  assert.equal(result.ok, true);
+  assert.match(result.output, /localhost/);
+});
+
+check("system_info reports the daemon layout", async () => {
+  const tool = findTool("system_info");
+  assert.ok(tool);
+  const result = await tool.execute(context, {});
+  assert.equal(result.ok, true);
+  assert.match(result.output, /run mode: dev/);
+  assert.match(result.output, /data dir:/);
+});
+
+check("restart_daemon reports when no scheduler is available", async () => {
+  const tool = findTool("restart_daemon");
+  assert.ok(tool);
+  const result = await tool.execute(context, {});
+  assert.equal(result.ok, false);
+  assert.match(result.output, /not available/);
+});
+
+check("restart_daemon forwards to the daemon scheduler", async () => {
+  const tool = findTool("restart_daemon");
+  assert.ok(tool);
+  let called = 0;
+  const result = await tool.execute(
+    {
+      ...context,
+      requestRestart: () => {
+        called += 1;
+        return { ok: true, message: "restart scheduled" };
+      },
+    },
+    {},
+  );
+  assert.equal(called, 1);
+  assert.equal(result.ok, true);
+  assert.match(result.output, /scheduled/);
+});
+
+// ---------------------------------------------------------------------------
 // runner
 // ---------------------------------------------------------------------------
 

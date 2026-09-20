@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   AccessMode,
+  AccessPane,
+  AccessReport,
   ApprovalRecord,
   ApprovalTier,
   Bot,
@@ -224,6 +226,7 @@ export function useDaemon() {
     useState<ChatBusyBehavior>("steer");
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [workspaceRoots, setWorkspaceRoots] = useState<string[]>([]);
+  const [accessReport, setAccessReport] = useState<AccessReport | null>(null);
   const [queuedMessageIds, setQueuedMessageIds] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState<ModelRef | null>(null);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
@@ -681,6 +684,10 @@ export function useDaemon() {
         case "workspaces": {
           setWorkspaces(message.workspaces);
           setWorkspaceRoots(message.roots);
+          break;
+        }
+        case "access.report": {
+          setAccessReport(message.report);
           break;
         }
         case "thread.upserted": {
@@ -1543,6 +1550,17 @@ export function useDaemon() {
     [client],
   );
 
+  const checkAccess = useCallback(() => {
+    client.send({ type: "access.check" });
+  }, [client]);
+
+  const openAccessPane = useCallback(
+    (pane: AccessPane) => {
+      client.send({ type: "access.open", pane });
+    },
+    [client],
+  );
+
   const testDecision = useCallback((): Promise<DecisionTestResult> => {
     const requestId = `decision-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     return new Promise((resolve) => {
@@ -1702,6 +1720,9 @@ export function useDaemon() {
     updateWorkspace,
     removeWorkspace,
     saveWorkspaceRoots,
+    accessReport,
+    checkAccess,
+    openAccessPane,
     activeThreadId,
     messages,
     streaming,

@@ -102,6 +102,8 @@ export interface AgentDeps {
   policy?: () => PolicySettings;
   /** What the daemon knows about itself (system_info and the lead's [self] note). */
   self?: SelfInfo;
+  /** Schedule a daemon restart after the current work settles. */
+  requestRestart?: () => { ok: boolean; message: string };
 }
 
 /** Messages typed while a turn is running; the loop drains them at step
@@ -975,6 +977,7 @@ export async function runAgent(
           computers,
           access: bot.access,
           self: deps.self,
+          requestRestart: deps.requestRestart,
           sandbox: deps.sandbox,
           workspaceDir,
           artifactsDir: deps.artifactsDir,

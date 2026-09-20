@@ -275,6 +275,14 @@ when the Codex CLI is on `PATH`.
   data directory, launch command, check commands), tells the lead in its prompt,
   and answers any agent through the `system_info` tool — so an agent asked to
   work on OpenBot can find its own source and explain how to restart it.
+- **Permission onboarding**: **Settings → Access** probes the folders macOS
+  gates (Documents, Desktop, Downloads, Full Disk Access), shows granted /
+  denied / not-found, and deep-links the matching System Settings privacy pane.
+  A probe can raise the first-time prompt; nothing is checked until you ask.
+- **Self-restart**: an agent can call `restart_daemon` after changing the
+  daemon's own code. The current turn and running tasks settle first, then the
+  watcher, the app, or a detached re-exec brings the daemon back; a guard
+  refuses more than three restarts in ten minutes.
 - **Host-side web search**: a `web_search` tool queries the live web through
   Exa (keyless) or Parallel and returns page content with titles and URLs for
   citation. It runs in the daemon, not the microVM, so it works on any
