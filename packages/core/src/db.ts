@@ -190,6 +190,9 @@ export function openDatabase(dataDir: string): DatabaseSync {
   if (!threadColumnNames.has("plan")) {
     db.exec("ALTER TABLE threads ADD COLUMN plan TEXT");
   }
+  if (!threadColumnNames.has("cleared_at")) {
+    db.exec("ALTER TABLE threads ADD COLUMN cleared_at TEXT");
+  }
 
   const providerColumns = db
     .prepare("PRAGMA table_info(providers)")
@@ -213,6 +216,9 @@ export function openDatabase(dataDir: string): DatabaseSync {
   }
   if (!botColumnNames.has("computer")) {
     db.exec("ALTER TABLE bots ADD COLUMN computer TEXT");
+  }
+  if (!botColumnNames.has("computers")) {
+    db.exec("ALTER TABLE bots ADD COLUMN computers TEXT");
   }
   if (!botColumnNames.has("kind")) {
     db.exec("ALTER TABLE bots ADD COLUMN kind TEXT NOT NULL DEFAULT 'role'");

@@ -337,7 +337,21 @@ const mockModelServer = createServer(async (request, response) => {
       ? { name: "list_dir", args: { path: "." } }
       : harnessSub === "spill"
         ? { name: "shell", args: { command: "spill-big-output" } }
-        : harnessSub === "press"
+        : harnessSub === "write"
+          ? {
+              name: "write_file",
+              args: { path: "/root/notes.txt", content: "alpha\nbravo\n" },
+            }
+          : harnessSub === "edit"
+            ? {
+                name: "edit",
+                args: {
+                  path: "/root/notes.txt",
+                  oldString: "bravo",
+                  newString: "BRAVO",
+                },
+              }
+            : harnessSub === "press"
           ? {
               name: "browser",
               args: { action: "press", selector: "#search", key: "Enter" },
@@ -505,6 +519,14 @@ const mockModelServer = createServer(async (request, response) => {
           "[system] Your last reply contained raw tool-call markup",
         )
         ? { name: "shell", args: { command: "uname -a" } }
+        : last.content.startsWith("run-mac:")
+        ? {
+            name: "shell",
+            args: {
+              command: last.content.slice("run-mac:".length).trim(),
+              computer: "mac",
+            },
+          }
         : last.content.startsWith("run:")
         ? {
             name: "shell",
@@ -539,12 +561,21 @@ const mockModelServer = createServer(async (request, response) => {
                     startUrl: "https://example.com",
                   },
                 }
+                : last.content.startsWith("create-project-ask:")
+                  ? {
+                      name: "create_project",
+                      args: {
+                        name: "Scope Probe",
+                        scope: "checks the computer ask",
+                      },
+                    }
                 : last.content.startsWith("create-project:")
                   ? {
                       name: "create_project",
                       args: {
                         name: createProjectName,
                         scope: createProjectScope,
+                        computers: ["firecracker"],
                       },
                     }
                   : last.content.startsWith("create-worker:")
@@ -790,6 +821,9 @@ const SCREEN_PNG = Buffer.from(
 );
 
 const executedCommands = [];
+// A tiny guest filesystem so write_file/edit can round-trip their before/after
+// reads in the mock sandbox, which is what the changed-files metadata needs.
+const guestFiles = new Map();
 let skillsCopies = 0;
 let spillWrites = 0;
 let codeToolInstalls = 0;
@@ -893,7 +927,9 @@ const mockSandboxServer = createServer(async (request, response) => {
           title: "Example Domain",
           output: `executed ${code.length} chars\n`,
           result: JSON.stringify({ title: "Example Domain" }),
-          screenshots: [SCREEN_PNG.toString("base64")],
+          screenshots: [
+            { mime: "image/png", base64: SCREEN_PNG.toString("base64") },
+          ],
           durationMs: 6,
         }),
       );
@@ -1109,6 +1145,44 @@ const mockSandboxServer = createServer(async (request, response) => {
           stderr: "",
           durationMs: 7,
         }),
+      );
+      return;
+    }
+    // write_file / edit write through `printf %s <base64> | base64 -d > path`.
+    const writeMatch =
+      /printf %s '([A-Za-z0-9+/=]+)' \| base64 -d > '([^']+)'/.exec(
+        body.command,
+      );
+    if (writeMatch) {
+      const content = Buffer.from(writeMatch[1], "base64").toString("utf8");
+      guestFiles.set(writeMatch[2], content);
+      response.end(
+        JSON.stringify({
+          exit: 0,
+          stdout: `${content.length}\n`,
+          stderr: "",
+          durationMs: 3,
+        }),
+      );
+      return;
+    }
+    // The file tools read through `head -c <n> -- path` before writing.
+    const readMatch = /head -c \d+ -- '([^']+)'/.exec(body.command);
+    if (readMatch) {
+      const content = guestFiles.get(readMatch[1]);
+      if (content === undefined) {
+        response.end(
+          JSON.stringify({
+            exit: 3,
+            stdout: "",
+            stderr: `no such file: ${readMatch[1]}`,
+            durationMs: 3,
+          }),
+        );
+        return;
+      }
+      response.end(
+        JSON.stringify({ exit: 0, stdout: content, stderr: "", durationMs: 3 }),
       );
       return;
     }
@@ -2203,6 +2277,101 @@ try {
     "deleted bot messages should be removed",
   );
 
+  // An agent with both computers routes per call (ADR-021): the microVM is the
+  // default, the computer argument targets This Mac, and a computer the agent
+  // does not have is rejected instead of silently substituted.
+  socket.send(
+    JSON.stringify({
+      type: "bots.create",
+      requestId: "bot-dual-1",
+      name: "Dual Tester",
+      computers: ["firecracker", "mac"],
+    }),
+  );
+  const dualCreated = await waitFor("bot.created");
+  assert.deepEqual(dualCreated.bot.computers, ["firecracker", "mac"]);
+
+  const sandboxRuns = executedCommands.length;
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId: dualCreated.bot.id,
+      text: "run: uname -a",
+    }),
+  );
+  const vmApproval = await waitFor("approval.request");
+  assert.equal(vmApproval.name, "shell");
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: vmApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const vmResult = await waitFor("tool.result");
+  assert.equal(vmResult.ok, true);
+  assert.deepEqual(
+    executedCommands.slice(sandboxRuns),
+    ["uname -a"],
+    "a dual-computer agent should default to the microVM",
+  );
+  await waitFor("chat.done");
+
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId: dualCreated.bot.id,
+      text: "run-mac: echo mac-call",
+    }),
+  );
+  const macApproval = await waitFor("approval.request");
+  assert.equal(macApproval.name, "shell");
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: macApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const macResult = await waitFor("tool.result");
+  assert.equal(macResult.ok, true);
+  assert.match(macResult.output, /\[local Mac\]/);
+  assert.deepEqual(
+    executedCommands.slice(sandboxRuns),
+    ["uname -a"],
+    "the mac call must run on the host, not in the sandbox",
+  );
+  await waitFor("chat.done");
+
+  socket.send(
+    JSON.stringify({
+      type: "bots.create",
+      requestId: "bot-vm-1",
+      name: "VM Tester",
+    }),
+  );
+  const vmOnlyCreated = await waitFor("bot.created");
+  assert.deepEqual(vmOnlyCreated.bot.computers, ["firecracker"]);
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId: vmOnlyCreated.bot.id,
+      text: "run-mac: echo nope",
+    }),
+  );
+  const blockedApproval = await waitFor("approval.request");
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: blockedApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const blockedResult = await waitFor("tool.result");
+  assert.equal(blockedResult.ok, false);
+  assert.match(blockedResult.output, /does not have This Mac/);
+  await waitFor("chat.done");
+
   socket.send(
     JSON.stringify({
       type: "provider.upsert",
@@ -2352,6 +2521,10 @@ try {
   );
   assert.ok(taskDone.budget.toolCalls > 0, "the task should carry a budget");
   assert.ok(taskDone.usage, "the task should record usage");
+  assert.ok(
+    taskDone.usage.cacheReadTokens > 0,
+    "task usage should keep cached prompt tokens separate from the input total",
+  );
   assert.match(
     taskDone.evidence ?? "",
     /Example Domain/,
@@ -2558,6 +2731,36 @@ try {
       ),
     ),
     "the denied escalation should be reported back to the worker",
+  );
+
+  // A project created without a chosen computer is not silently defaulted:
+  // the tool tells the lead to ask the user first (ADR-021).
+  const askComputersMarker = received.length;
+  socket.send(
+    JSON.stringify({ type: "chat.send", botId, text: "create-project-ask:" }),
+  );
+  const askComputersApproval = await waitForSince(
+    askComputersMarker,
+    (item) =>
+      item.type === "approval.request" && item.name === "create_project",
+  );
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: askComputersApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const askComputersDone = await waitForSince(
+    askComputersMarker,
+    (item) =>
+      item.type === "chat.done" &&
+      /No computers were chosen/.test(item.message.content),
+  );
+  assert.match(
+    askComputersDone.message.content,
+    /No computers were chosen/,
+    "create_project without computers should ask the user instead of guessing",
   );
 
   // Projects: the lead creates a persistent manager for a topic and routes
@@ -3320,6 +3523,39 @@ try {
   );
   await waitFor("chat.done");
 
+  // File writes carry before/after metadata so the app can render the
+  // changed-files card under the final answer.
+  await waitForLeadQuiet();
+  socket.send(
+    JSON.stringify({ type: "chat.send", botId, text: "harness:write" }),
+  );
+  const writeResult = await waitFor("tool.result");
+  assert.equal(writeResult.ok, true);
+  const writeDone = await waitFor("chat.done");
+  const writeCalls = toolCallsIn(await fetchMessages(writeDone.threadId));
+  const writeCall = writeCalls.findLast((call) => call.name === "write_file");
+  assert.equal(
+    writeCall?.changes?.[0]?.path,
+    "notes.txt",
+    "the write should report a workspace-relative path",
+  );
+  assert.equal(writeCall?.changes?.[0]?.additions, 2);
+  assert.equal(writeCall?.changes?.[0]?.deletions, 0);
+  assert.match(writeCall?.changes?.[0]?.diff ?? "", /^\+alpha$/m);
+
+  await waitForLeadQuiet();
+  socket.send(
+    JSON.stringify({ type: "chat.send", botId, text: "harness:edit" }),
+  );
+  const editResult = await waitFor("tool.result");
+  assert.equal(editResult.ok, true);
+  const editDone = await waitFor("chat.done");
+  const editCalls = toolCallsIn(await fetchMessages(editDone.threadId));
+  const editCall = editCalls.findLast((call) => call.name === "edit");
+  assert.equal(editCall?.changes?.[0]?.additions, 1);
+  assert.equal(editCall?.changes?.[0]?.deletions, 1);
+  assert.match(editCall?.changes?.[0]?.diff ?? "", /^\+BRAVO$/m);
+
   // A model stuck on one failing call is stopped after three identical
   // failures instead of looping until the step cap.
   await waitForLeadQuiet();
@@ -3571,8 +3807,56 @@ try {
     "the steered message should persist exactly once",
   );
 
+  // Clear: the transcript is archived in place, the title resets, and the
+  // thread keeps its identity so tasks and workers still report here.
+  await waitForLeadQuiet();
+  const beforeClear = await fetchMessages(threadId);
+  assert.ok(beforeClear.length > 0, "expected a transcript before clearing");
+  const clearMarker = received.length;
+  socket.send(JSON.stringify({ type: "thread.clear", threadId }));
+  const cleared = await waitForSince(
+    clearMarker,
+    (item) => item.type === "thread.cleared" && item.threadId === threadId,
+  );
+  assert.equal(cleared.thread.id, threadId, "clear keeps the thread");
+  assert.equal(cleared.thread.title, "New chat", "clear resets the title");
+  assert.ok(cleared.thread.clearedAt, "clear should stamp clearedAt");
+  assert.equal(cleared.thread.lastMessage, null, "the live transcript is empty");
+  assert.equal(cleared.thread.plan, null, "clear drops the working plan");
+  assert.equal(
+    (await fetchMessages(threadId)).length,
+    0,
+    "cleared messages stay hidden from the live transcript",
+  );
+  socket.send(
+    JSON.stringify({
+      type: "thread.messages",
+      threadId,
+      includeFolded: true,
+    }),
+  );
+  const archived = await waitFor("thread.messages");
+  assert.ok(
+    archived.messages.length >= beforeClear.length,
+    "the archived view should return the folded transcript",
+  );
+  assert.ok(
+    archived.messages.every((message) => message.foldedAt),
+    "every pre-clear message should be folded",
+  );
+  socket.send(
+    JSON.stringify({ type: "chat.send", botId, text: "after clear" }),
+  );
+  const afterClearDone = await waitFor("chat.done");
+  assert.match(afterClearDone.message.content, /Mock reply to: after clear/);
+  assert.equal(
+    afterClearDone.threadId,
+    threadId,
+    "the fresh turn runs on the same thread",
+  );
+
   console.log(
-    `SMOKE OK — text chat, single thread per bot, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, lead delegation (spawn_worker, task grant, in-grant tools without re-approval, out-of-grant escalation and denial, task result + evidence + usage, lead notification), dynamic team building (create_worker, immediate delegation to the new worker, duplicate-name reuse), projects (lead creates a persistent manager, list_projects routing, ask_project request on the project thread, worker sessions in the project computer with their own browser, project survives and is reused), per-task computers (own sandbox id, concurrency cap and queueing, destroyed on settle), memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-role narrowing, egress allowlist), Jev routing (conversation runs without tools, a named project gets the routing hint), harness robustness (list_dir, shell output spill, shell background, browser press/select/wait_for/snapshot/tabs/upload/downloads, duplicate-failure stop, raw-markup retry), context discipline (unchanged reads and identical results collapse), working plan (update_plan persists and is injected), output screening (injected instructions in shell output are annotated), busy-turn delivery (queue waits for the stop, steer redirects the running turn, persisted default)`,
+    `SMOKE OK — text chat, single thread per bot, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), dual-computer routing (per-call computer argument, microVM default, Mac opt-in, unavailable computer rejected), agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, lead delegation (spawn_worker, task grant, in-grant tools without re-approval, out-of-grant escalation and denial, task result + evidence + usage, lead notification), dynamic team building (create_worker, immediate delegation to the new worker, duplicate-name reuse), projects (lead creates a persistent manager, list_projects routing, ask_project request on the project thread, worker sessions in the project computer with their own browser, project survives and is reused), per-task computers (own sandbox id, concurrency cap and queueing, destroyed on settle), memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-role narrowing, egress allowlist), Jev routing (conversation runs without tools, a named project gets the routing hint), harness robustness (list_dir, shell output spill, shell background, browser press/select/wait_for/snapshot/tabs/upload/downloads, duplicate-failure stop, raw-markup retry, changed-file metadata), context discipline (unchanged reads and identical results collapse), working plan (update_plan persists and is injected), output screening (injected instructions in shell output are annotated), busy-turn delivery (queue waits for the stop, steer redirects the running turn, persisted default), chat clear (transcript archived in place, title reset, fresh turn on the same thread)`,
   );
 } finally {
   socket?.close();

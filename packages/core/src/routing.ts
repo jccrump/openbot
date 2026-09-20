@@ -86,6 +86,13 @@ export async function decideRoute(input: {
     };
   }
   if (needsWorkValue < NEEDS_WORK_YES || confidence < ROUTE_CONFIDENCE) {
+    // No route event reaches the app; the turn runs as before, with the UI
+    // staying in its simple mode unless a tool actually runs.
+    console.info("route.undecided", {
+      needsWork: needsWorkValue,
+      confidence,
+      choice: choiceKey,
+    });
     return null;
   }
 

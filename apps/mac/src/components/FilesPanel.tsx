@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { FileEntry } from "@openbot/protocol";
+import type { ComputerKind, FileEntry } from "@openbot/protocol";
 import type { FileListResult, FileReadResult } from "../lib/useDaemon";
 
 function FolderIcon() {
@@ -105,16 +105,28 @@ function formatDate(mtime: number | null): string {
 
 export function FilesPanel({
   botId,
-  isMac,
+  computers,
+  computer,
+  onComputerChange,
   active,
   listFiles,
   readFile,
 }: {
   botId: string;
-  isMac: boolean;
+  computers: ComputerKind[];
+  computer: ComputerKind;
+  onComputerChange: (computer: ComputerKind) => void;
   active: boolean;
-  listFiles: (botId: string, path?: string) => Promise<FileListResult>;
-  readFile: (botId: string, path: string) => Promise<FileReadResult>;
+  listFiles: (
+    botId: string,
+    path?: string,
+    computer?: ComputerKind,
+  ) => Promise<FileListResult>;
+  readFile: (
+    botId: string,
+    path: string,
+    computer?: ComputerKind,
+  ) => Promise<FileReadResult>;
 }) {
   const [started, setStarted] = useState(false);
   const [path, setPath] = useState("");
@@ -132,7 +144,7 @@ export function FilesPanel({
       const seq = ++requestSeq.current;
       setLoading(true);
       setError(null);
-      const result = await listFiles(botId, target);
+      const result = await listFiles(botId, target, computer);
       if (seq !== requestSeq.current) {
         return;
       }
@@ -148,11 +160,11 @@ export function FilesPanel({
         setRootPath(result.path);
       }
     },
-    [botId, listFiles],
+    [botId, computer, listFiles],
   );
 
-  // Only talk to the computer once the tab has been opened at least once, so
-  // a hidden Files tab never costs an exec.
+  // Only talk to the computer once the section has been expanded at least
+  // once, so a collapsed Files section never costs an exec.
   useEffect(() => {
     if (active) {
       setStarted(true);
@@ -168,7 +180,7 @@ export function FilesPanel({
     setPath("");
     setRootPath("");
     void load("");
-  }, [botId, load, started]);
+  }, [botId, computer, load, started]);
 
   const openEntry = (entry: FileEntry) => {
     const child = path ? `${path.replace(/\/+$/, "")}/${entry.name}` : entry.name;
@@ -180,7 +192,7 @@ export function FilesPanel({
     setPreviewName(entry.name);
     setPreviewLoading(true);
     setPreview(null);
-    void readFile(botId, child).then((result) => {
+    void readFile(botId, child, computer).then((result) => {
       setPreview(result);
       setPreviewLoading(false);
     });
@@ -207,7 +219,7 @@ export function FilesPanel({
     });
   }, [path, rootPath]);
 
-  const rootLabel = isMac ? "Workspace" : "/root";
+  const rootLabel = computer === "mac" ? "Workspace" : "/root";
   const atRoot = path === rootPath;
   const previewSrc =
     preview?.kind === "image" && preview.content
@@ -277,6 +289,30 @@ export function FilesPanel({
   return (
     <div className="files-panel">
       <div className="files-toolbar">
+        {computers.length > 1 && (
+          <div
+            className="files-computer-switch"
+            role="group"
+            aria-label="Computer"
+          >
+            <button
+              className={`files-computer-option ${
+                computer === "firecracker" ? "files-computer-option-active" : ""
+              }`}
+              onClick={() => onComputerChange("firecracker")}
+            >
+              microVM
+            </button>
+            <button
+              className={`files-computer-option ${
+                computer === "mac" ? "files-computer-option-active" : ""
+              }`}
+              onClick={() => onComputerChange("mac")}
+            >
+              This Mac
+            </button>
+          </div>
+        )}
         <button
           className="icon-button"
           title="Up one folder"

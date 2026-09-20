@@ -7,10 +7,13 @@ import type {
   RolePolicy,
 } from "@openbot/protocol";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { ComputerChoices } from "./ComputerChoices";
 import {
   AVATAR_COLORS,
+  botComputers,
   COMPUTER_LABEL,
   EFFORT_OPTIONS,
+  hasVm,
 } from "../lib/agentOptions";
 import type { SandboxState } from "../lib/useDaemon";
 
@@ -18,7 +21,7 @@ export interface AgentSettingsPatch {
   name: string;
   role: string | null;
   color: string;
-  computer: ComputerKind;
+  computers: ComputerKind[];
   delegates: boolean;
   policy: RolePolicy;
   model: ModelRef;
@@ -46,7 +49,7 @@ export function AgentSettingsModal({
   const [name, setName] = useState("");
   const [role, setRole] = useState("");
   const [color, setColor] = useState(AVATAR_COLORS[0]!);
-  const [computer, setComputer] = useState<ComputerKind>("firecracker");
+  const [computers, setComputers] = useState<ComputerKind[]>(["firecracker"]);
   const [delegates, setDelegates] = useState(false);
   const [policy, setPolicy] = useState<RolePolicy>("inherit");
   const [effort, setEffort] = useState<ReasoningEffort | "">("");
@@ -59,7 +62,7 @@ export function AgentSettingsModal({
     setName(bot.name);
     setRole(bot.role ?? "");
     setColor(bot.color ?? AVATAR_COLORS[0]!);
-    setComputer(bot.computer === "mac" ? "mac" : "firecracker");
+    setComputers(botComputers(bot));
     setDelegates(bot.delegates);
     setPolicy(bot.policy);
     setEffort(bot.model.effort ?? "");
@@ -85,11 +88,15 @@ export function AgentSettingsModal({
   }
 
   const powerOn = sandboxState === "running" || sandboxState === "booting";
+  const savedComputers = botComputers(bot);
+  const computersChanged =
+    computers.length !== savedComputers.length ||
+    computers.some((kind) => !savedComputers.includes(kind));
   const changed =
     name.trim() !== bot.name ||
     (role.trim() || null) !== (bot.role ?? null) ||
     color !== (bot.color ?? AVATAR_COLORS[0]!) ||
-    computer !== (bot.computer === "mac" ? "mac" : "firecracker") ||
+    computersChanged ||
     delegates !== bot.delegates ||
     policy !== bot.policy ||
     (effort || null) !== (bot.model.effort ?? null);
@@ -162,33 +169,8 @@ export function AgentSettingsModal({
 
             <div className="field">
               <span>Computer</span>
-              <div className="computer-choices">
-                <button
-                  className={`computer-choice ${
-                    computer === "firecracker" ? "computer-choice-active" : ""
-                  }`}
-                  onClick={() => setComputer("firecracker")}
-                >
-                  <span className="computer-choice-title">
-                    Firecracker microVM
-                  </span>
-                  <span className="computer-choice-sub">
-                    Isolated Linux computer
-                  </span>
-                </button>
-                <button
-                  className={`computer-choice ${
-                    computer === "mac" ? "computer-choice-active" : ""
-                  }`}
-                  onClick={() => setComputer("mac")}
-                >
-                  <span className="computer-choice-title">This Mac</span>
-                  <span className="computer-choice-sub">
-                    Runs commands directly on this Mac
-                  </span>
-                </button>
-              </div>
-              {computer === "firecracker" ? (
+              <ComputerChoices value={computers} onChange={setComputers} />
+              {computers.includes("firecracker") ? (
                 <div className="agent-power-row">
                   <span>{COMPUTER_LABEL[sandboxState]}</span>
                   <button
@@ -320,7 +302,7 @@ export function AgentSettingsModal({
                   name: name.trim(),
                   role: role.trim() || null,
                   color,
-                  computer,
+                  computers,
                   delegates,
                   policy,
                   model: {
@@ -341,7 +323,7 @@ export function AgentSettingsModal({
         open={confirm === "reset"}
         title="Start fresh?"
         description={
-          bot.computer === "mac"
+          !hasVm(bot)
             ? `This permanently deletes ${bot.name}'s chat history and its workspace files on this Mac.`
             : `This permanently deletes ${bot.name}'s chat history and everything on its computer — files, browser sign-ins, and installed software — then installs a clean system and boots it again.`
         }

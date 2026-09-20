@@ -16,6 +16,7 @@ import type {
   CompactionSettings,
   CompactionTrigger,
   ComputerKind,
+  FileChange,
   Message,
   ModelRef,
   PlanStep,
@@ -56,6 +57,7 @@ import {
 } from "./guardrail";
 import type { SoulService } from "./soul";
 import {
+  callComputer,
   findTool,
   isApprovalExemptTool,
   isOrchestrationTool,
@@ -507,6 +509,7 @@ async function executeToolCall(
   let executionMs = 0;
   let artifacts: ToolArtifact[] | null = null;
   let images: ToolImage[] | null = null;
+  let changes: FileChange[] | null = null;
 
   // Long commands stream their output while they run; each chunk is tagged
   // with this call so the app can render it live in the tool card.
@@ -609,6 +612,7 @@ async function executeToolCall(
       executionMs = result.durationMs;
       artifacts = result.artifacts ?? null;
       images = result.images ?? null;
+      changes = result.changes ?? null;
     }
   }
 
@@ -653,6 +657,7 @@ async function executeToolCall(
       ok,
       durationMs: executionMs,
       artifacts,
+      changes,
     },
     images,
   };
@@ -670,6 +675,7 @@ async function runTool(
   images?: ToolImage[];
   challenge?: boolean;
   challengeUrl?: string | null;
+  changes?: FileChange[];
 }> {
   let args: Record<string, unknown> = {};
   if (call.arguments.trim()) {
@@ -833,7 +839,16 @@ export async function runAgent(
     }
   }
 
-  const computer: ComputerKind = bot.computer === "mac" ? "mac" : "firecracker";
+  const computers = bot.computers;
+  const hasVm = computers.includes("firecracker");
+  const hasMac = computers.includes("mac");
+  // The microVM is the default target when the agent has both; This Mac is
+  // chosen per call with the computer argument (ADR-021).
+  const computer: ComputerKind = hasVm
+    ? "firecracker"
+    : hasMac
+      ? "mac"
+      : "firecracker";
   const local = computer === "mac";
   const decisionRuntime = deps.decision();
   const emitDecision = (notice: DecisionNotice): void => {
@@ -847,6 +862,7 @@ export async function runAgent(
       flagged: notice.flagged,
       latencyMs: notice.latencyMs,
       model: notice.model,
+      ...(notice.route ? { route: notice.route } : {}),
     });
   };
   const vision = modelSupportsImages(model.model);
@@ -879,12 +895,23 @@ export async function runAgent(
           signal,
         });
         if (decision) {
+          console.info("route.decision", {
+            runId,
+            threadId: thread.id,
+            botId: bot.id,
+            target: decision.target,
+            needsWork: decision.needsWork,
+            confidence: decision.confidence,
+            latencyMs: decision.latencyMs,
+            model: decision.model,
+          });
           emitDecision({
             kind: "route",
             summary: decision.summary,
             flagged: false,
             latencyMs: decision.latencyMs,
             model: decision.model,
+            route: decision.target,
           });
           if (decision.target === "chat") {
             routeChat = true;
@@ -930,6 +957,7 @@ export async function runAgent(
           browserId: input.browserId,
           guestCwd: input.guestCwd,
           computer,
+          computers,
           sandbox: deps.sandbox,
           workspaceDir: join(deps.dataDir, "workspaces", bot.id),
           artifactsDir: deps.artifactsDir,
@@ -969,6 +997,16 @@ export async function runAgent(
   }
   if (input.contextNote) {
     contextParts.push(input.contextNote);
+  }
+  if (computers.length > 1) {
+    contextParts.push(
+      "[computers] You have two computers. Tools that act on a computer take " +
+        "a \"computer\" argument: \"firecracker\" is the isolated Linux " +
+        "microVM and the default, and \"mac\" is the user's Mac, where file " +
+        "tools are confined to your workspace folder and every action is " +
+        "approval-gated. The browser and desktop tools only work on the " +
+        "microVM.",
+    );
   }
   if (deps.soul && bot.kind === "lead") {
     try {
@@ -1014,14 +1052,14 @@ export async function runAgent(
   }
   const turnContext = contextParts.filter(Boolean).join("\n\n");
   const definitions: ToolDefinition[] = toolContext && !routeChat
-    ? toolDefinitions(computer, {
+    ? toolDefinitions(computers, {
         browse: Boolean(
           decisionRuntime.client && decisionRuntime.settings.browse,
         ),
         delegate: bot.kind === "lead" || bot.kind === "project" || bot.delegates,
       })
     : [];
-  const globalApproval = deps.requireApproval || local;
+  const globalApproval = deps.requireApproval || hasMac;
   const grantedTools = new Set(input.grant?.tools ?? []);
   const isManagerRun = Boolean(input.taskId);
   const roleOverlay = rolePolicySettings(bot.policy);
@@ -1033,7 +1071,7 @@ export async function runAgent(
   }
   // A hard shell egress policy is enforced on the VM's network interface for
   // the whole turn, so commands cannot reach hosts the browser would refuse.
-  if (toolContext && computer === "firecracker" && deps.sandbox) {
+  if (toolContext && hasVm && deps.sandbox) {
     const egress = policySettings.egress;
     try {
       await deps.sandbox.setNetworkPolicy(
@@ -1086,14 +1124,17 @@ export async function runAgent(
         args = {};
       }
     }
+    // Policy follows the computer the call targets, so a local action still
+    // always asks even when the agent's default is the microVM (ADR-021).
+    const callTarget = callComputer(computers, computer, args);
     return evaluatePolicy({
       policy: policySettings,
       requireApproval: deps.requireApproval,
       tool: call.name,
       args,
-      computer,
+      computer: callTarget,
       granted: Boolean(input.grant && grantedTools.has(call.name)),
-      local,
+      local: callTarget === "mac",
     });
   };
 

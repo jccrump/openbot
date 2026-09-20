@@ -7,7 +7,7 @@ import {
 export type DaemonStatus = "connecting" | "connected" | "disconnected";
 
 export const DAEMON_URL =
-  (import.meta.env.VITE_OPENBOT_URL as string | undefined) ??
+  (import.meta.env?.VITE_OPENBOT_URL as string | undefined) ??
   "ws://127.0.0.1:4170/ws";
 
 export const DAEMON_HTTP_URL = DAEMON_URL.replace(/^ws/, "http").replace(
@@ -31,6 +31,16 @@ export class DaemonClient {
 
   connect(): void {
     this.closed = false;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (
+      this.socket?.readyState === WebSocket.CONNECTING ||
+      this.socket?.readyState === WebSocket.OPEN
+    ) {
+      return;
+    }
     this.open();
   }
 
@@ -40,8 +50,13 @@ export class DaemonClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    this.socket?.close();
+    const socket = this.socket;
     this.socket = null;
+    if (socket) {
+      this.detach(socket);
+      socket.close();
+    }
+    this.setStatus("disconnected");
   }
 
   send(message: ClientMessage): void {
@@ -64,8 +79,24 @@ export class DaemonClient {
     };
   }
 
+  private detach(socket: WebSocket): void {
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onclose = null;
+    socket.onerror = null;
+  }
+
   private open(): void {
     this.setStatus("connecting");
+    // Replace, never orphan: a socket that is left open keeps delivering every
+    // daemon broadcast alongside the current one, and a stale close would
+    // schedule yet another reconnect on top.
+    const previous = this.socket;
+    this.socket = null;
+    if (previous) {
+      this.detach(previous);
+      previous.close();
+    }
     const socket = new WebSocket(this.url);
     this.socket = socket;
 
@@ -92,9 +123,12 @@ export class DaemonClient {
     };
 
     socket.onclose = () => {
-      if (this.socket === socket) {
-        this.socket = null;
+      // A socket that has already been replaced must not clear the current
+      // one, report a disconnect, or schedule a reconnect.
+      if (this.socket !== socket) {
+        return;
       }
+      this.socket = null;
       this.setStatus("disconnected");
       if (!this.closed) {
         this.scheduleReconnect();

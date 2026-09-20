@@ -30,6 +30,7 @@
     "typecheck": "pnpm -r typecheck",
     "code-tools:smoke": "pnpm --filter @openbot/core code-tools:smoke",
     "websearch:smoke": "pnpm --filter @openbot/core websearch:smoke",
+    "daemon-client:smoke": "pnpm --filter @openbot/core exec tsx ../../scripts/daemon-client-smoke.mjs",
     "smoke": "node scripts/smoke.mjs",
     "eval:validate": "node scripts/eval-validate.mjs",
     "eval": "node scripts/eval.mjs",

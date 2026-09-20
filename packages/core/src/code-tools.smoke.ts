@@ -14,6 +14,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Bot } from "@openbot/protocol";
+import { lineDiff } from "./diff";
 import { listComputerFiles, readComputerFile } from "./files";
 import { findTool, type ToolContext, type ToolExecutionResult } from "./tools";
 
@@ -267,6 +268,83 @@ check("write_file creates nested directories containing spaces", async () => {
     readFileSync(join(workspace, "a dir/nested dir/file.txt"), "utf8"),
     "hello\n",
   );
+});
+
+// ---------------------------------------------------------------------------
+// changed files (the app's per-turn card metadata)
+// ---------------------------------------------------------------------------
+
+check("write_file reports a new file as additions", async () => {
+  const result = await run("write_file", {
+    path: "changes/new.txt",
+    content: "alpha\nbravo\n",
+  });
+  assert.equal(result.ok, true);
+  const change = result.changes?.[0];
+  assert.ok(change, "write_file should report the change");
+  assert.equal(change.path, "changes/new.txt");
+  assert.equal(change.additions, 2);
+  assert.equal(change.deletions, 0);
+  assert.match(change.diff ?? "", /^\+alpha$/m);
+});
+
+check("write_file reports overwrite stats with context", async () => {
+  write("changes/overwrite.txt", "keep\nold\nkeep2\n");
+  const result = await run("write_file", {
+    path: "changes/overwrite.txt",
+    content: "keep\nnew\nkeep2\n",
+  });
+  assert.equal(result.ok, true);
+  const change = result.changes?.[0];
+  assert.ok(change);
+  assert.equal(change.additions, 1);
+  assert.equal(change.deletions, 1);
+  assert.match(change.diff ?? "", /^-old$/m);
+  assert.match(change.diff ?? "", /^\+new$/m);
+  assert.match(change.diff ?? "", /^ keep2$/m);
+});
+
+check("write_file skips the card when nothing changed", async () => {
+  write("changes/same.txt", "same\n");
+  const result = await run("write_file", {
+    path: "changes/same.txt",
+    content: "same\n",
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.changes, undefined);
+});
+
+check("edit reports the changed line", async () => {
+  write("changes/edit.txt", "one\ntwo\nthree\n");
+  const result = await run("edit", {
+    path: "changes/edit.txt",
+    oldString: "two",
+    newString: "TWO",
+  });
+  assert.equal(result.ok, true);
+  const change = result.changes?.[0];
+  assert.ok(change);
+  assert.equal(change.path, "changes/edit.txt");
+  assert.equal(change.additions, 1);
+  assert.equal(change.deletions, 1);
+  assert.match(change.diff ?? "", /^-two$/m);
+  assert.match(change.diff ?? "", /^\+TWO$/m);
+});
+
+check("lineDiff splits distant edits into separate hunks", async () => {
+  const before = Array.from({ length: 40 }, (_, index) => `line ${index + 1}`).join(
+    "\n",
+  );
+  const after = before
+    .replace("line 2", "line two")
+    .replace("line 39", "line thirty-nine");
+  const stats = lineDiff(before, after);
+  assert.equal(stats.additions, 2);
+  assert.equal(stats.deletions, 2);
+  const hunks = (stats.diff ?? "")
+    .split("\n")
+    .filter((line) => line.startsWith("@@"));
+  assert.equal(hunks.length, 2, "distant edits should not share a hunk");
 });
 
 check("edit refuses a file larger than its limit", async () => {

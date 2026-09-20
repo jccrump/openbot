@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import type { Bot } from "@openbot/protocol";
+import type { Bot, ComputerKind } from "@openbot/protocol";
 import type { SandboxBackend } from "@openbot/sandbox";
 import { ensureWorkspace, resolveWorkspacePath } from "./local-computer";
 import {
@@ -46,6 +46,17 @@ function isMacBot(bot: Bot): boolean {
   return bot.computer === "mac";
 }
 
+/**
+ * Which computer a file request browses: the requested one when the agent has
+ * it, otherwise the agent's primary (ADR-021).
+ */
+function computerFor(bot: Bot, requested?: ComputerKind | null): ComputerKind {
+  if (requested && bot.computers.includes(requested)) {
+    return requested;
+  }
+  return isMacBot(bot) ? "mac" : "firecracker";
+}
+
 function workspaceFor(options: FileServiceOptions, bot: Bot): string {
   return ensureWorkspace(join(options.dataDir, "workspaces", bot.id));
 }
@@ -53,10 +64,12 @@ function workspaceFor(options: FileServiceOptions, bot: Bot): string {
 function helperContext(
   options: FileServiceOptions,
   bot: Bot,
+  computer: ComputerKind,
 ): ToolContext {
   return {
     botId: bot.id,
-    computer: isMacBot(bot) ? "mac" : "firecracker",
+    computer,
+    computers: bot.computers,
     sandbox: options.sandbox,
     workspaceDir: join(options.dataDir, "workspaces", bot.id),
     artifactsDir: options.artifactsDir,
@@ -74,10 +87,14 @@ async function resolveTarget(
   options: FileServiceOptions,
   bot: Bot,
   rawPath: string,
-  fallback: string,
+  computer: ComputerKind,
 ): Promise<{ path: string; error: string | null }> {
+  const fallback =
+    computer === "mac"
+      ? join(options.dataDir, "workspaces", bot.id)
+      : "/root";
   const target = rawPath.trim() || fallback;
-  if (isMacBot(bot)) {
+  if (computer === "mac") {
     const root = workspaceFor(options, bot);
     const resolved = resolveWorkspacePath(root, target);
     if (resolved.error || !resolved.path) {
@@ -100,8 +117,9 @@ async function runHelper(
   options: FileServiceOptions,
   bot: Bot,
   payload: Record<string, unknown>,
+  computer: ComputerKind,
 ): Promise<RawExecResult> {
-  return runCodeToolHelper(helperContext(options, bot), payload, 30);
+  return runCodeToolHelper(helperContext(options, bot, computer), payload, 30);
 }
 
 function parseHelper<T>(result: RawExecResult): T | null {
@@ -116,19 +134,18 @@ export async function listComputerFiles(
   options: FileServiceOptions,
   botId: string,
   rawPath = "",
+  requested?: ComputerKind | null,
 ): Promise<FileListResult> {
   const bot = options.getBot(botId);
   if (!bot) {
     return { path: rawPath, entries: [], error: "agent not found" };
   }
-  const fallback = isMacBot(bot)
-    ? join(options.dataDir, "workspaces", bot.id)
-    : "/root";
-  const target = await resolveTarget(options, bot, rawPath, fallback);
+  const computer = computerFor(bot, requested);
+  const target = await resolveTarget(options, bot, rawPath, computer);
   if (target.error) {
     return { path: target.path, entries: [], error: target.error };
   }
-  if (!isMacBot(bot)) {
+  if (computer !== "mac") {
     const sandbox = options.sandbox;
     if (!sandbox) {
       return { path: target.path, entries: [], error: "sandbox is not available" };
@@ -150,11 +167,16 @@ export async function listComputerFiles(
       };
     }
   }
-  const result = await runHelper(options, bot, {
-    mode: "entries",
-    root: target.path,
-    cap: DEFAULT_CAP,
-  });
+  const result = await runHelper(
+    options,
+    bot,
+    {
+      mode: "entries",
+      root: target.path,
+      cap: DEFAULT_CAP,
+    },
+    computer,
+  );
   if (result.exit !== 0) {
     return {
       path: target.path,
@@ -182,6 +204,7 @@ export async function readComputerFile(
   options: FileServiceOptions,
   botId: string,
   rawPath: string,
+  requested?: ComputerKind | null,
 ): Promise<FileReadResult> {
   const empty: FileReadResult = {
     path: rawPath,
@@ -199,14 +222,12 @@ export async function readComputerFile(
   if (!bot) {
     return { ...empty, error: "agent not found" };
   }
-  const fallback = isMacBot(bot)
-    ? join(options.dataDir, "workspaces", bot.id)
-    : "/root";
-  const target = await resolveTarget(options, bot, rawPath, fallback);
+  const computer = computerFor(bot, requested);
+  const target = await resolveTarget(options, bot, rawPath, computer);
   if (target.error) {
     return { ...empty, path: target.path, error: target.error };
   }
-  if (!isMacBot(bot)) {
+  if (computer !== "mac") {
     const sandbox = options.sandbox;
     if (!sandbox) {
       return { ...empty, path: target.path, error: "sandbox is not available" };
@@ -230,10 +251,15 @@ export async function readComputerFile(
       };
     }
   }
-  const result = await runHelper(options, bot, {
-    mode: "read",
-    path: target.path,
-  });
+  const result = await runHelper(
+    options,
+    bot,
+    {
+      mode: "read",
+      path: target.path,
+    },
+    computer,
+  );
   if (result.exit !== 0) {
     return {
       ...empty,

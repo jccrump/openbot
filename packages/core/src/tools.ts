@@ -6,6 +6,7 @@ import type { ToolDefinition } from "@openbot/gateway";
 import { choice } from "@openbot/gateway";
 import type {
   ComputerKind,
+  FileChange,
   ModelRef,
   PlanStep,
   PolicySettings,
@@ -28,6 +29,7 @@ import {
   runBrowseLoop,
 } from "./browse";
 import type { DecisionNotice, DecisionRuntime } from "./decision";
+import { lineDiff } from "./diff";
 import type { MemoryService } from "./memory";
 import type { SoulService } from "./soul";
 import {
@@ -68,6 +70,8 @@ export interface ToolExecutionResult {
   images?: ToolImage[];
   challenge?: boolean;
   challengeUrl?: string | null;
+  /** Files this call changed, for the app's changed-files card. */
+  changes?: FileChange[];
 }
 
 export interface ToolContext {
@@ -79,6 +83,8 @@ export interface ToolContext {
   /** Guest workspace directory for task sessions inside a shared computer. */
   guestCwd?: string;
   computer: ComputerKind;
+  /** Every computer this agent may act on; defaults to [computer]. */
+  computers?: ComputerKind[];
   sandbox: SandboxBackend | null;
   workspaceDir: string;
   artifactsDir: string;
@@ -103,12 +109,66 @@ export interface ToolContext {
   readCache?: Map<string, string>;
 }
 
+export function computerLabel(kind: ComputerKind): string {
+  return kind === "mac" ? "This Mac" : "the Firecracker microVM";
+}
+
+/**
+ * Resolve which computer a call acts on: the explicit `computer` argument when
+ * the agent has that computer, otherwise the agent's primary. An unavailable
+ * computer is an error the model can correct instead of a silent fallback
+ * (ADR-021).
+ */
+export function resolveToolComputer(
+  context: ToolContext,
+  args: Record<string, unknown>,
+): { computer: ComputerKind; error: string | null } {
+  const allowed =
+    context.computers && context.computers.length > 0
+      ? context.computers
+      : [context.computer];
+  const requested =
+    args.computer === "mac" || args.computer === "firecracker"
+      ? args.computer
+      : null;
+  if (requested && !allowed.includes(requested)) {
+    return {
+      computer: context.computer,
+      error:
+        `This agent does not have ${computerLabel(requested)}. ` +
+        `Available: ${allowed.map(computerLabel).join(" and ")}.`,
+    };
+  }
+  return { computer: requested ?? context.computer, error: null };
+}
+
+/**
+ * The computer a call targets for policy purposes: the requested one when the
+ * agent has it, otherwise the primary. The execute path rejects a computer the
+ * agent does not have; policy only needs the tier and scope.
+ */
+export function callComputer(
+  computers: ComputerKind[],
+  primary: ComputerKind,
+  args: Record<string, unknown>,
+): ComputerKind {
+  const requested =
+    args.computer === "mac" || args.computer === "firecracker"
+      ? args.computer
+      : null;
+  if (!requested) {
+    return primary;
+  }
+  return computers.includes(requested) ? requested : primary;
+}
+
 export interface RoleSummary {
   id: string;
   name: string;
   role: string | null;
   model: ModelRef;
   computer: string | null;
+  computers: ComputerKind[];
   delegates: boolean;
   busyTaskId: string | null;
   busyTaskTitle: string | null;
@@ -170,6 +230,7 @@ export interface OrchestratorHandle {
     scope: string;
     brief?: string;
     model?: ModelRef;
+    computers?: ComputerKind[];
   }): ProjectSummary;
   createWorker(input: {
     callerBotId: string;
@@ -177,7 +238,7 @@ export interface OrchestratorHandle {
     specialty: string;
     instructions?: string;
     model?: ModelRef;
-    computer?: string;
+    computers?: ComputerKind[];
   }): { role: RoleSummary; created: boolean };
   askProject(input: {
     callerBotId: string;
@@ -655,7 +716,8 @@ async function readRawFile(
   path: string,
   maxBytes: number,
 ): Promise<
-  { ok: true; content: string; truncated: boolean } | { ok: false; error: string }
+  | { ok: true; content: string; truncated: boolean }
+  | { ok: false; error: string; missing?: boolean }
 > {
   const resolved = resolveToolPath(context, path);
   if (resolved.error || !resolved.path) {
@@ -664,14 +726,18 @@ async function readRawFile(
   const target = resolved.path;
   const result = await runCapture(
     context,
-    `if [ ! -e ${shellQuote(target)} ]; then echo ${shellQuote(`no such file: ${path}`)} >&2; exit 1; fi; ` +
+    `if [ ! -e ${shellQuote(target)} ]; then echo ${shellQuote(`no such file: ${path}`)} >&2; exit 3; fi; ` +
       `if [ -d ${shellQuote(target)} ]; then echo ${shellQuote(`is a directory: ${path}`)} >&2; exit 1; fi; ` +
       `head -c ${Math.floor(maxBytes)} -- ${shellQuote(target)}`,
     codeCwd(context),
     30,
   );
   if (result.exit !== 0) {
-    return { ok: false, error: result.stderr.trim() || `could not read ${path}` };
+    return {
+      ok: false,
+      error: result.stderr.trim() || `could not read ${path}`,
+      missing: result.exit === 3,
+    };
   }
   return {
     ok: true,
@@ -704,6 +770,56 @@ async function writeRawFile(
     return { ok: false, error: result.stderr.trim() || `could not write ${path}` };
   }
   return { ok: true };
+}
+
+/**
+ * The path shown in the changed-files card: workspace-relative when the file
+ * lives under the agent's root, so rows read like repo paths rather than
+ * absolute temp-directory names.
+ */
+function changeDisplayPath(
+  context: ToolContext,
+  resolved: string,
+  rawPath: string,
+): string {
+  const root = codeRoot(context).replace(/\/+$/, "");
+  if (resolved === root) {
+    return rawPath;
+  }
+  if (resolved.startsWith(`${root}/`)) {
+    return resolved.slice(root.length + 1);
+  }
+  return resolved;
+}
+
+/**
+ * Build the card metadata for one file edit. Returns null when there is
+ * nothing to show: the diff would be empty, the path is invalid, or the text
+ * is past the size the tools track.
+ */
+function buildFileChange(
+  context: ToolContext,
+  rawPath: string,
+  before: string,
+  after: string,
+): FileChange | null {
+  if (before.length > MAX_EDIT_BYTES || after.length > MAX_EDIT_BYTES) {
+    return null;
+  }
+  const resolved = resolveToolPath(context, rawPath);
+  if (resolved.error || !resolved.path) {
+    return null;
+  }
+  const stats = lineDiff(before, after);
+  if (stats.additions === 0 && stats.deletions === 0) {
+    return null;
+  }
+  return {
+    path: changeDisplayPath(context, resolved.path, rawPath),
+    additions: stats.additions,
+    deletions: stats.deletions,
+    diff: stats.diff,
+  };
 }
 
 function readTimeout(args: Record<string, unknown>): number {
@@ -820,6 +936,11 @@ const shellTool: Tool = {
     },
   },
   async execute(context, args) {
+    const target = resolveToolComputer(context, args);
+    if (target.error) {
+      return { ok: false, output: target.error, durationMs: 0 };
+    }
+    context = { ...context, computer: target.computer };
     const command = typeof args.command === "string" ? args.command : "";
     if (!command) {
       return { ok: false, output: "command is required", durationMs: 0 };
@@ -870,6 +991,11 @@ const readFileTool: Tool = {
     },
   },
   async execute(context, args) {
+    const computerTarget = resolveToolComputer(context, args);
+    if (computerTarget.error) {
+      return { ok: false, output: computerTarget.error, durationMs: 0 };
+    }
+    context = { ...context, computer: computerTarget.computer };
     const path = typeof args.path === "string" ? args.path : "";
     if (!path) {
       return { ok: false, output: "path is required", durationMs: 0 };
@@ -980,12 +1106,28 @@ const writeFileTool: Tool = {
     },
   },
   async execute(context, args) {
+    const target = resolveToolComputer(context, args);
+    if (target.error) {
+      return { ok: false, output: target.error, durationMs: 0 };
+    }
+    context = { ...context, computer: target.computer };
     const path = typeof args.path === "string" ? args.path : "";
     const content = typeof args.content === "string" ? args.content : "";
     if (!path) {
       return { ok: false, output: "path is required", durationMs: 0 };
     }
+    // Read what is there now so the app can show the before/after diff. A
+    // missing file is a new file; any other read failure just skips the card.
+    const previous = await readRawFile(context, path, MAX_EDIT_BYTES);
+    let before: string | null = null;
+    if (previous.ok) {
+      before = previous.truncated ? null : previous.content;
+    } else if (previous.missing) {
+      before = "";
+    }
+
     const encoded = Buffer.from(content, "utf8").toString("base64");
+    let result: ToolExecutionResult;
     if (context.computer === "mac") {
       ensureWorkspace(context.workspaceDir);
       const resolved = resolveWorkspacePath(context.workspaceDir, path);
@@ -993,10 +1135,19 @@ const writeFileTool: Tool = {
         return localResult(resolved.error ?? "invalid path", false, 0);
       }
       const command = `mkdir -p -- "$(dirname ${shellQuote(resolved.path)})" && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(resolved.path)} && wc -c < ${shellQuote(resolved.path)}`;
-      return runCommand(context, command, context.workspaceDir, 30);
+      result = await runCommand(context, command, context.workspaceDir, 30);
+    } else {
+      const command = `mkdir -p -- "$(dirname ${shellQuote(path)})" && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(path)} && wc -c < ${shellQuote(path)}`;
+      result = await runCommand(context, command, "/root", 30);
     }
-    const command = `mkdir -p -- "$(dirname ${shellQuote(path)})" && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(path)} && wc -c < ${shellQuote(path)}`;
-    return runCommand(context, command, "/root", 30);
+
+    if (result.ok && before !== null) {
+      const change = buildFileChange(context, path, before, content);
+      if (change) {
+        result.changes = [change];
+      }
+    }
+    return result;
   },
 };
 
@@ -1028,6 +1179,11 @@ const editTool: Tool = {
     },
   },
   async execute(context, args) {
+    const target = resolveToolComputer(context, args);
+    if (target.error) {
+      return { ok: false, output: target.error, durationMs: 0 };
+    }
+    context = { ...context, computer: target.computer };
     const path = typeof args.path === "string" ? args.path : "";
     const oldString = typeof args.oldString === "string" ? args.oldString : "";
     const newString = typeof args.newString === "string" ? args.newString : "";
@@ -1093,10 +1249,12 @@ const editTool: Tool = {
     if (!write.ok) {
       return { ok: false, output: write.error, durationMs: Date.now() - startedAt };
     }
+    const change = buildFileChange(context, path, content, updated);
     return {
       ok: true,
       output: `Replaced ${count} occurrence(s) in ${path}.`,
       durationMs: Date.now() - startedAt,
+      ...(change ? { changes: [change] } : {}),
     };
   },
 };
@@ -1135,6 +1293,11 @@ const grepTool: Tool = {
     },
   },
   async execute(context, args) {
+    const target = resolveToolComputer(context, args);
+    if (target.error) {
+      return { ok: false, output: target.error, durationMs: 0 };
+    }
+    context = { ...context, computer: target.computer };
     const pattern = typeof args.pattern === "string" ? args.pattern : "";
     if (!pattern) {
       return { ok: false, output: "pattern is required", durationMs: 0 };
@@ -1213,6 +1376,11 @@ const globTool: Tool = {
     },
   },
   async execute(context, args) {
+    const target = resolveToolComputer(context, args);
+    if (target.error) {
+      return { ok: false, output: target.error, durationMs: 0 };
+    }
+    context = { ...context, computer: target.computer };
     const pattern = typeof args.pattern === "string" ? args.pattern : "";
     if (!pattern) {
       return { ok: false, output: "pattern is required", durationMs: 0 };
@@ -1355,6 +1523,11 @@ const listDirTool: Tool = {
     },
   },
   async execute(context, args) {
+    const target = resolveToolComputer(context, args);
+    if (target.error) {
+      return { ok: false, output: target.error, durationMs: 0 };
+    }
+    context = { ...context, computer: target.computer };
     const startedAt = Date.now();
     const rawPath =
       typeof args.path === "string" && args.path ? args.path : codeRoot(context);
@@ -1420,7 +1593,9 @@ interface BrowserResult {
   challenge?: boolean;
   output?: string;
   result?: string;
-  screenshots?: string[];
+  // The browser host reports `{mime, base64}`; the smoke mock and older hosts
+  // send a bare base64 string.
+  screenshots?: Array<string | { mime?: string; base64?: string }>;
   /** Hosts the guest blocked because they are not in the egress allowlist. */
   egressBlocked?: string[];
   elements?: Array<{
@@ -1642,24 +1817,34 @@ const browserExecuteTool: Tool = {
     const screenshots = parsed.screenshots ?? [];
     if (screenshots.length > 0) {
       mkdirSync(context.artifactsDir, { recursive: true });
+      let saved = 0;
       for (const shot of screenshots) {
+        const base64 = typeof shot === "string" ? shot : shot.base64;
+        if (typeof base64 !== "string" || !base64) {
+          continue;
+        }
+        const mime =
+          typeof shot === "string" || typeof shot.mime !== "string"
+            ? "image/png"
+            : shot.mime;
         const filename = `${randomUUID()}.png`;
         writeFileSync(
           join(context.artifactsDir, filename),
-          Buffer.from(shot, "base64"),
+          Buffer.from(base64, "base64"),
         );
         artifacts.push({ type: "image", url: `/artifacts/${filename}` });
         if (context.vision) {
-          images.push({ data: shot, mimeType: "image/png" });
+          images.push({ data: base64, mimeType: mime });
         }
+        saved += 1;
       }
-      output += `\n${screenshots.length} screenshot${
-        screenshots.length === 1 ? "" : "s"
-      } ${
-        context.vision
-          ? "captured and attached to the conversation"
-          : "saved (visible to the user in the chat)"
-      }`;
+      if (saved > 0) {
+        output += `\n${saved} screenshot${saved === 1 ? "" : "s"} ${
+          context.vision
+            ? "captured and attached to the conversation"
+            : "saved (visible to the user in the chat)"
+        }`;
+      }
     }
 
     return {
@@ -2895,12 +3080,30 @@ function parseModelArg(value: unknown): ModelRef | undefined {
   };
 }
 
+/**
+ * Parse a computers argument: valid kinds only, deduped, in the given order.
+ * Returns null when the caller did not choose (missing, invalid, or empty), so
+ * the tool can ask instead of guessing.
+ */
+function parseComputersArg(value: unknown): ComputerKind[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const seen = new Set<ComputerKind>();
+  for (const item of value) {
+    if (item === "firecracker" || item === "mac") {
+      seen.add(item);
+    }
+  }
+  return seen.size > 0 ? [...seen] : null;
+}
+
 const createWorkerTool: Tool = {
   definition: {
     name: "create_worker",
     description:
       "Add a persistent team worker when list_roles has no role that fits a " +
-      "task. The worker gets its own computer and stays on the team for " +
+      "task. The worker inherits your computers and stays on the team for " +
       "future tasks, so the team grows only as the work needs it. Give it a " +
       "short name and a one-line specialty, then delegate to it with " +
       "spawn_worker using the returned id. Check list_roles first and reuse " +
@@ -2938,12 +3141,6 @@ const createWorkerTool: Tool = {
             },
           },
         },
-        computer: {
-          type: "string",
-          enum: ["firecracker", "mac"],
-          description:
-            "Optional computer: a Firecracker microVM (default) or This Mac.",
-        },
       },
       required: ["name", "specialty"],
     },
@@ -2959,10 +3156,6 @@ const createWorkerTool: Tool = {
     const instructions =
       typeof args.instructions === "string" ? args.instructions.trim() : undefined;
     const model = parseModelArg(args.model);
-    const computer =
-      args.computer === "mac" || args.computer === "firecracker"
-        ? args.computer
-        : undefined;
     if (!name || !specialty) {
       return {
         ok: false,
@@ -2977,7 +3170,6 @@ const createWorkerTool: Tool = {
         specialty,
         instructions,
         model,
-        computer,
       });
       return {
         ok: true,
@@ -3146,7 +3338,9 @@ const createProjectTool: Tool = {
       "project when list_projects has nothing that matches the user's request. " +
       "Name it after the thing being worked on (for example \"Buddy Weather\") " +
       "and give a one-line scope. The project owns all future work on that " +
-      "topic; you route to it with ask_project.",
+      "topic; you route to it with ask_project. If the user has not said " +
+      "which computers the project should have, ask before calling this tool: " +
+      "the Firecracker microVM, This Mac, or both.",
     parameters: {
       type: "object",
       properties: {
@@ -3164,6 +3358,15 @@ const createProjectTool: Tool = {
           description:
             "Optional context for the project manager: what the user is " +
             "building, constraints, and any assets that already exist.",
+        },
+        computers: {
+          type: "array",
+          items: { type: "string", enum: ["firecracker", "mac"] },
+          description:
+            "Which computers the manager and its workers may use: " +
+            "[\"firecracker\"] for the isolated microVM, [\"mac\"] for This " +
+            "Mac, or both. Do not guess: ask the user when the request does " +
+            "not say.",
         },
         model: {
           type: "object",
@@ -3200,10 +3403,21 @@ const createProjectTool: Tool = {
     const scope = typeof args.scope === "string" ? args.scope.trim() : "";
     const brief = typeof args.brief === "string" ? args.brief.trim() : undefined;
     const model = parseModelArg(args.model);
+    const computers = parseComputersArg(args.computers);
     if (!name || !scope) {
       return {
         ok: false,
         output: "name and scope are required.",
+        durationMs: 0,
+      };
+    }
+    if (!computers) {
+      return {
+        ok: false,
+        output:
+          "No computers were chosen for this project. Ask the user whether " +
+          "the manager should have the Firecracker microVM, This Mac, or " +
+          "both, then call create_project again with the answer.",
         durationMs: 0,
       };
     }
@@ -3214,6 +3428,7 @@ const createProjectTool: Tool = {
         scope,
         brief,
         model,
+        computers,
       });
       return {
         ok: true,
@@ -3854,11 +4069,67 @@ const LOCAL_DEFINITIONS: Record<string, ToolDefinition> = {
   },
 };
 
+const COMPUTER_TOOL_NAMES = new Set([
+  "shell",
+  "read_file",
+  "write_file",
+  "edit",
+  "grep",
+  "glob",
+  "list_dir",
+]);
+
+const VM_ONLY_TOOL_NAMES = new Set([
+  "browser",
+  "browser_execute",
+  "browser_step",
+  "desktop",
+]);
+
+/**
+ * An agent with both computers gets one tool set, not two: the shared tools
+ * grow an optional `computer` argument and the description says so (ADR-021).
+ */
+function withComputerChoice(
+  definition: ToolDefinition,
+  computers: ComputerKind[],
+): ToolDefinition {
+  const labels = computers.map(computerLabel).join(" or ");
+  const parameters = definition.parameters as {
+    properties?: Record<string, unknown>;
+    [key: string]: unknown;
+  };
+  return {
+    ...definition,
+    description:
+      `${definition.description} This agent has more than one computer ` +
+      `(${labels}); pass computer to choose which one this call acts on.`,
+    parameters: {
+      ...parameters,
+      properties: {
+        ...(parameters.properties ?? {}),
+        computer: {
+          type: "string",
+          enum: ["firecracker", "mac"],
+          description:
+            "Which computer to act on: \"firecracker\" is the isolated " +
+            "Linux microVM (the default); \"mac\" is the user's Mac, where " +
+            "file tools are confined to the agent's workspace folder and " +
+            "every action is approval-gated.",
+        },
+      },
+    },
+  };
+}
+
 export function toolDefinitions(
-  computer: ComputerKind = "firecracker",
+  computers: ComputerKind[] = ["firecracker"],
   options: { browse?: boolean; delegate?: boolean } = {},
 ): ToolDefinition[] {
-  const browse = Boolean(options.browse) && computer !== "mac";
+  const hasVm = computers.includes("firecracker");
+  const hasMac = computers.includes("mac");
+  const hasComputer = hasVm || hasMac;
+  const browse = Boolean(options.browse) && hasVm;
   const delegate = Boolean(options.delegate);
   // Deterministic evaluations replace the web with fixtures; the live search
   // tool would silently bypass them, so it is disabled there.
@@ -3866,6 +4137,12 @@ export function toolDefinitions(
   return tools
     .filter((tool) => {
       const name = tool.definition.name;
+      if (COMPUTER_TOOL_NAMES.has(name)) {
+        return hasComputer;
+      }
+      if (VM_ONLY_TOOL_NAMES.has(name)) {
+        return hasVm;
+      }
       if (name === "browse") {
         return browse;
       }
@@ -3877,11 +4154,18 @@ export function toolDefinitions(
       }
       return true;
     })
-    .map((tool) =>
-      computer === "mac"
-        ? (LOCAL_DEFINITIONS[tool.definition.name] ?? tool.definition)
-        : tool.definition,
-    );
+    .map((tool) => {
+      const name = tool.definition.name;
+      if (!COMPUTER_TOOL_NAMES.has(name)) {
+        return tool.definition;
+      }
+      if (hasVm && hasMac) {
+        return withComputerChoice(tool.definition, computers);
+      }
+      return hasMac
+        ? (LOCAL_DEFINITIONS[name] ?? tool.definition)
+        : tool.definition;
+    });
 }
 
 export function findTool(name: string): Tool | undefined {

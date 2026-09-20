@@ -30,6 +30,7 @@ export interface DecisionNotice {
   flagged: boolean;
   latencyMs: number | null;
   model: string | null;
+  route?: "chat" | "direct" | "project" | "new_project";
 }
 
 export const DEFAULT_DECISION_SETTINGS: DecisionSettings = {

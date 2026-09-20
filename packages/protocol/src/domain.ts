@@ -42,6 +42,9 @@ export type RolePolicy = z.infer<typeof RolePolicySchema>;
 export const BotKindSchema = z.enum(["lead", "role", "project"]);
 export type BotKind = z.infer<typeof BotKindSchema>;
 
+export const ComputerKindSchema = z.enum(["firecracker", "mac"]);
+export type ComputerKind = z.infer<typeof ComputerKindSchema>;
+
 export const BotSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -52,7 +55,9 @@ export const BotSchema = z.object({
   role: z.string().nullable().optional(),
   avatar: z.string().nullable().optional(),
   color: z.string().nullable().optional(),
+  /** @deprecated use computers; kept so older clients and rows still parse. */
   computer: z.string().nullable().optional(),
+  computers: z.array(ComputerKindSchema).default(["firecracker"]),
   delegates: z.boolean().default(false),
   policy: RolePolicySchema.default("inherit"),
 });
@@ -88,6 +93,7 @@ export const TaskUsageSchema = z.object({
   toolCalls: z.number(),
   inputTokens: z.number(),
   outputTokens: z.number(),
+  cacheReadTokens: z.number().optional(),
   wallClockMs: z.number(),
 });
 export type TaskUsage = z.infer<typeof TaskUsageSchema>;
@@ -116,9 +122,6 @@ export const TaskSchema = z.object({
 });
 export type Task = z.infer<typeof TaskSchema>;
 
-export const ComputerKindSchema = z.enum(["firecracker", "mac"]);
-export type ComputerKind = z.infer<typeof ComputerKindSchema>;
-
 export const MessageRoleSchema = z.enum(["user", "assistant", "system"]);
 export type MessageRole = z.infer<typeof MessageRoleSchema>;
 
@@ -128,6 +131,14 @@ export const ToolArtifactSchema = z.object({
 });
 export type ToolArtifact = z.infer<typeof ToolArtifactSchema>;
 
+export const FileChangeSchema = z.object({
+  path: z.string(),
+  additions: z.number(),
+  deletions: z.number(),
+  diff: z.string().nullable(),
+});
+export type FileChange = z.infer<typeof FileChangeSchema>;
+
 export const ToolCallRecordSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -136,6 +147,7 @@ export const ToolCallRecordSchema = z.object({
   ok: z.boolean(),
   durationMs: z.number(),
   artifacts: z.array(ToolArtifactSchema).nullable(),
+  changes: z.array(FileChangeSchema).nullable().optional(),
 });
 export type ToolCallRecord = z.infer<typeof ToolCallRecordSchema>;
 
@@ -244,6 +256,7 @@ export const ThreadSchema = z.object({
   lastMessage: z.string().nullable(),
   lastCompactedAt: z.string().nullable().optional(),
   compactionCount: z.number().optional(),
+  clearedAt: z.string().nullable().optional(),
   plan: z.array(PlanStepSchema).nullable().optional(),
   createdAt: z.string(),
   updatedAt: z.string(),

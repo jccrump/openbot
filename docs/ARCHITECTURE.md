@@ -197,7 +197,11 @@ is also the drag region.
 **One thread per agent.** `getOrCreateThread(botId)` returns the agent's single
 thread; the app has no new-chat affordance. The thread title is set from the
 first user message. Sidebar search filters agents by name/role — it does not
-search message text.
+search message text. Clearing a chat (`thread.clear`) is the fresh-start
+affordance without a second thread: the daemon aborts the active run, drops
+queued messages, folds every message, drops the working plan, resets the title,
+and stamps `clearedAt`. The thread, its tasks, and its memory stay; folded
+messages remain readable through `thread.messages` with `includeFolded`.
 
 ### Harnesses: the OpenBot loop (primary) and Codex (optional)
 
@@ -476,6 +480,11 @@ Long threads are compacted instead of dropped. `compaction.ts` owns the policy:
   and are excluded from provider history, so the provider sees the summary plus
   the recent messages. Compaction events (`chat.compaction`) are emitted on the
   protocol; the app does not render a compaction indicator yet.
+- **Clear.** `thread.clear` reuses folding for a user-driven fresh start: the
+  active run is aborted, queued messages dropped, and the whole transcript
+  folded with no summary message, so the next turn begins from the system
+  prompt, soul, and memory only. `cleared_at` marks the break for the app, and
+  the reflector still extracts memories from the folded text.
 - `scripts/compaction-demo.mjs` exercises the whole path against a mock model.
 
 ### Sandbox
@@ -836,7 +845,8 @@ Client to server:
   and `delivery` (`steer` | `queue`) decides what happens when the thread
   already has a run, defaulting to the busy-turn setting
 - `chat.cancel` — `{ runId }`
-- `thread.list`, `thread.messages`
+- `thread.list`, `thread.messages` (`includeFolded` returns the archived
+  transcript), `thread.clear`
 - `bots.create`, `bots.update` (name, role, avatar, color, computer),
   `bots.delete`, `bots.reset`, `bots.power`, `sandbox.status`
 - `files.list` — `{ botId, path? }`, lists a directory on the agent's computer
@@ -853,7 +863,7 @@ Server to client:
 
 - `hello` — snapshot: bots, threads, tasks, providers, presets, default model,
   approval setting, harness, decision-model info, Codex info, busy-turn default
-- `threads`, `thread.messages`, `thread.upserted`
+- `threads`, `thread.messages`, `thread.upserted`, `thread.cleared`
 - `chat.start`, `chat.delta`, `chat.reasoning`, `chat.done`, `chat.message`,
   `chat.error`, `chat.compaction` — streaming text and live reasoning deltas
   (rendered in the expanded work group while a run is active; reasoning is not
@@ -1188,6 +1198,22 @@ step is answered by a follow-up run so it is never left hanging. Rejected:
 abort-and-resend (throws away completed tool work and re-bills the turn); a
 client-side-only queue (lost on reload, no cross-window consistency); injecting
 mid-provider-call (a stream cannot accept a new user turn).
+
+**ADR-021: An agent may have one computer, both, or neither.** A bot's
+`computers` is a capability set (`["firecracker"]`, `["mac"]`, or both), not a
+single kind. The lead gets both because it orchestrates work on either side; a
+project manager's set is chosen when the lead creates it — when the brief does
+not say, the lead asks the user instead of silently defaulting — and workers
+inherit the manager's set rather than choosing for themselves. Tools name the
+computer they act on: shared tools (`shell`, file tools) take an optional
+`computer` argument and default to the agent's primary, while `browser` and
+`desktop` stay microVM-only and `web_search` stays host-side. Policy stays
+per-call, so a local action still always asks unless a mac-scoped rule allows
+it. An empty set means a chat-only agent with no computer tools. Rejected: a
+separate tool name per computer (doubles the tool surface and descriptions);
+silently defaulting managers to the microVM (the user asked to be asked);
+workers choosing their own computer (capability should follow the manager's
+approval).
 
 **ADR-017 amendment: memory and soul adapt automatically, but stay legible.**
 The user asked for memory and soul to change over time without being told to,

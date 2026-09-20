@@ -7,6 +7,7 @@ import type {
   Bot,
   BotKind,
   CompactionMeta,
+  ComputerKind,
   Memory,
   MemoryStatus,
   MemoryType,
@@ -30,6 +31,9 @@ import type {
 } from "@openbot/protocol";
 
 export const DEFAULT_BOT_NAME = "Assistant";
+/** The lead orchestrates work on either side, so it gets both computers. */
+const LEAD_PRIMARY: ComputerKind = "firecracker";
+const LEAD_COMPUTERS: ComputerKind[] = [LEAD_PRIMARY, "mac"];
 export const DEFAULT_THREAD_TITLE = "New chat";
 export const DEFAULT_SYSTEM_PROMPT =
   "You are OpenBot, an agent with your own computer. Your computer is a " +
@@ -294,6 +298,7 @@ interface BotRow {
   avatar?: string | null;
   color?: string | null;
   computer?: string | null;
+  computers?: string | null;
   delegates?: number | null;
   policy?: string | null;
 }
@@ -328,6 +333,7 @@ interface ThreadRow {
   last_message?: string | null;
   last_compacted_at?: string | null;
   compaction_count?: number;
+  cleared_at?: string | null;
   plan?: string | null;
   created_at: string;
   updated_at: string;
@@ -564,8 +570,44 @@ function toEffort(value: string | null | undefined): ReasoningEffort | undefined
     : undefined;
 }
 
+/**
+ * Normalize a computer capability set: valid kinds only, order preserved,
+ * duplicates dropped. A missing value takes the fallback; an explicit empty
+ * array means a chat-only agent and stays empty (ADR-021).
+ */
+export function normalizeComputers(
+  value: unknown,
+  fallback: ComputerKind[] = ["firecracker"],
+): ComputerKind[] {
+  if (!Array.isArray(value)) {
+    return fallback;
+  }
+  const seen = new Set<ComputerKind>();
+  for (const item of value) {
+    if (item === "firecracker" || item === "mac") {
+      seen.add(item);
+    }
+  }
+  return [...seen];
+}
+
+function computersFor(row: BotRow): ComputerKind[] {
+  if (row.computers) {
+    try {
+      const parsed: unknown = JSON.parse(row.computers);
+      if (Array.isArray(parsed)) {
+        return normalizeComputers(parsed, []);
+      }
+    } catch {
+      // fall through to the legacy single-computer column
+    }
+  }
+  return normalizeComputers(row.computer ? [row.computer] : null);
+}
+
 function toBot(row: BotRow): Bot {
   const effort = toEffort(row.effort);
+  const computers = computersFor(row);
   return {
     id: row.id,
     name: row.name,
@@ -585,7 +627,8 @@ function toBot(row: BotRow): Bot {
     role: row.role ?? null,
     avatar: row.avatar ?? null,
     color: row.color ?? null,
-    computer: row.computer ?? null,
+    computer: computers[0] ?? null,
+    computers,
     delegates: (row.delegates ?? 0) !== 0,
     policy: (row.policy as RolePolicy) ?? "inherit",
   };
@@ -660,6 +703,7 @@ function toThread(row: ThreadRow): Thread {
     lastMessage: row.last_message ?? null,
     lastCompactedAt: row.last_compacted_at ?? null,
     compactionCount: row.compaction_count ?? 0,
+    clearedAt: row.cleared_at ?? null,
     plan,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -675,6 +719,7 @@ function toMessage(row: MessageRow): Message {
         parsed?.map((call) => ({
           ...call,
           artifacts: call.artifacts ?? null,
+          changes: call.changes ?? null,
         })) ?? null;
     } catch {
       toolCalls = null;
@@ -731,9 +776,15 @@ export class Store {
         this.db
           .prepare("UPDATE bots SET system_prompt = ? WHERE id = ?")
           .run(DEFAULT_LEAD_SYSTEM_PROMPT, existing.id);
-        return this.getBot(existing.id)!;
       }
-      return existing;
+      // The lead orchestrates work on either side of the fence, so its
+      // capability set stays open (ADR-021).
+      if (!LEAD_COMPUTERS.every((kind) => existing.computers.includes(kind))) {
+        this.db
+          .prepare("UPDATE bots SET computers = ?, computer = ? WHERE id = ?")
+          .run(JSON.stringify(LEAD_COMPUTERS), LEAD_PRIMARY, existing.id);
+      }
+      return this.getBot(existing.id)!;
     }
     const candidate = bots[0];
     if (candidate) {
@@ -741,8 +792,15 @@ export class Store {
         ? DEFAULT_LEAD_SYSTEM_PROMPT
         : candidate.systemPrompt;
       this.db
-        .prepare("UPDATE bots SET kind = 'lead', system_prompt = ? WHERE id = ?")
-        .run(systemPrompt, candidate.id);
+        .prepare(
+          "UPDATE bots SET kind = 'lead', system_prompt = ?, computers = ?, computer = ? WHERE id = ?",
+        )
+        .run(
+          systemPrompt,
+          JSON.stringify(LEAD_COMPUTERS),
+          LEAD_PRIMARY,
+          candidate.id,
+        );
       return this.getBot(candidate.id)!;
     }
     return this.createBot({
@@ -750,6 +808,7 @@ export class Store {
       systemPrompt: DEFAULT_LEAD_SYSTEM_PROMPT,
       model: defaultModel,
       kind: "lead",
+      computers: LEAD_COMPUTERS,
     });
   }
 
@@ -780,9 +839,16 @@ export class Store {
     avatar?: string | null;
     color?: string | null;
     computer?: string | null;
+    computers?: ComputerKind[];
     delegates?: boolean;
     policy?: RolePolicy;
   }): Bot {
+    const computers: ComputerKind[] =
+      input.computers !== undefined
+        ? normalizeComputers(input.computers, [])
+        : input.computer
+          ? normalizeComputers([input.computer], ["firecracker"])
+          : ["firecracker"];
     const bot: Bot = {
       id: randomUUID(),
       name: input.name,
@@ -793,13 +859,14 @@ export class Store {
       role: input.role ?? null,
       avatar: input.avatar ?? null,
       color: input.color ?? null,
-      computer: input.computer ?? null,
+      computer: computers[0] ?? null,
+      computers,
       delegates: input.delegates ?? false,
       policy: input.policy ?? "inherit",
     };
     this.db
       .prepare(
-        "INSERT INTO bots (id, name, system_prompt, provider, model, effort, created_at, kind, role, avatar, color, computer, delegates, policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO bots (id, name, system_prompt, provider, model, effort, created_at, kind, role, avatar, color, computer, computers, delegates, policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         bot.id,
@@ -814,6 +881,7 @@ export class Store {
         bot.avatar ?? null,
         bot.color ?? null,
         bot.computer ?? null,
+        JSON.stringify(bot.computers),
         bot.delegates ? 1 : 0,
         bot.policy,
       );
@@ -828,6 +896,7 @@ export class Store {
       avatar?: string | null;
       color?: string | null;
       computer?: string | null;
+      computers?: ComputerKind[];
       delegates?: boolean;
       policy?: RolePolicy;
       model?: ModelRef;
@@ -842,7 +911,16 @@ export class Store {
     if (patch.role !== undefined) fields.push(["role", patch.role]);
     if (patch.avatar !== undefined) fields.push(["avatar", patch.avatar]);
     if (patch.color !== undefined) fields.push(["color", patch.color]);
-    if (patch.computer !== undefined) fields.push(["computer", patch.computer]);
+    if (patch.computers !== undefined || patch.computer !== undefined) {
+      const computers =
+        patch.computers !== undefined
+          ? normalizeComputers(patch.computers, [])
+          : patch.computer
+            ? normalizeComputers([patch.computer], ["firecracker"])
+            : ["firecracker"];
+      fields.push(["computers", JSON.stringify(computers)]);
+      fields.push(["computer", computers[0] ?? null]);
+    }
     if (patch.delegates !== undefined) {
       fields.push(["delegates", patch.delegates ? 1 : 0]);
     }
@@ -1018,6 +1096,35 @@ export class Store {
         "UPDATE threads SET last_compacted_at = ?, compaction_count = compaction_count + 1, updated_at = ? WHERE id = ?",
       )
       .run(now, now, id);
+    return this.getThread(id);
+  }
+
+  /**
+   * Start the thread over without losing anything: every current message is
+   * folded away (the model context and the transcript view are built from
+   * unfolded messages only), the working plan is dropped, and the title resets
+   * so the next user message names the new stretch of conversation. Returns
+   * null when there is nothing to clear.
+   */
+  clearThread(id: string): Thread | null {
+    const thread = this.getThread(id);
+    if (!thread) {
+      return null;
+    }
+    const unfolded = this.listMessages(id);
+    if (unfolded.length === 0) {
+      return null;
+    }
+    this.foldMessages(
+      id,
+      unfolded.map((message) => message.id),
+    );
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        "UPDATE threads SET title = ?, plan = NULL, cleared_at = ?, updated_at = ? WHERE id = ?",
+      )
+      .run(DEFAULT_THREAD_TITLE, now, now, id);
     return this.getThread(id);
   }
 

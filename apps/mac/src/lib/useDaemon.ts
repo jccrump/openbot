@@ -36,6 +36,10 @@ export interface StreamingState {
   text: string;
   reasoning: string;
   startedAt: number;
+  // A live turn starts "pending": Jev may say it is conversation ("chat"), in
+  // which case the UI stays a simple loading bubble; reasoning or a tool call
+  // means real work, and only then does the working group appear.
+  mode: "pending" | "chat" | "work";
 }
 
 export interface ToolActivity {
@@ -48,18 +52,6 @@ export interface ToolActivity {
   output: string | null;
   durationMs: number | null;
   artifacts: ToolArtifact[] | null;
-  at: number;
-}
-
-export interface DecisionActivity {
-  threadId: string;
-  messageId: string;
-  id: string;
-  kind: "audit" | "browse" | "route" | "guardrail";
-  summary: string;
-  flagged: boolean;
-  latencyMs: number | null;
-  model: string | null;
   at: number;
 }
 
@@ -104,7 +96,9 @@ export interface CreateBotInput {
   avatar?: string;
   color?: string;
   model?: ModelRef;
+  /** @deprecated use computers. */
   computer?: ComputerKind;
+  computers?: ComputerKind[];
 }
 
 export interface FetchModelsResult {
@@ -237,7 +231,6 @@ export function useDaemon() {
   >({});
   const [error, setError] = useState<string | null>(null);
   const [toolActivity, setToolActivity] = useState<ToolActivity[]>([]);
-  const [decisions, setDecisions] = useState<DecisionActivity[]>([]);
   const [approvals, setApprovals] = useState<PendingApproval[]>([]);
   const [challenges, setChallenges] = useState<PendingChallenge[]>([]);
   const [sandboxStates, setSandboxStates] = useState<
@@ -576,9 +569,6 @@ export function useDaemon() {
           setApprovals((current) =>
             current.filter((item) => !replacedThreadIds.has(item.threadId)),
           );
-          setDecisions((current) =>
-            current.filter((item) => !replacedThreadIds.has(item.threadId)),
-          );
           setTasks((current) =>
             current.filter((task) => task.roleId !== message.botId),
           );
@@ -694,6 +684,44 @@ export function useDaemon() {
           });
           break;
         }
+        case "thread.cleared": {
+          disarmWatchdog(message.threadId);
+          setThreads((current) => {
+            const index = current.findIndex(
+              (thread) => thread.id === message.thread.id,
+            );
+            if (index === -1) {
+              return [message.thread, ...current];
+            }
+            const next = [...current];
+            next[index] = message.thread;
+            return next;
+          });
+          setStreamingByThread((current) => {
+            if (!current[message.threadId]) {
+              return current;
+            }
+            const next = { ...current };
+            delete next[message.threadId];
+            return next;
+          });
+          setToolActivity((current) =>
+            current.filter((item) => item.threadId !== message.threadId),
+          );
+          setApprovals((current) =>
+            current.filter((item) => item.threadId !== message.threadId),
+          );
+          setChallenges((current) =>
+            current.filter((item) => item.threadId !== message.threadId),
+          );
+          if (message.threadId === activeThreadIdRef.current) {
+            setMessages([]);
+          }
+          if (message.threadId === previewThreadIdRef.current) {
+            setPreviewMessages([]);
+          }
+          break;
+        }
         case "thread.messages": {
           if (message.threadId === activeThreadIdRef.current) {
             setMessages(message.messages);
@@ -729,6 +757,7 @@ export function useDaemon() {
               text: "",
               reasoning: "",
               startedAt: Date.now(),
+              mode: "pending",
             },
           }));
           break;
@@ -743,6 +772,8 @@ export function useDaemon() {
               ...current,
               [message.threadId]: {
                 ...entry,
+                // Reasoning is not a work signal: chat models think too. The
+                // turn stays simple unless Jev says work or a tool runs.
                 reasoning: entry.reasoning + message.text,
               },
             };
@@ -766,23 +797,39 @@ export function useDaemon() {
           break;
         }
         case "chat.decision": {
-          setDecisions((current) => [
-            ...current,
-            {
-              threadId: message.threadId,
-              messageId: message.messageId,
-              id: `decision-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-              kind: message.kind,
-              summary: message.summary,
-              flagged: message.flagged,
-              latencyMs: message.latencyMs,
-              model: message.model,
-              at: Date.now(),
-            },
-          ]);
+          // Route decisions tell the live UI whether the turn is conversation
+          // or work. The other kinds stay backend telemetry.
+          if (message.kind !== "route" || !message.route) {
+            break;
+          }
+          const mode = message.route === "chat" ? "chat" : "work";
+          setStreamingByThread((current) => {
+            const entry = current[message.threadId];
+            if (
+              !entry ||
+              entry.messageId !== message.messageId ||
+              entry.mode === mode
+            ) {
+              return current;
+            }
+            return {
+              ...current,
+              [message.threadId]: { ...entry, mode },
+            };
+          });
           break;
         }
         case "tool.start": {
+          setStreamingByThread((current) => {
+            const entry = current[message.threadId];
+            if (!entry || entry.mode === "work") {
+              return current;
+            }
+            return {
+              ...current,
+              [message.threadId]: { ...entry, mode: "work" },
+            };
+          });
           setToolActivity((current) => {
             if (current.some((item) => item.callId === message.callId)) {
               return current;
@@ -1249,6 +1296,7 @@ export function useDaemon() {
         avatar?: string | null;
         color?: string | null;
         computer?: ComputerKind;
+        computers?: ComputerKind[];
         delegates?: boolean;
         policy?: RolePolicy;
         model?: ModelRef;
@@ -1368,11 +1416,21 @@ export function useDaemon() {
   );
 
   const listFiles = useCallback(
-    (botId: string, path = ""): Promise<FileListResult> => {
+    (
+      botId: string,
+      path = "",
+      computer?: ComputerKind,
+    ): Promise<FileListResult> => {
       const requestId = `files-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       return new Promise((resolve) => {
         fileListRequests.current.set(requestId, resolve);
-        client.send({ type: "files.list", requestId, botId, path });
+        client.send({
+          type: "files.list",
+          requestId,
+          botId,
+          path,
+          ...(computer ? { computer } : {}),
+        });
         setTimeout(() => {
           if (fileListRequests.current.has(requestId)) {
             fileListRequests.current.delete(requestId);
@@ -1389,11 +1447,21 @@ export function useDaemon() {
   );
 
   const readFile = useCallback(
-    (botId: string, path: string): Promise<FileReadResult> => {
+    (
+      botId: string,
+      path: string,
+      computer?: ComputerKind,
+    ): Promise<FileReadResult> => {
       const requestId = `file-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       return new Promise((resolve) => {
         fileReadRequests.current.set(requestId, resolve);
-        client.send({ type: "files.read", requestId, botId, path });
+        client.send({
+          type: "files.read",
+          requestId,
+          botId,
+          path,
+          ...(computer ? { computer } : {}),
+        });
         setTimeout(() => {
           if (fileReadRequests.current.has(requestId)) {
             fileReadRequests.current.delete(requestId);
@@ -1461,6 +1529,31 @@ export function useDaemon() {
     setPreviewThreadId(null);
     setPreviewMessages([]);
   }, []);
+
+  // Folded messages are hidden by default; the archived view asks for them
+  // explicitly.
+  const loadThreadMessages = useCallback(
+    (threadId: string, includeFolded = false) => {
+      client.send({
+        type: "thread.messages",
+        threadId,
+        ...(includeFolded ? { includeFolded: true } : {}),
+      });
+    },
+    [client],
+  );
+
+  const clearThread = useCallback(
+    (threadId: string) => {
+      if (client.status !== "connected") {
+        setError(DISCONNECTED_ERROR);
+        return;
+      }
+      setError(null);
+      client.send({ type: "thread.clear", threadId });
+    },
+    [client],
+  );
 
   const sendMessageToThread = useCallback(
     (
@@ -1552,10 +1645,11 @@ export function useDaemon() {
     previewStreaming,
     openThreadPreview,
     closeThreadPreview,
+    loadThreadMessages,
+    clearThread,
     sendMessageToThread,
     error,
     toolActivity,
-    decisions,
     approvals,
     challenges,
     sandboxStates,

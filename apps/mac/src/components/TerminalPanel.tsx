@@ -32,13 +32,11 @@ const STATUS_LABEL: Record<TerminalStatus, string> = {
 
 export function TerminalPanel({
   botId,
-  botName,
   canConnect,
   url,
   active,
 }: {
   botId: string;
-  botName: string;
   canConnect: boolean;
   url: string;
   active: boolean;
@@ -52,7 +50,7 @@ export function TerminalPanel({
   const [generation, setGeneration] = useState(0);
 
   // The pty session lives only while the panel is mounted, so start it the
-  // first time the tab is opened and keep it running across tab switches.
+  // first time the section is expanded and keep it running across collapses.
   useEffect(() => {
     if (active && canConnect) {
       setStarted(true);
@@ -198,7 +196,7 @@ export function TerminalPanel({
     };
   }, [started, canConnect, botId, url, generation]);
 
-  // Refit and focus whenever the tab becomes visible again.
+  // Refit and focus whenever the section becomes visible again.
   useEffect(() => {
     if (!active || !started) {
       return;
@@ -253,9 +251,6 @@ export function TerminalPanel({
       </div>
       {message && <p className="terminal-message">{message}</p>}
       <div className="terminal-host" ref={hostRef} />
-      <p className="terminal-caption">
-        {botName}&rsquo;s shell, as root. Closing this panel ends the session.
-      </p>
     </div>
   );
 }

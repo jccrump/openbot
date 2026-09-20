@@ -49,7 +49,9 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     avatar: z.string().optional(),
     color: z.string().optional(),
     model: ModelRefSchema.optional(),
+    /** @deprecated use computers. */
     computer: ComputerKindSchema.optional(),
+    computers: z.array(ComputerKindSchema).optional(),
     delegates: z.boolean().optional(),
     policy: RolePolicySchema.optional(),
   }),
@@ -61,7 +63,9 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     role: z.string().nullable().optional(),
     avatar: z.string().nullable().optional(),
     color: z.string().nullable().optional(),
+    /** @deprecated use computers. */
     computer: ComputerKindSchema.optional(),
+    computers: z.array(ComputerKindSchema).optional(),
     delegates: z.boolean().optional(),
     policy: RolePolicySchema.optional(),
     model: ModelRefSchema.optional(),
@@ -81,12 +85,16 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     requestId: z.string(),
     botId: z.string(),
     path: z.string().optional(),
+    /** Which computer to browse; defaults to the agent's primary. */
+    computer: ComputerKindSchema.optional(),
   }),
   z.object({
     type: z.literal("files.read"),
     requestId: z.string(),
     botId: z.string(),
     path: z.string().min(1),
+    /** Which computer to browse; defaults to the agent's primary. */
+    computer: ComputerKindSchema.optional(),
   }),
   z.object({
     type: z.literal("bots.delete"),
@@ -123,6 +131,12 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("thread.messages"),
+    threadId: z.string(),
+    /** Include messages folded away by compaction or a clear. */
+    includeFolded: z.boolean().optional(),
+  }),
+  z.object({
+    type: z.literal("thread.clear"),
     threadId: z.string(),
   }),
   z.object({
@@ -298,6 +312,11 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     thread: ThreadSchema,
   }),
   z.object({
+    type: z.literal("thread.cleared"),
+    threadId: z.string(),
+    thread: ThreadSchema,
+  }),
+  z.object({
     type: z.literal("chat.start"),
     runId: z.string(),
     threadId: z.string(),
@@ -328,6 +347,9 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     flagged: z.boolean(),
     latencyMs: z.number().nullable(),
     model: z.string().nullable(),
+    // Set for route decisions so the app can tell conversation from work
+    // without parsing the summary.
+    route: z.enum(["chat", "direct", "project", "new_project"]).optional(),
   }),
   z.object({
     type: z.literal("chat.compaction"),

@@ -61,8 +61,7 @@
      only by a hairline border — no translucency, blur, or glow. */
   --glass-fill: var(--bg-chat);
   --glass-soft: rgba(0, 0, 0, 0.05);
-  --bubble-glass: rgba(0, 0, 0, 0.03);
-  --bubble-user: rgba(0, 0, 0, 0.06);
+  --bubble-user: rgba(0, 0, 0, 0.07);
   font-family: system-ui, -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif;
   -webkit-font-smoothing: antialiased;
 }
@@ -114,8 +113,7 @@
   --approval-border: rgba(251, 191, 36, 0.28);
   --glass-fill: var(--bg-chat);
   --glass-soft: rgba(255, 255, 255, 0.08);
-  --bubble-glass: rgba(255, 255, 255, 0.04);
-  --bubble-user: rgba(255, 255, 255, 0.08);
+  --bubble-user: rgba(255, 255, 255, 0.12);
   --status-connected: #34d399;
   --status-connecting: #fbbf24;
   --status-disconnected: #f87171;
@@ -617,6 +615,13 @@ body.resizing .screen-panel * {
   min-width: 0;
 }
 
+/* Only the user's message is a bubble; the assistant writes directly on the
+   transcript background. */
+.entry-assistant {
+  max-width: none;
+  width: 100%;
+}
+
 .entry-user {
   max-width: 580px;
   min-width: 0;
@@ -638,25 +643,18 @@ body.resizing .screen-panel * {
   min-width: 0;
 }
 
-.entry-user .entry-body,
-.entry-assistant .entry-body {
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  padding: 8px 12px;
-}
-
 .entry-user .entry-body {
   background: var(--bubble-user);
-}
-
-.entry-assistant .entry-body {
-  background: var(--bubble-glass);
+  border-radius: 18px;
+  padding: 10px 14px;
 }
 
 .entry-assistant .entry-body.entry-error {
   color: var(--red);
   background: var(--red-tint);
-  border: 0.5px solid var(--red-border);
+  border: 1px solid var(--red-border);
+  border-radius: 12px;
+  padding: 8px 12px;
 }
 
 .bubble-action {
@@ -839,7 +837,8 @@ body.resizing .screen-panel * {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .work-group-dots span {
+  .work-group-dots span,
+  .typing-dots span {
     animation: none;
     opacity: 0.7;
   }
@@ -908,6 +907,30 @@ body.resizing .screen-panel * {
   margin: 0;
   font-size: 13px;
   line-height: 18px;
+}
+
+.archived-link {
+  margin-top: 2px;
+  font-size: 12px;
+}
+
+/* Marks where the transcript was cleared: archived messages sit above it. */
+.cleared-divider {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin: 18px 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.cleared-divider::before,
+.cleared-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
 }
 
 /* Composer */
@@ -1041,16 +1064,6 @@ body.resizing .screen-panel * {
   flex-shrink: 0;
 }
 
-.composer-busy-group {
-  flex-shrink: 0;
-}
-
-.segmented-compact .segmented-option {
-  height: 20px;
-  padding: 0 8px;
-  font-size: 11px;
-}
-
 /* Harness pill */
 
 .harness-pill {
@@ -1174,24 +1187,6 @@ body.resizing .screen-panel * {
   opacity: 0.72;
 }
 
-/* Live status line: trails the tool rows and streamed text, the way the agent
-   harness prints "Thinking" while a turn is in flight. */
-.work-group-status {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-top: 2px;
-  padding: 2px 0;
-  color: var(--text-muted);
-  font-size: 13px;
-  letter-spacing: -0.1px;
-}
-
-.work-group-live .work-group-body {
-  margin-top: 0;
-  margin-bottom: 2px;
-}
-
 .work-group-chevron {
   display: inline-flex;
   flex-shrink: 0;
@@ -1245,6 +1240,30 @@ body.resizing .screen-panel * {
   }
 }
 
+/* Conversation turns wait as a plain loading bubble, not the working UI. */
+.typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 0;
+}
+
+.typing-dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  animation: work-dot 1.2s ease-in-out infinite;
+}
+
+.typing-dots span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.typing-dots span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
 .work-group-meta {
   white-space: nowrap;
 }
@@ -1280,45 +1299,6 @@ body.resizing .screen-panel * {
   margin: 0;
 }
 
-.work-decision {
-  display: flex;
-  align-items: baseline;
-  gap: 7px;
-  min-width: 0;
-  color: var(--text-muted);
-  font-size: 13px;
-  line-height: 19px;
-  letter-spacing: -0.1px;
-}
-
-.work-decision-engine {
-  flex-shrink: 0;
-  color: var(--text);
-  font-weight: 600;
-}
-
-.work-decision-kind {
-  flex-shrink: 0;
-  color: var(--text-muted);
-}
-
-.work-decision-summary {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.work-decision-meta {
-  flex-shrink: 0;
-  white-space: nowrap;
-  font-size: 12px;
-}
-
-.work-decision-flagged .work-decision-kind {
-  color: var(--amber);
-}
-
 .work-thinking {
   font-size: 13px;
   line-height: 19px;
@@ -1342,18 +1322,6 @@ body.resizing .screen-panel * {
   flex-shrink: 0;
   color: var(--text);
   font-weight: 600;
-}
-
-.work-thinking-preview {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-muted);
-}
-
-.work-thinking[open] .work-thinking-preview {
-  display: none;
 }
 
 .work-thinking pre {
@@ -1517,6 +1485,127 @@ body.resizing .screen-panel * {
   color: var(--text);
 }
 
+/* Changed files: a per-turn summary of edits, shown under the final answer. */
+.changed-files {
+  max-width: 560px;
+  margin-top: 12px;
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.changed-files-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  letter-spacing: -0.1px;
+}
+
+.changed-files-title {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.changed-files-stat {
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.changed-files-add {
+  color: var(--green);
+}
+
+.changed-files-del {
+  color: var(--red);
+}
+
+.changed-files-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.changed-files-item + .changed-files-item {
+  border-top: 1px solid var(--hairline);
+}
+
+.changed-files-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 12px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.changed-files-row:hover {
+  background: var(--hover);
+}
+
+.changed-files-static {
+  cursor: default;
+}
+
+.changed-files-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12.5px;
+  letter-spacing: -0.2px;
+  color: var(--text);
+}
+
+.changed-files-chevron {
+  display: inline-flex;
+  flex-shrink: 0;
+  color: var(--text-muted);
+  transform: rotate(-90deg);
+  transition: transform 0.15s ease;
+}
+
+.changed-files-chevron.open {
+  transform: rotate(0deg);
+}
+
+.changed-files-diff {
+  margin: 0;
+  padding: 2px 12px 10px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  line-height: 17px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow: auto;
+  max-height: 320px;
+  color: var(--text-secondary);
+}
+
+.changed-files-diff .diff-line-add {
+  color: var(--green);
+}
+
+.changed-files-diff .diff-line-del {
+  color: var(--red);
+}
+
+.changed-files-diff .diff-line-hunk {
+  color: var(--text-muted);
+}
+
+.changed-files-diff .diff-line-note {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
 /* Approval cards */
 
 .approval-card {
@@ -1647,61 +1736,122 @@ body.resizing .screen-panel * {
   border-radius: 14px;
 }
 
-.panel-tabs {
+.panel-stack {
   display: flex;
-  align-items: center;
-  gap: 2px;
-  flex: 0 0 auto;
-  padding-bottom: 6px;
-  border-bottom: 0.5px solid var(--hairline);
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
 }
 
-.panel-tab {
+.panel-section {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.panel-section-collapsed {
+  flex: 0 0 auto;
+}
+
+.panel-section-header {
   display: flex;
   align-items: center;
-  gap: 5px;
-  padding: 5px 8px;
+  gap: 4px;
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.panel-section-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  padding: 4px 6px;
   border: none;
   border-radius: 8px;
   background: transparent;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font: inherit;
   font-size: 12px;
   letter-spacing: -0.1px;
   cursor: pointer;
 }
 
-.panel-tab:hover {
+.panel-section-toggle:hover {
   background: var(--hover);
-  color: var(--text-secondary);
+  color: var(--text);
 }
 
-.panel-tab-active,
-.panel-tab-active:hover {
-  background: var(--row-selected);
-  color: var(--text);
+.panel-section-chevron {
+  display: flex;
+  color: var(--text-muted);
+  transition: transform 120ms ease;
+}
+
+.panel-section-chevron-collapsed {
+  transform: rotate(-90deg);
+}
+
+.panel-section-label {
   font-weight: 600;
 }
 
-.panel-collapse {
+.panel-section-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   margin-left: auto;
-  flex-shrink: 0;
+  min-width: 0;
 }
 
-.panel-tab-pane {
+.panel-section-body {
   display: flex;
   flex-direction: column;
   flex: 1;
   min-height: 0;
-  gap: 8px;
+  padding-top: 6px;
+  overflow: hidden;
 }
 
-.panel-tab-pane[hidden] {
+.panel-section-body[hidden] {
   display: none;
 }
 
-.panel-pane-screen {
-  gap: 10px;
+.panel-section-resizer {
+  position: relative;
+  flex: 0 0 10px;
+  cursor: row-resize;
+}
+
+.panel-section-resizer::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  top: 4px;
+  height: 1px;
+  background: transparent;
+  transition: background 120ms ease;
+}
+
+.panel-section-resizer:hover::after,
+body.resizing-rows .panel-section-resizer::after {
+  background: var(--hairline);
+}
+
+body.resizing-rows {
+  user-select: none;
+  cursor: row-resize;
+}
+
+body.resizing-rows .screen-panel * {
+  pointer-events: none !important;
+}
+
+.panel-collapse {
+  flex-shrink: 0;
 }
 
 /* Files */
@@ -1730,6 +1880,34 @@ body.resizing .screen-panel * {
 .files-toolbar .icon-button:disabled {
   opacity: 0.35;
   cursor: default;
+}
+
+.files-computer-switch {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  border: 0.5px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.files-computer-option {
+  padding: 2px 7px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.files-computer-option:hover {
+  background: var(--hover);
+}
+
+.files-computer-option-active {
+  background: var(--hover);
+  color: var(--text);
 }
 
 .files-breadcrumb {
@@ -1991,12 +2169,6 @@ body.resizing .screen-panel * {
   height: 100%;
 }
 
-.terminal-caption {
-  margin: 0;
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
 .terminal-empty {
   display: flex;
   flex-direction: column;
@@ -2013,47 +2185,21 @@ body.resizing .screen-panel * {
   color: var(--text-secondary);
 }
 
-.screen-panel-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  height: 26px;
-  margin-bottom: -6px;
-}
-
-.screen-panel-identity {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  min-width: 0;
-}
-
-.screen-panel-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 9999px;
-  flex-shrink: 0;
-}
-
-.screen-panel-name {
-  font-size: 13px;
-  font-weight: 600;
-  letter-spacing: -0.15px;
-  color: var(--text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.screen-panel-title {
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
 .screen-view {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.panel-section-body .screen-view {
+  flex: 1;
+  min-height: 0;
+}
+
+.panel-section-body .screen-frame {
+  flex: 1;
+  aspect-ratio: auto;
+  min-height: 0;
 }
 
 .screen-frame {
@@ -2184,6 +2330,8 @@ body.resizing .screen-panel * {
 .screen-image {
   display: block;
   width: 100%;
+  max-height: 100%;
+  object-fit: contain;
 }
 
 .screen-empty {
@@ -2191,7 +2339,7 @@ body.resizing .screen-panel * {
   flex-direction: column;
   align-items: center;
   gap: 8px;
-  padding: 56px 12px;
+  padding: 16px 12px;
   font-size: 12px;
   color: var(--text-muted);
 }
@@ -2199,8 +2347,8 @@ body.resizing .screen-panel * {
 .screen-caption {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 2px;
+  gap: 6px;
+  min-width: 0;
   font-size: 12px;
   color: var(--text-muted);
 }
@@ -2213,7 +2361,6 @@ body.resizing .screen-panel * {
 }
 
 .screen-caption-status {
-  margin-left: auto;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;

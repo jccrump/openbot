@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type {
   Bot,
+  ComputerKind,
   Message,
   ModelRef,
   ServerMessage,
@@ -11,7 +12,7 @@ import type {
   TaskUsage,
 } from "@openbot/protocol";
 import { runAgent, type AgentDeps } from "./agent";
-import { systemPromptForBot } from "./store";
+import { normalizeComputers, systemPromptForBot } from "./store";
 import { renderEvidenceLedger } from "./task-harness";
 import type {
   OrchestratorHandle,
@@ -105,6 +106,10 @@ function computeUsage(task: Task, messages: Message[]): TaskUsage {
     (total, message) => total + (message.usage?.outputTokens ?? 0),
     0,
   );
+  const cacheReadTokens = messages.reduce(
+    (total, message) => total + (message.usage?.cacheReadTokens ?? 0),
+    0,
+  );
   const startedAt = task.startedAt
     ? Date.parse(task.startedAt)
     : Date.parse(task.createdAt);
@@ -113,6 +118,7 @@ function computeUsage(task: Task, messages: Message[]): TaskUsage {
     toolCalls,
     inputTokens,
     outputTokens,
+    ...(cacheReadTokens > 0 ? { cacheReadTokens } : {}),
     wallClockMs: Math.max(0, endedAt - startedAt),
   };
 }
@@ -132,6 +138,7 @@ export class Orchestrator implements OrchestratorHandle {
       role: bot.role ?? null,
       model: bot.model,
       computer: bot.computer ?? null,
+      computers: bot.computers,
       delegates: bot.delegates,
       busyTaskId: active?.id ?? null,
       busyTaskTitle: active?.title ?? null,
@@ -157,7 +164,7 @@ export class Orchestrator implements OrchestratorHandle {
     specialty: string;
     instructions?: string;
     model?: ModelRef;
-    computer?: string;
+    computers?: ComputerKind[];
   }): { role: RoleSummary; created: boolean } {
     const store = this.options.deps.store;
     const caller = store.getBot(input.callerBotId);
@@ -198,13 +205,19 @@ export class Orchestrator implements OrchestratorHandle {
     ]
       .filter(Boolean)
       .join("\n\n");
+    // Workers inherit the caller's computers (ADR-021): capability follows the
+    // manager's approval instead of being chosen per worker.
+    const computers = normalizeComputers(
+      input.computers ?? caller.computers,
+      caller.computers,
+    );
     const bot = store.createBot({
       name,
       systemPrompt,
       model,
       kind: "role",
       role: specialty,
-      computer: input.computer ?? "firecracker",
+      computers,
       delegates: false,
     });
     this.options.emit({
@@ -229,6 +242,7 @@ export class Orchestrator implements OrchestratorHandle {
     scope: string;
     brief?: string;
     model?: ModelRef;
+    computers?: ComputerKind[];
   }): ProjectSummary {
     const store = this.options.deps.store;
     const caller = store.getBot(input.callerBotId);
@@ -251,7 +265,7 @@ export class Orchestrator implements OrchestratorHandle {
       role: input.scope,
       avatar: "🗂️",
       color: "#2563eb",
-      computer: "firecracker",
+      computers: normalizeComputers(input.computers ?? null),
       delegates: true,
     });
     this.options.emit({
@@ -464,19 +478,25 @@ export class Orchestrator implements OrchestratorHandle {
   }
 
   private defaultGrant(role: Bot): TaskGrant {
-    const tools =
-      role.computer === "mac"
-        ? ["shell", "read_file", "write_file"]
-        : [
-            "shell",
-            "read_file",
-            "write_file",
-            "browser",
-            "browser_execute",
-            "browser_step",
-            "browse",
-            "desktop",
-          ];
+    // Browser and desktop live only on the microVM; shell and file tools work
+    // on either computer. The grant follows the role's capability set, and a
+    // chat-only role gets no computer tools at all (ADR-021).
+    const vmTools = [
+      "shell",
+      "read_file",
+      "write_file",
+      "browser",
+      "browser_execute",
+      "browser_step",
+      "browse",
+      "desktop",
+    ];
+    const localTools = ["shell", "read_file", "write_file"];
+    const tools = role.computers.includes("firecracker")
+      ? vmTools
+      : role.computers.includes("mac")
+        ? localTools
+        : [];
     return {
       tools,
       display: "none",

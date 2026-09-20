@@ -5,6 +5,7 @@ export function ConfirmDialog({
   title,
   description,
   confirmLabel,
+  warning = "This cannot be undone.",
   busy = false,
   onConfirm,
   onClose,
@@ -13,6 +14,7 @@ export function ConfirmDialog({
   title: string;
   description: string;
   confirmLabel: string;
+  warning?: string;
   busy?: boolean;
   onConfirm: () => void;
   onClose: () => void;
@@ -63,7 +65,7 @@ export function ConfirmDialog({
         <div className="modal-body">
           <p className="modal-confirm-text">{description}</p>
           <p className="modal-confirm-warning">
-            This cannot be undone.
+            {warning}
           </p>
         </div>
 

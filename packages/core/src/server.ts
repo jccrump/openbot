@@ -145,6 +145,9 @@ interface QueuedChat {
 export function createDaemon(options: DaemonOptions): Daemon {
   const runs = new Map<string, RunHandle>();
   const threadQueues = new Map<string, QueuedChat[]>();
+  // Threads whose clear must wait for the active run to unwind, so the
+  // cancelled turn's own messages are folded with the rest.
+  const pendingClears = new Set<string>();
   const pending = new Set<Promise<void>>();
 
   const artifactsDir = join(options.config.dataDir, "artifacts");
@@ -455,6 +458,26 @@ export function createDaemon(options: DaemonOptions): Daemon {
     });
   };
 
+  // Fold the thread's transcript away so the next turn starts from the system
+  // prompt, soul, and memory only. Folded messages stay in the database, feed
+  // memory extraction, and remain readable through thread.messages with
+  // includeFolded.
+  const clearThreadNow = (threadId: string): void => {
+    const queue = threadQueues.get(threadId);
+    if (queue) {
+      threadQueues.delete(threadId);
+      for (const item of queue) {
+        broadcast({ type: "chat.dequeued", threadId, messageId: item.id });
+      }
+    }
+    const cleared = options.store.clearThread(threadId);
+    if (!cleared) {
+      return;
+    }
+    broadcast({ type: "thread.cleared", threadId, thread: cleared });
+    reflector.schedule();
+  };
+
   const dropQueuedChats = (botId: string): void => {
     for (const [threadId, queue] of threadQueues) {
       const remaining = queue.filter((item) => item.botId !== botId);
@@ -541,6 +564,11 @@ export function createDaemon(options: DaemonOptions): Daemon {
             skipUserMessage: true,
           });
           return;
+        }
+        // A clear requested mid-run folds the transcript only now, so the
+        // cancelled turn's own messages go with it.
+        if (pendingClears.delete(input.threadId)) {
+          clearThreadNow(input.threadId);
         }
         drainThreadQueue(input.threadId);
         if (isLead) {
@@ -991,6 +1019,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
             avatar: message.avatar ?? null,
             color: message.color ?? null,
             computer: message.computer ?? null,
+            computers: message.computers,
             delegates: message.delegates ?? false,
             policy: message.policy ?? "inherit",
           });
@@ -1007,6 +1036,9 @@ export function createDaemon(options: DaemonOptions): Daemon {
           if (message.color !== undefined) patch.color = message.color || null;
           if (message.computer !== undefined) {
             patch.computer = message.computer;
+          }
+          if (message.computers !== undefined) {
+            patch.computers = message.computers;
           }
           if (message.delegates !== undefined) {
             patch.delegates = message.delegates;
@@ -1217,6 +1249,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
             fileOptions,
             message.botId,
             message.path ?? "",
+            message.computer,
           )
             .then((result) =>
               send({
@@ -1241,7 +1274,12 @@ export function createDaemon(options: DaemonOptions): Daemon {
           return;
         }
         case "files.read": {
-          void readComputerFile(fileOptions, message.botId, message.path)
+          void readComputerFile(
+            fileOptions,
+            message.botId,
+            message.path,
+            message.computer,
+          )
             .then((result) =>
               send({
                 type: "files.read",
@@ -1279,9 +1317,29 @@ export function createDaemon(options: DaemonOptions): Daemon {
           send({
             type: "thread.messages",
             threadId: message.threadId,
-            messages: options.store.listMessages(message.threadId),
+            messages: options.store.listMessages(message.threadId, {
+              includeFolded: message.includeFolded === true,
+            }),
           });
           return;
+        case "thread.clear": {
+          const thread = options.store.getThread(message.threadId);
+          if (!thread) {
+            send({
+              type: "chat.error",
+              message: `unknown thread: ${message.threadId}`,
+            });
+            return;
+          }
+          const active = activeRunForThread(thread.id);
+          if (active) {
+            pendingClears.add(thread.id);
+            active.controller.abort();
+            return;
+          }
+          clearThreadNow(thread.id);
+          return;
+        }
         case "chat.cancel":
           runs.get(message.runId)?.controller.abort();
           return;
