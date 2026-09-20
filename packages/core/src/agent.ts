@@ -67,6 +67,7 @@ import {
   type ToolContext,
   type ToolImage,
 } from "./tools";
+import { workspaceGuestRoot } from "./workspaces";
 import {
   annotateBrowserObservation,
   annotateWebSearchObservation,
@@ -949,17 +950,28 @@ export async function runAgent(
   // gone.
   const readCache = new Map<string, string>();
   const toolResultCache = new Map<string, string>();
+  // A registered workspace roots the agent's file tools and shell at the
+  // project folder; without one it gets a managed scratch folder (ADR-022).
+  const workspace = bot.workspaceId
+    ? deps.store.getWorkspace(bot.workspaceId)
+    : null;
+  const workspaceDir = workspace
+    ? workspace.root
+    : join(deps.dataDir, "workspaces", bot.id);
+  const guestCwd =
+    input.guestCwd ??
+    (workspace && hasVm ? workspaceGuestRoot(workspace) : undefined);
   const toolContext: ToolContext | null =
     local || deps.sandbox
       ? {
           botId: bot.id,
           computerId: input.computerId,
           browserId: input.browserId,
-          guestCwd: input.guestCwd,
+          guestCwd,
           computer,
           computers,
           sandbox: deps.sandbox,
-          workspaceDir: join(deps.dataDir, "workspaces", bot.id),
+          workspaceDir,
           artifactsDir: deps.artifactsDir,
           decision: decisionRuntime,
           vision,
@@ -997,6 +1009,16 @@ export async function runAgent(
   }
   if (input.contextNote) {
     contextParts.push(input.contextNote);
+  }
+  if (workspace) {
+    contextParts.push(
+      `[workspace] Your project folder is "${workspace.name}" at ${workspace.root}. ` +
+        "File tools and shell are rooted there; keep the project's files in " +
+        "place instead of copying them into a scratch folder." +
+        (workspace.missing
+          ? " The folder is currently missing on disk — tell the user."
+          : ""),
+    );
   }
   if (computers.length > 1) {
     contextParts.push(
@@ -1062,10 +1084,34 @@ export async function runAgent(
   const globalApproval = deps.requireApproval || hasMac;
   const grantedTools = new Set(input.grant?.tools ?? []);
   const isManagerRun = Boolean(input.taskId);
+  const basePolicy = deps.policy?.() ?? DEFAULT_POLICY;
+  // A workspace's trusted command patterns auto-approve shell calls for
+  // agents working in that project; a global deny or ask rule still wins
+  // because the strictest matched rule decides (ADR-022).
+  const workspaceOverlay =
+    workspace && workspace.autoApprove.length > 0
+      ? {
+          timeoutMs: basePolicy.timeoutMs,
+          defaultTier: "inherit" as const,
+          tools: {},
+          rules: workspace.autoApprove.map((pattern, index) => ({
+            id: `workspace-${workspace.id}-${index}`,
+            tool: "shell",
+            scope: "*" as const,
+            match: "command" as const,
+            pattern,
+            tier: "auto" as const,
+            note: `trusted command in ${workspace.name}`,
+          })),
+        }
+      : null;
+  const withWorkspace = workspaceOverlay
+    ? mergePolicies(basePolicy, workspaceOverlay)
+    : basePolicy;
   const roleOverlay = rolePolicySettings(bot.policy);
   const policySettings = roleOverlay
-    ? mergePolicies(deps.policy?.() ?? DEFAULT_POLICY, roleOverlay)
-    : (deps.policy?.() ?? DEFAULT_POLICY);
+    ? mergePolicies(withWorkspace, roleOverlay)
+    : withWorkspace;
   if (toolContext) {
     toolContext.policy = policySettings;
   }

@@ -71,6 +71,7 @@ import {
   type Store,
 } from "./store";
 import { captureScreen } from "./tools";
+import { WorkspaceService } from "./workspaces";
 
 const SCREEN_CACHE_MS = 1000;
 
@@ -112,6 +113,7 @@ export interface DaemonOptions {
   approvals: ApprovalBroker;
   challenges: ChallengeBroker;
   presets: ProviderPreset[];
+  workspaces: WorkspaceService;
 }
 
 export interface Daemon {
@@ -233,6 +235,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
     artifactsDir,
     sandbox: options.sandbox,
     getBot: (botId) => options.store.getBot(botId),
+    getWorkspace: (workspaceId) => options.workspaces.get(workspaceId),
   };
 
   const deps: AgentDeps = {
@@ -993,6 +996,8 @@ export function createDaemon(options: DaemonOptions): Daemon {
       decision: decisionInfo(readDecisionSettings(), process.env),
       codex: codex.info(),
       chatBusyBehavior: readChatBusyBehavior(),
+      workspaces: options.workspaces.list(),
+      workspaceRoots: options.workspaces.roots(),
     });
 
     socket.on("message", (raw) => {
@@ -1020,6 +1025,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
             color: message.color ?? null,
             computer: message.computer ?? null,
             computers: message.computers,
+            workspaceId: message.workspaceId ?? null,
             delegates: message.delegates ?? false,
             policy: message.policy ?? "inherit",
           });
@@ -1039,6 +1045,9 @@ export function createDaemon(options: DaemonOptions): Daemon {
           }
           if (message.computers !== undefined) {
             patch.computers = message.computers;
+          }
+          if (message.workspaceId !== undefined) {
+            patch.workspaceId = message.workspaceId || null;
           }
           if (message.delegates !== undefined) {
             patch.delegates = message.delegates;
@@ -1213,6 +1222,89 @@ export function createDaemon(options: DaemonOptions): Daemon {
               }
             })();
           }
+          return;
+        }
+        case "workspaces.list": {
+          send({
+            type: "workspaces",
+            workspaces: options.workspaces.list(),
+            roots: options.workspaces.roots(),
+          });
+          return;
+        }
+        case "workspaces.scan": {
+          try {
+            const result = options.workspaces.scan();
+            console.info("workspaces.scan", { discovered: result.discovered });
+            broadcast({
+              type: "workspaces",
+              workspaces: result.workspaces,
+              roots: options.workspaces.roots(),
+            });
+          } catch (error) {
+            send({ type: "chat.error", message: (error as Error).message });
+          }
+          return;
+        }
+        case "workspaces.add": {
+          try {
+            options.workspaces.add(message.root);
+            broadcast({
+              type: "workspaces",
+              workspaces: options.workspaces.list(),
+              roots: options.workspaces.roots(),
+            });
+          } catch (error) {
+            send({ type: "chat.error", message: (error as Error).message });
+          }
+          return;
+        }
+        case "workspaces.update": {
+          const updated = options.workspaces.update(message.workspaceId, {
+            ...(message.name !== undefined ? { name: message.name } : {}),
+            ...(message.ignored !== undefined
+              ? { ignored: message.ignored }
+              : {}),
+            ...(message.autoApprove !== undefined
+              ? { autoApprove: message.autoApprove }
+              : {}),
+          });
+          if (!updated) {
+            send({
+              type: "chat.error",
+              message: `unknown workspace: ${message.workspaceId}`,
+            });
+            return;
+          }
+          broadcast({
+            type: "workspaces",
+            workspaces: options.workspaces.list(),
+            roots: options.workspaces.roots(),
+          });
+          return;
+        }
+        case "workspaces.remove": {
+          if (!options.workspaces.remove(message.workspaceId)) {
+            send({
+              type: "chat.error",
+              message: `unknown workspace: ${message.workspaceId}`,
+            });
+            return;
+          }
+          broadcast({
+            type: "workspaces",
+            workspaces: options.workspaces.list(),
+            roots: options.workspaces.roots(),
+          });
+          return;
+        }
+        case "workspaces.roots": {
+          options.workspaces.setRoots(message.roots);
+          broadcast({
+            type: "workspaces",
+            workspaces: options.workspaces.list(),
+            roots: options.workspaces.roots(),
+          });
           return;
         }
         case "sandbox.status": {

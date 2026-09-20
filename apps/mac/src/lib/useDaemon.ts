@@ -24,6 +24,7 @@ import type {
   Task,
   Thread,
   ToolArtifact,
+  Workspace,
 } from "@openbot/protocol";
 import { DaemonClient, type DaemonStatus } from "./daemon";
 
@@ -99,6 +100,7 @@ export interface CreateBotInput {
   /** @deprecated use computers. */
   computer?: ComputerKind;
   computers?: ComputerKind[];
+  workspaceId?: string;
 }
 
 export interface FetchModelsResult {
@@ -218,6 +220,8 @@ export function useDaemon() {
   const [codex, setCodex] = useState<CodexInfo | null>(null);
   const [chatBusyBehavior, setChatBusyBehavior] =
     useState<ChatBusyBehavior>("steer");
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [workspaceRoots, setWorkspaceRoots] = useState<string[]>([]);
   const [queuedMessageIds, setQueuedMessageIds] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState<ModelRef | null>(null);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
@@ -416,6 +420,8 @@ export function useDaemon() {
           setDecision(message.decision ?? null);
           setCodex(message.codex ?? null);
           setChatBusyBehavior(message.chatBusyBehavior ?? "steer");
+          setWorkspaces(message.workspaces ?? []);
+          setWorkspaceRoots(message.workspaceRoots ?? []);
           setQueuedMessageIds([]);
           const stored = storedBotId();
           const current = selectedBotIdRef.current;
@@ -668,6 +674,11 @@ export function useDaemon() {
         }
         case "threads": {
           setThreads(message.threads);
+          break;
+        }
+        case "workspaces": {
+          setWorkspaces(message.workspaces);
+          setWorkspaceRoots(message.roots);
           break;
         }
         case "thread.upserted": {
@@ -1297,6 +1308,7 @@ export function useDaemon() {
         color?: string | null;
         computer?: ComputerKind;
         computers?: ComputerKind[];
+        workspaceId?: string | null;
         delegates?: boolean;
         policy?: RolePolicy;
         model?: ModelRef;
@@ -1485,6 +1497,49 @@ export function useDaemon() {
     setError(null);
   }, []);
 
+  const scanWorkspaces = useCallback(() => {
+    client.send({ type: "workspaces.scan" });
+  }, [client]);
+
+  const addWorkspace = useCallback(
+    (root: string) => {
+      client.send({ type: "workspaces.add", root });
+    },
+    [client],
+  );
+
+  const updateWorkspace = useCallback(
+    (
+      workspaceId: string,
+      patch: { name?: string; ignored?: boolean; autoApprove?: string[] },
+    ) => {
+      client.send({
+        type: "workspaces.update",
+        workspaceId,
+        ...(patch.name !== undefined ? { name: patch.name } : {}),
+        ...(patch.ignored !== undefined ? { ignored: patch.ignored } : {}),
+        ...(patch.autoApprove !== undefined
+          ? { autoApprove: patch.autoApprove }
+          : {}),
+      });
+    },
+    [client],
+  );
+
+  const removeWorkspace = useCallback(
+    (workspaceId: string) => {
+      client.send({ type: "workspaces.remove", workspaceId });
+    },
+    [client],
+  );
+
+  const saveWorkspaceRoots = useCallback(
+    (roots: string[]) => {
+      client.send({ type: "workspaces.roots", roots });
+    },
+    [client],
+  );
+
   const testDecision = useCallback((): Promise<DecisionTestResult> => {
     const requestId = `decision-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     return new Promise((resolve) => {
@@ -1637,6 +1692,13 @@ export function useDaemon() {
     queuedMessageIds,
     selectedModel,
     chooseModel,
+    workspaces,
+    workspaceRoots,
+    scanWorkspaces,
+    addWorkspace,
+    updateWorkspace,
+    removeWorkspace,
+    saveWorkspaceRoots,
     activeThreadId,
     messages,
     streaming,

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { PROVIDER_PRESETS, type ProviderDefinition } from "@openbot/gateway";
@@ -26,6 +26,8 @@ export interface OpenBotConfig {
   harness: HarnessSettings;
   decision: DecisionSettings;
   chatBusyBehavior: ChatBusyBehavior;
+  /** Folders scanned for local projects on first run; user-editable later. */
+  workspaceRoots: string[];
 }
 
 interface FileConfig {
@@ -43,6 +45,7 @@ interface FileConfig {
   };
   decision?: Partial<DecisionSettings>;
   chatBusyBehavior?: string;
+  workspaceRoots?: string[];
 }
 
 export function defaultDataDir(): string {
@@ -115,7 +118,42 @@ export function loadConfig(
     chatBusyBehavior: parseChatBusyBehavior(
       env.OPENBOT_CHAT_BUSY_BEHAVIOR ?? file.chatBusyBehavior,
     ),
+    workspaceRoots: parseWorkspaceRoots(env, file),
   };
+}
+
+function parseWorkspaceRoots(
+  env: Record<string, string | undefined>,
+  file: FileConfig,
+): string[] {
+  const fromEnv = env.OPENBOT_WORKSPACE_ROOTS?.trim();
+  if (fromEnv) {
+    return fromEnv
+      .split(/[:,]/)
+      .map((root) => root.trim())
+      .filter(Boolean);
+  }
+  if (file.workspaceRoots && file.workspaceRoots.length > 0) {
+    return file.workspaceRoots;
+  }
+  return defaultWorkspaceRoots();
+}
+
+/**
+ * Conventional developer folders that exist on this machine, used to seed the
+ * registry's scan roots. Everything stays user-editable in Settings.
+ */
+export function defaultWorkspaceRoots(): string[] {
+  const home = homedir();
+  const candidates = [
+    join(home, "Documents", "Personal-Projects"),
+    join(home, "Documents", "Projects"),
+    join(home, "Projects"),
+    join(home, "Developer"),
+    join(home, "code"),
+    join(home, "src"),
+  ];
+  return candidates.filter((dir) => existsSync(dir));
 }
 
 export function parseChatBusyBehavior(

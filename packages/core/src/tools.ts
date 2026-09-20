@@ -169,9 +169,20 @@ export interface RoleSummary {
   model: ModelRef;
   computer: string | null;
   computers: ComputerKind[];
+  workspaceId: string | null;
+  workspace: string | null;
   delegates: boolean;
   busyTaskId: string | null;
   busyTaskTitle: string | null;
+}
+
+export interface WorkspaceSummary {
+  id: string;
+  name: string;
+  root: string;
+  markers: string[];
+  missing: boolean;
+  agentCount: number;
 }
 
 export interface TaskSummary {
@@ -224,6 +235,7 @@ export interface ProjectSummary {
 export interface OrchestratorHandle {
   listRoles(): RoleSummary[];
   listProjects(): ProjectSummary[];
+  listWorkspaces(): WorkspaceSummary[];
   createProject(input: {
     callerBotId: string;
     name: string;
@@ -231,6 +243,7 @@ export interface OrchestratorHandle {
     brief?: string;
     model?: ModelRef;
     computers?: ComputerKind[];
+    workspaceId?: string | null;
   }): ProjectSummary;
   createWorker(input: {
     callerBotId: string;
@@ -239,6 +252,7 @@ export interface OrchestratorHandle {
     instructions?: string;
     model?: ModelRef;
     computers?: ComputerKind[];
+    workspaceId?: string | null;
   }): { role: RoleSummary; created: boolean };
   askProject(input: {
     callerBotId: string;
@@ -3285,6 +3299,56 @@ const cancelWorkerTool: Tool = {
   },
 };
 
+const listWorkspacesTool: Tool = {
+  definition: {
+    name: "list_workspaces",
+    description:
+      "List the user's project folders (workspaces) that the daemon has " +
+      "registered on this Mac. Each has an id, a name, and a root path. When " +
+      "a request is about an existing project, create its manager with " +
+      "create_project and pass that workspace id so the manager's file tools " +
+      "and shell work inside the project folder.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  async execute(context) {
+    const orchestrator = context.orchestrator;
+    if (!orchestrator) {
+      return orchestratorUnavailable();
+    }
+    const workspaces = orchestrator.listWorkspaces();
+    if (workspaces.length === 0) {
+      return {
+        ok: true,
+        output:
+          "No project folders are registered. The user can add or scan for " +
+          "them in Settings → Workspaces.",
+        durationMs: 0,
+      };
+    }
+    const lines = workspaces.map((workspace) => {
+      const markers = workspace.markers.length
+        ? ` · ${workspace.markers.join(", ")}`
+        : "";
+      const agents =
+        workspace.agentCount > 0
+          ? ` · ${workspace.agentCount} agent${
+              workspace.agentCount === 1 ? "" : "s"
+            }`
+          : "";
+      const missing = workspace.missing ? " · MISSING on disk" : "";
+      return (
+        `- ${workspace.name} (id: ${workspace.id}) at ${workspace.root}` +
+        `${markers}${agents}${missing}`
+      );
+    });
+    return { ok: true, output: lines.join("\n"), durationMs: 0 };
+  },
+};
+
 const listProjectsTool: Tool = {
   definition: {
     name: "list_projects",
@@ -3368,6 +3432,12 @@ const createProjectTool: Tool = {
             "Mac, or both. Do not guess: ask the user when the request does " +
             "not say.",
         },
+        workspace: {
+          type: "string",
+          description:
+            "Optional project folder for the manager: a workspace id from " +
+            "list_workspaces, or its name. Omit for a managed scratch folder.",
+        },
         model: {
           type: "object",
           description:
@@ -3421,6 +3491,28 @@ const createProjectTool: Tool = {
         durationMs: 0,
       };
     }
+    let workspaceId: string | null = null;
+    if (typeof args.workspace === "string" && args.workspace.trim()) {
+      const wanted = args.workspace.trim().toLowerCase();
+      const match = orchestrator
+        .listWorkspaces()
+        .find(
+          (workspace) =>
+            workspace.id === args.workspace ||
+            workspace.name.toLowerCase() === wanted,
+        );
+      if (!match) {
+        return {
+          ok: false,
+          output:
+            `No workspace matches "${args.workspace}". Check list_workspaces ` +
+            "and pass the id or exact name, or omit workspace for a scratch " +
+            "folder.",
+          durationMs: 0,
+        };
+      }
+      workspaceId = match.id;
+    }
     try {
       const project = orchestrator.createProject({
         callerBotId: context.botId,
@@ -3429,6 +3521,7 @@ const createProjectTool: Tool = {
         brief,
         model,
         computers,
+        workspaceId,
       });
       return {
         ok: true,
@@ -3798,6 +3891,7 @@ const ORCHESTRATION_TOOL_NAMES = new Set([
   "list_projects",
   "create_project",
   "ask_project",
+  "list_workspaces",
 ]);
 
 // Reads never need approval; the tools that create or change work do.
@@ -3805,6 +3899,7 @@ const READ_ONLY_ORCHESTRATION_TOOL_NAMES = new Set([
   "list_roles",
   "worker_status",
   "list_projects",
+  "list_workspaces",
 ]);
 
 const MEMORY_TOOL_NAMES = new Set([
@@ -3837,6 +3932,7 @@ export const tools: Tool[] = [
   listProjectsTool,
   createProjectTool,
   askProjectTool,
+  listWorkspacesTool,
   rememberTool,
   recallTool,
   forgetTool,

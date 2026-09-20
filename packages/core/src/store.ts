@@ -28,6 +28,7 @@ import type {
   Thread,
   TokenUsage,
   ToolCallRecord,
+  Workspace,
 } from "@openbot/protocol";
 
 export const DEFAULT_BOT_NAME = "Assistant";
@@ -299,8 +300,20 @@ interface BotRow {
   color?: string | null;
   computer?: string | null;
   computers?: string | null;
+  workspace_id?: string | null;
   delegates?: number | null;
   policy?: string | null;
+}
+
+interface WorkspaceRow {
+  id: string;
+  name: string;
+  root: string;
+  markers: string | null;
+  ignored: number | null;
+  settings: string | null;
+  created_at: string;
+  last_seen_at: string;
 }
 
 interface TaskRow {
@@ -629,8 +642,47 @@ function toBot(row: BotRow): Bot {
     color: row.color ?? null,
     computer: computers[0] ?? null,
     computers,
+    workspaceId: row.workspace_id ?? null,
     delegates: (row.delegates ?? 0) !== 0,
     policy: (row.policy as RolePolicy) ?? "inherit",
+  };
+}
+
+function toWorkspace(row: WorkspaceRow): Workspace {
+  let markers: string[] = [];
+  if (row.markers) {
+    try {
+      const parsed: unknown = JSON.parse(row.markers);
+      if (Array.isArray(parsed)) {
+        markers = parsed.filter((item): item is string => typeof item === "string");
+      }
+    } catch {
+      markers = [];
+    }
+  }
+  let autoApprove: string[] = [];
+  if (row.settings) {
+    try {
+      const parsed = JSON.parse(row.settings) as { autoApprove?: unknown };
+      if (Array.isArray(parsed.autoApprove)) {
+        autoApprove = parsed.autoApprove.filter(
+          (item): item is string => typeof item === "string",
+        );
+      }
+    } catch {
+      autoApprove = [];
+    }
+  }
+  return {
+    id: row.id,
+    name: row.name,
+    root: row.root,
+    markers,
+    ignored: (row.ignored ?? 0) !== 0,
+    missing: false,
+    autoApprove,
+    createdAt: row.created_at,
+    lastSeenAt: row.last_seen_at,
   };
 }
 
@@ -840,6 +892,7 @@ export class Store {
     color?: string | null;
     computer?: string | null;
     computers?: ComputerKind[];
+    workspaceId?: string | null;
     delegates?: boolean;
     policy?: RolePolicy;
   }): Bot {
@@ -861,12 +914,13 @@ export class Store {
       color: input.color ?? null,
       computer: computers[0] ?? null,
       computers,
+      workspaceId: input.workspaceId ?? null,
       delegates: input.delegates ?? false,
       policy: input.policy ?? "inherit",
     };
     this.db
       .prepare(
-        "INSERT INTO bots (id, name, system_prompt, provider, model, effort, created_at, kind, role, avatar, color, computer, computers, delegates, policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO bots (id, name, system_prompt, provider, model, effort, created_at, kind, role, avatar, color, computer, computers, workspace_id, delegates, policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         bot.id,
@@ -882,6 +936,7 @@ export class Store {
         bot.color ?? null,
         bot.computer ?? null,
         JSON.stringify(bot.computers),
+        bot.workspaceId ?? null,
         bot.delegates ? 1 : 0,
         bot.policy,
       );
@@ -897,6 +952,7 @@ export class Store {
       color?: string | null;
       computer?: string | null;
       computers?: ComputerKind[];
+      workspaceId?: string | null;
       delegates?: boolean;
       policy?: RolePolicy;
       model?: ModelRef;
@@ -920,6 +976,9 @@ export class Store {
             : ["firecracker"];
       fields.push(["computers", JSON.stringify(computers)]);
       fields.push(["computer", computers[0] ?? null]);
+    }
+    if (patch.workspaceId !== undefined) {
+      fields.push(["workspace_id", patch.workspaceId]);
     }
     if (patch.delegates !== undefined) {
       fields.push(["delegates", patch.delegates ? 1 : 0]);
@@ -955,6 +1014,124 @@ export class Store {
       throw error;
     }
     return true;
+  }
+
+  listWorkspaces(): Workspace[] {
+    const rows = this.db
+      .prepare("SELECT * FROM workspaces ORDER BY name COLLATE NOCASE ASC")
+      .all() as unknown as WorkspaceRow[];
+    return rows.map(toWorkspace);
+  }
+
+  getWorkspace(id: string): Workspace | null {
+    const row = this.db
+      .prepare("SELECT * FROM workspaces WHERE id = ?")
+      .get(id) as unknown as WorkspaceRow | undefined;
+    return row ? toWorkspace(row) : null;
+  }
+
+  getWorkspaceByRoot(root: string): Workspace | null {
+    const row = this.db
+      .prepare("SELECT * FROM workspaces WHERE root = ?")
+      .get(root) as unknown as WorkspaceRow | undefined;
+    return row ? toWorkspace(row) : null;
+  }
+
+  createWorkspace(input: {
+    name: string;
+    root: string;
+    markers?: string[];
+    ignored?: boolean;
+    autoApprove?: string[];
+  }): Workspace {
+    const now = new Date().toISOString();
+    const workspace: Workspace = {
+      id: randomUUID(),
+      name: input.name,
+      root: input.root,
+      markers: input.markers ?? [],
+      ignored: input.ignored ?? false,
+      missing: false,
+      autoApprove: input.autoApprove ?? [],
+      createdAt: now,
+      lastSeenAt: now,
+    };
+    this.db
+      .prepare(
+        "INSERT INTO workspaces (id, name, root, markers, ignored, settings, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        workspace.id,
+        workspace.name,
+        workspace.root,
+        JSON.stringify(workspace.markers),
+        workspace.ignored ? 1 : 0,
+        JSON.stringify({ autoApprove: workspace.autoApprove }),
+        workspace.createdAt,
+        workspace.lastSeenAt,
+      );
+    return workspace;
+  }
+
+  updateWorkspace(
+    id: string,
+    patch: {
+      name?: string;
+      markers?: string[];
+      ignored?: boolean;
+      autoApprove?: string[];
+      lastSeenAt?: string;
+    },
+  ): Workspace | null {
+    const existing = this.getWorkspace(id);
+    if (!existing) {
+      return null;
+    }
+    const fields: Array<[string, string | number]> = [];
+    if (patch.name !== undefined) fields.push(["name", patch.name]);
+    if (patch.markers !== undefined) {
+      fields.push(["markers", JSON.stringify(patch.markers)]);
+    }
+    if (patch.ignored !== undefined) {
+      fields.push(["ignored", patch.ignored ? 1 : 0]);
+    }
+    if (patch.autoApprove !== undefined) {
+      fields.push([
+        "settings",
+        JSON.stringify({ autoApprove: patch.autoApprove }),
+      ]);
+    }
+    if (patch.lastSeenAt !== undefined) {
+      fields.push(["last_seen_at", patch.lastSeenAt]);
+    }
+    for (const [column, value] of fields) {
+      this.db
+        .prepare(`UPDATE workspaces SET ${column} = ? WHERE id = ?`)
+        .run(value, id);
+    }
+    return this.getWorkspace(id);
+  }
+
+  deleteWorkspace(id: string): boolean {
+    if (!this.getWorkspace(id)) {
+      return false;
+    }
+    this.db.exec("BEGIN");
+    try {
+      this.db
+        .prepare("UPDATE bots SET workspace_id = NULL WHERE workspace_id = ?")
+        .run(id);
+      this.db.prepare("DELETE FROM workspaces WHERE id = ?").run(id);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return true;
+  }
+
+  listBotsForWorkspace(workspaceId: string): Bot[] {
+    return this.listBots().filter((bot) => bot.workspaceId === workspaceId);
   }
 
   resetBot(id: string): boolean {

@@ -5,6 +5,7 @@ import type {
   ModelRef,
   ReasoningEffort,
   RolePolicy,
+  Workspace,
 } from "@openbot/protocol";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { ComputerChoices } from "./ComputerChoices";
@@ -22,6 +23,7 @@ export interface AgentSettingsPatch {
   role: string | null;
   color: string;
   computers: ComputerKind[];
+  workspaceId: string | null;
   delegates: boolean;
   policy: RolePolicy;
   model: ModelRef;
@@ -31,6 +33,7 @@ export function AgentSettingsModal({
   bot,
   sandboxState,
   streaming,
+  workspaces,
   onClose,
   onSave,
   onPower,
@@ -40,6 +43,7 @@ export function AgentSettingsModal({
   bot: Bot | null;
   sandboxState: SandboxState;
   streaming: boolean;
+  workspaces: Workspace[];
   onClose: () => void;
   onSave: (patch: AgentSettingsPatch) => void;
   onPower: (on: boolean) => void;
@@ -50,6 +54,7 @@ export function AgentSettingsModal({
   const [role, setRole] = useState("");
   const [color, setColor] = useState(AVATAR_COLORS[0]!);
   const [computers, setComputers] = useState<ComputerKind[]>(["firecracker"]);
+  const [workspaceId, setWorkspaceId] = useState("");
   const [delegates, setDelegates] = useState(false);
   const [policy, setPolicy] = useState<RolePolicy>("inherit");
   const [effort, setEffort] = useState<ReasoningEffort | "">("");
@@ -63,6 +68,7 @@ export function AgentSettingsModal({
     setRole(bot.role ?? "");
     setColor(bot.color ?? AVATAR_COLORS[0]!);
     setComputers(botComputers(bot));
+    setWorkspaceId(bot.workspaceId ?? "");
     setDelegates(bot.delegates);
     setPolicy(bot.policy);
     setEffort(bot.model.effort ?? "");
@@ -97,6 +103,7 @@ export function AgentSettingsModal({
     (role.trim() || null) !== (bot.role ?? null) ||
     color !== (bot.color ?? AVATAR_COLORS[0]!) ||
     computersChanged ||
+    (workspaceId || null) !== (bot.workspaceId ?? null) ||
     delegates !== bot.delegates ||
     policy !== bot.policy ||
     (effort || null) !== (bot.model.effort ?? null);
@@ -198,6 +205,33 @@ export function AgentSettingsModal({
                 </p>
               )}
             </div>
+
+            <label className="field">
+              <span>Project folder</span>
+              <select
+                value={workspaceId}
+                aria-label="Agent project folder"
+                onChange={(event) => setWorkspaceId(event.target.value)}
+              >
+                <option value="">Scratch folder (no project)</option>
+                {workspaces
+                  .filter(
+                    (workspace) => !workspace.ignored && !workspace.missing,
+                  )
+                  .map((workspace) => (
+                    <option key={workspace.id} value={workspace.id}>
+                      {workspace.name}
+                    </option>
+                  ))}
+              </select>
+              <p className="computer-warning">
+                {workspaceId
+                  ? (workspaces.find(
+                      (workspace) => workspace.id === workspaceId,
+                    )?.root ?? "")
+                  : "File tools and shell run in a managed scratch folder. Add project folders in Settings → Workspaces."}
+              </p>
+            </label>
 
             <div className="field">
               <span>Delegation</span>
@@ -303,6 +337,7 @@ export function AgentSettingsModal({
                   role: role.trim() || null,
                   color,
                   computers,
+                  workspaceId: workspaceId || null,
                   delegates,
                   policy,
                   model: {
@@ -323,9 +358,11 @@ export function AgentSettingsModal({
         open={confirm === "reset"}
         title="Start fresh?"
         description={
-          !hasVm(bot)
-            ? `This permanently deletes ${bot.name}'s chat history and its workspace files on this Mac.`
-            : `This permanently deletes ${bot.name}'s chat history and everything on its computer — files, browser sign-ins, and installed software — then installs a clean system and boots it again.`
+          bot.workspaceId
+            ? `This clears ${bot.name}'s chat history and rebuilds its computer. The project folder is not touched.`
+            : !hasVm(bot)
+              ? `This permanently deletes ${bot.name}'s chat history and its workspace files on this Mac.`
+              : `This permanently deletes ${bot.name}'s chat history and everything on its computer — files, browser sign-ins, and installed software — then installs a clean system and boots it again.`
         }
         confirmLabel="Start fresh"
         onConfirm={() => {

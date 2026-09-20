@@ -107,6 +107,7 @@ export function FilesPanel({
   botId,
   computers,
   computer,
+  rootLabel: rootLabelProp,
   onComputerChange,
   active,
   listFiles,
@@ -115,6 +116,8 @@ export function FilesPanel({
   botId: string;
   computers: ComputerKind[];
   computer: ComputerKind;
+  /** Shown for the root crumb; defaults to "Workspace" on This Mac. */
+  rootLabel?: string;
   onComputerChange: (computer: ComputerKind) => void;
   active: boolean;
   listFiles: (
@@ -219,7 +222,9 @@ export function FilesPanel({
     });
   }, [path, rootPath]);
 
-  const rootLabel = computer === "mac" ? "Workspace" : "/root";
+  const rootLabel =
+    rootLabelProp ??
+    (computer === "mac" ? "Workspace" : "/root");
   const atRoot = path === rootPath;
   const previewSrc =
     preview?.kind === "image" && preview.content

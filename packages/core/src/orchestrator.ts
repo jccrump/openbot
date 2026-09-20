@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import type {
   Bot,
   ComputerKind,
@@ -21,6 +22,7 @@ import type {
   SpawnedTask,
   TaskGrantRequest,
   TaskSummary,
+  WorkspaceSummary,
 } from "./tools";
 
 const MAX_DEPTH = 1;
@@ -132,6 +134,9 @@ export class Orchestrator implements OrchestratorHandle {
 
   private roleSummary(bot: Bot): RoleSummary {
     const active = this.options.deps.store.activeTaskForRole(bot.id);
+    const workspace = bot.workspaceId
+      ? this.options.deps.store.getWorkspace(bot.workspaceId)
+      : null;
     return {
       id: bot.id,
       name: bot.name,
@@ -139,6 +144,8 @@ export class Orchestrator implements OrchestratorHandle {
       model: bot.model,
       computer: bot.computer ?? null,
       computers: bot.computers,
+      workspaceId: bot.workspaceId ?? null,
+      workspace: workspace?.name ?? null,
       delegates: bot.delegates,
       busyTaskId: active?.id ?? null,
       busyTaskTitle: active?.title ?? null,
@@ -165,6 +172,7 @@ export class Orchestrator implements OrchestratorHandle {
     instructions?: string;
     model?: ModelRef;
     computers?: ComputerKind[];
+    workspaceId?: string | null;
   }): { role: RoleSummary; created: boolean } {
     const store = this.options.deps.store;
     const caller = store.getBot(input.callerBotId);
@@ -205,8 +213,9 @@ export class Orchestrator implements OrchestratorHandle {
     ]
       .filter(Boolean)
       .join("\n\n");
-    // Workers inherit the caller's computers (ADR-021): capability follows the
-    // manager's approval instead of being chosen per worker.
+    // Workers inherit the caller's computers (ADR-021) and workspace
+    // (ADR-022): capability and project follow the manager's approval instead
+    // of being chosen per worker.
     const computers = normalizeComputers(
       input.computers ?? caller.computers,
       caller.computers,
@@ -218,6 +227,7 @@ export class Orchestrator implements OrchestratorHandle {
       kind: "role",
       role: specialty,
       computers,
+      workspaceId: input.workspaceId ?? caller.workspaceId ?? null,
       delegates: false,
     });
     this.options.emit({
@@ -236,6 +246,19 @@ export class Orchestrator implements OrchestratorHandle {
       .map((bot) => this.projectSummary(bot));
   }
 
+  listWorkspaces(): WorkspaceSummary[] {
+    const store = this.options.deps.store;
+    const bots = store.listBots();
+    return store.listWorkspaces().map((workspace) => ({
+      id: workspace.id,
+      name: workspace.name,
+      root: workspace.root,
+      markers: workspace.markers,
+      missing: !existsSync(workspace.root),
+      agentCount: bots.filter((bot) => bot.workspaceId === workspace.id).length,
+    }));
+  }
+
   createProject(input: {
     callerBotId: string;
     name: string;
@@ -243,6 +266,7 @@ export class Orchestrator implements OrchestratorHandle {
     brief?: string;
     model?: ModelRef;
     computers?: ComputerKind[];
+    workspaceId?: string | null;
   }): ProjectSummary {
     const store = this.options.deps.store;
     const caller = store.getBot(input.callerBotId);
@@ -266,6 +290,7 @@ export class Orchestrator implements OrchestratorHandle {
       avatar: "🗂️",
       color: "#2563eb",
       computers: normalizeComputers(input.computers ?? null),
+      workspaceId: input.workspaceId ?? null,
       delegates: true,
     });
     this.options.emit({

@@ -16,6 +16,7 @@ import type {
   Thread,
   ToolArtifact,
   ToolCallRecord,
+  Workspace,
 } from "@openbot/protocol";
 import { Settings } from "./Settings";
 import { AgentSettingsModal } from "./components/AgentSettingsModal";
@@ -1200,6 +1201,11 @@ export default function App() {
   const filesTarget: ComputerKind = screenBotComputers.includes(filesComputer)
     ? filesComputer
     : (screenBotComputers[0] ?? "firecracker");
+  const filesWorkspace = screenBot?.workspaceId
+    ? (daemon.workspaces.find(
+        (workspace) => workspace.id === screenBot.workspaceId,
+      ) ?? null)
+    : null;
   useEffect(() => {
     setFilesComputer(hasVm(screenBot) ? "firecracker" : "mac");
   }, [screenBot?.id]);
@@ -2094,6 +2100,9 @@ export default function App() {
                             botId={screenBot.id}
                             computers={screenBotComputers}
                             computer={filesTarget}
+                            {...(filesTarget === "mac" && filesWorkspace
+                              ? { rootLabel: filesWorkspace.name }
+                              : {})}
                             onComputerChange={setFilesComputer}
                             active={!collapsed}
                             listFiles={daemon.listFiles}
@@ -2173,6 +2182,7 @@ export default function App() {
         onClose={() => setCreateOpen(false)}
         modelOptions={daemon.modelOptions}
         selectedModel={daemon.selectedModel}
+        workspaces={daemon.workspaces}
         onCreate={daemon.createBot}
       />
 
@@ -2186,6 +2196,7 @@ export default function App() {
           settingsBotId ? (daemon.sandboxStates[settingsBotId] ?? "stopped") : "stopped"
         }
         streaming={settingsStreaming}
+        workspaces={daemon.workspaces}
         onClose={() => setSettingsBotId(null)}
         onSave={(patch) => {
           if (settingsBotId) {
@@ -2239,6 +2250,14 @@ export default function App() {
         sandboxStates={daemon.sandboxStates}
         onHireRole={() => setCreateOpen(true)}
         onEditRole={(botId) => setSettingsBotId(botId)}
+        bots={daemon.bots}
+        workspaces={daemon.workspaces}
+        workspaceRoots={daemon.workspaceRoots}
+        onScanWorkspaces={daemon.scanWorkspaces}
+        onAddWorkspace={daemon.addWorkspace}
+        onUpdateWorkspace={daemon.updateWorkspace}
+        onRemoveWorkspace={daemon.removeWorkspace}
+        onSaveWorkspaceRoots={daemon.saveWorkspaceRoots}
       />
     </div>
   );
@@ -3365,12 +3384,14 @@ function CreateAgentModal({
   onClose,
   modelOptions,
   selectedModel,
+  workspaces,
   onCreate,
 }: {
   open: boolean;
   onClose: () => void;
   modelOptions: ModelOption[];
   selectedModel: ModelRef | null;
+  workspaces: Workspace[];
   onCreate: (input: CreateBotInput) => Promise<Bot>;
 }) {
   const [name, setName] = useState("");
@@ -3379,6 +3400,7 @@ function CreateAgentModal({
   const [modelValue, setModelValue] = useState("");
   const [effort, setEffort] = useState<ReasoningEffort | "">("");
   const [computers, setComputers] = useState<ComputerKind[]>(["firecracker"]);
+  const [workspaceId, setWorkspaceId] = useState("");
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const nameRef = useRef<HTMLInputElement | null>(null);
@@ -3391,6 +3413,7 @@ function CreateAgentModal({
     setRole("");
     setColor(AVATAR_COLORS[0]!);
     setComputers(["firecracker"]);
+    setWorkspaceId("");
     setCreating(false);
     setError(null);
     const preferred = selectedModel ?? null;
@@ -3439,6 +3462,7 @@ function CreateAgentModal({
           ? { model: { provider, model, ...(effort ? { effort } : {}) } }
           : {}),
         computers,
+        ...(workspaceId ? { workspaceId } : {}),
       });
       onClose();
     } catch (err) {
@@ -3563,6 +3587,34 @@ function CreateAgentModal({
               </p>
             )}
           </div>
+
+          <label className="field">
+            <span>Project folder</span>
+            <select
+              value={workspaceId}
+              onChange={(event) => setWorkspaceId(event.target.value)}
+              aria-label="Agent project folder"
+            >
+              <option value="">Scratch folder (no project)</option>
+              {workspaces
+                .filter((workspace) => !workspace.ignored && !workspace.missing)
+                .map((workspace) => (
+                  <option key={workspace.id} value={workspace.id}>
+                    {workspace.name}
+                  </option>
+                ))}
+            </select>
+            {workspaceId ? (
+              <p className="computer-warning">
+                {workspaces.find((workspace) => workspace.id === workspaceId)
+                  ?.root ?? ""}
+              </p>
+            ) : (
+              <p className="computer-warning">
+                Manage project folders in Settings → Workspaces.
+              </p>
+            )}
+          </label>
 
           {error && <div className="form-error">{error}</div>}
         </div>

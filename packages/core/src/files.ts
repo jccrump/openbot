@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import type { Bot, ComputerKind } from "@openbot/protocol";
+import type { Bot, ComputerKind, Workspace } from "@openbot/protocol";
 import type { SandboxBackend } from "@openbot/sandbox";
 import { ensureWorkspace, resolveWorkspacePath } from "./local-computer";
 import {
@@ -7,6 +7,7 @@ import {
   type RawExecResult,
   type ToolContext,
 } from "./tools";
+import { workspaceGuestRoot } from "./workspaces";
 
 export interface FileEntryInfo {
   name: string;
@@ -38,6 +39,8 @@ export interface FileServiceOptions {
   artifactsDir: string;
   sandbox: SandboxBackend | null;
   getBot(botId: string): Bot | null;
+  /** The workspace registry, when the caller has one (older callers may not). */
+  getWorkspace?(workspaceId: string): Workspace | null;
 }
 
 const DEFAULT_CAP = 500;
@@ -57,8 +60,27 @@ function computerFor(bot: Bot, requested?: ComputerKind | null): ComputerKind {
   return isMacBot(bot) ? "mac" : "firecracker";
 }
 
-function workspaceFor(options: FileServiceOptions, bot: Bot): string {
-  return ensureWorkspace(join(options.dataDir, "workspaces", bot.id));
+function scratchDir(options: FileServiceOptions, bot: Bot): string {
+  return join(options.dataDir, "workspaces", bot.id);
+}
+
+function workspaceFor(options: FileServiceOptions, bot: Bot): Workspace | null {
+  if (!bot.workspaceId || !options.getWorkspace) {
+    return null;
+  }
+  return options.getWorkspace(bot.workspaceId);
+}
+
+/** The Mac folder file tools are confined to: the project, or the scratch folder. */
+function macRoot(options: FileServiceOptions, bot: Bot): string {
+  const workspace = workspaceFor(options, bot);
+  return workspace ? workspace.root : ensureWorkspace(scratchDir(options, bot));
+}
+
+/** The microVM folder relative paths start from for this agent. */
+function guestRoot(options: FileServiceOptions, bot: Bot): string {
+  const workspace = workspaceFor(options, bot);
+  return workspace ? workspaceGuestRoot(workspace) : "/root";
 }
 
 function helperContext(
@@ -71,7 +93,8 @@ function helperContext(
     computer,
     computers: bot.computers,
     sandbox: options.sandbox,
-    workspaceDir: join(options.dataDir, "workspaces", bot.id),
+    workspaceDir: macRoot(options, bot),
+    ...(computer === "mac" ? {} : { guestCwd: guestRoot(options, bot) }),
     artifactsDir: options.artifactsDir,
     decision: null,
     vision: false,
@@ -89,20 +112,16 @@ async function resolveTarget(
   rawPath: string,
   computer: ComputerKind,
 ): Promise<{ path: string; error: string | null }> {
-  const fallback =
-    computer === "mac"
-      ? join(options.dataDir, "workspaces", bot.id)
-      : "/root";
+  const fallback = computer === "mac" ? macRoot(options, bot) : guestRoot(options, bot);
   const target = rawPath.trim() || fallback;
   if (computer === "mac") {
-    const root = workspaceFor(options, bot);
-    const resolved = resolveWorkspacePath(root, target);
+    const resolved = resolveWorkspacePath(macRoot(options, bot), target);
     if (resolved.error || !resolved.path) {
       return { path: target, error: resolved.error ?? "invalid path" };
     }
     return { path: resolved.path, error: null };
   }
-  const path = target.startsWith("/") ? target : join("/root", target);
+  const path = target.startsWith("/") ? target : join(guestRoot(options, bot), target);
   if (!options.sandbox) {
     return { path, error: "sandbox is not available" };
   }

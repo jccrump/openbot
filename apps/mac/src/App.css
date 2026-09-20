@@ -2926,6 +2926,148 @@ body.resizing-rows .screen-panel * {
   padding: 14px 16px;
 }
 
+/* Workspace registry in Settings: folder, root path, markers, agents. */
+.workspace-entry {
+  border-bottom: 0.5px solid var(--hairline);
+}
+
+.workspace-entry:last-child {
+  border-bottom: none;
+}
+
+.workspace-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+}
+
+.workspace-row-ignored {
+  opacity: 0.55;
+}
+
+.workspace-trust {
+  padding: 0 14px 12px;
+}
+
+.workspace-trust textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border-radius: 9px;
+  border: 0.5px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  resize: vertical;
+}
+
+.workspace-trust textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.workspace-trust-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.workspace-trust .settings-note {
+  padding: 8px 0 0;
+}
+
+.workspace-row-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+
+.workspace-row-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.workspace-badge {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--hover);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.workspace-row-root {
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-row-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.workspace-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.workspace-root-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 0.5px solid var(--hairline);
+}
+
+.workspace-root-row:last-of-type {
+  border-bottom: none;
+}
+
+.workspace-add-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+}
+
+.workspace-add-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  border-radius: 9px;
+  border: 0.5px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.workspace-add-row input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.settings-card .settings-note {
+  padding: 0 14px 12px;
+}
+
 /* Team roster in Settings: color dot, name, model, computer. */
 .team-row {
   display: flex;

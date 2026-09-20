@@ -1215,6 +1215,28 @@ silently defaulting managers to the microVM (the user asked to be asked);
 workers choosing their own computer (capability should follow the manager's
 approval).
 
+**ADR-022: Workspaces map local projects; agents reference them by id.** The
+daemon keeps a registry of local project folders — name, root, detected markers
+(`.git`, `package.json`, `pnpm-workspace.yaml`, `Cargo.toml`, …), and an ignored
+flag. Scan roots are user data, seeded from conventional developer folders and
+editable in Settings → Workspaces; a scan walks them breadth-first, registers
+marker directories, stops at a project root, skips build directories and
+`node_modules`, and never follows symlinks. Discovery only proposes: a folder
+becomes reachable when it is registered, and ignoring one keeps a scan from
+re-adding it. An agent assigned a workspace roots its file tools and shell in
+the project folder (still realpath-confined) instead of a managed scratch
+folder; on the microVM the same workspace maps to `/root/projects/<slug>`, so
+one registry row describes both computers. The lead sees the registry with
+`list_workspaces` and passes a workspace to `create_project`; workers inherit
+the manager's, and removing a workspace clears it from its agents without
+touching the folder. A workspace also carries trusted shell command patterns: a
+matching command runs without an approval card, while the built-in deny rules
+and any ask rule still win, and file writes keep asking. Rejected: pointing
+agents at raw paths (paths drift, no allowlist, nothing to show in the UI);
+auto-assigning every discovered folder (agents would silently gain access to
+unrelated repos); deleting the project folder on Start fresh (only the scratch
+folder and the computer are rebuilt).
+
 **ADR-017 amendment: memory and soul adapt automatically, but stay legible.**
 The user asked for memory and soul to change over time without being told to,
 so reflection is automatic: a background pass extracts durable memories from

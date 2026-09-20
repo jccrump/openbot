@@ -150,6 +150,20 @@ export function openDatabase(dataDir: string): DatabaseSync {
       ON approvals(request_id);
     CREATE INDEX IF NOT EXISTS idx_approvals_time
       ON approvals(requested_at);
+
+    CREATE TABLE IF NOT EXISTS workspaces (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      root TEXT NOT NULL,
+      markers TEXT NOT NULL DEFAULT '[]',
+      ignored INTEGER NOT NULL DEFAULT 0,
+      settings TEXT,
+      created_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_root
+      ON workspaces(root);
   `);
 
   const columns = db
@@ -219,6 +233,16 @@ export function openDatabase(dataDir: string): DatabaseSync {
   }
   if (!botColumnNames.has("computers")) {
     db.exec("ALTER TABLE bots ADD COLUMN computers TEXT");
+  }
+  if (!botColumnNames.has("workspace_id")) {
+    db.exec("ALTER TABLE bots ADD COLUMN workspace_id TEXT");
+  }
+
+  const workspaceColumns = db
+    .prepare("PRAGMA table_info(workspaces)")
+    .all() as unknown as Array<{ name: string }>;
+  if (!workspaceColumns.some((column) => column.name === "settings")) {
+    db.exec("ALTER TABLE workspaces ADD COLUMN settings TEXT");
   }
   if (!botColumnNames.has("kind")) {
     db.exec("ALTER TABLE bots ADD COLUMN kind TEXT NOT NULL DEFAULT 'role'");

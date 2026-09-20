@@ -255,6 +255,16 @@ when the Codex CLI is on `PATH`.
   `GET /vms/<id>/network`) for auditing or offline grading.
 - **Local-Mac computers**: shell as your user and file tools confined to the
   agent's workspace, always approval-gated.
+- **Workspaces**: a local project registry. The daemon scans conventional dev
+  folders (or ones you add in **Settings → Workspaces**) for project markers,
+  registers each repo once, and lets you assign it to an agent. An agent with a
+  workspace roots its file tools and shell in that project folder — on the
+  microVM the same project maps to `/root/projects/<name>` — the lead can list
+  and route to workspaces, and workers inherit their manager's. Each workspace
+  can carry trusted shell command patterns (for example `^pnpm typecheck$`) so
+  routine commands in a repo you trust skip the approval card — deny rules and
+  ask rules still win, and file writes keep asking. Discovery only proposes:
+  nothing is reachable until you register it.
 - **Host-side web search**: a `web_search` tool queries the live web through
   Exa (keyless) or Parallel and returns page content with titles and URLs for
   citation. It runs in the daemon, not the microVM, so it works on any
@@ -439,15 +449,36 @@ Layout:
 - `packages/protocol` — shared Zod schemas for the daemon/UI protocol
 - `docs/research` — background research on production computer-use agents
 
+### Working on OpenBot with OpenBot
+
+The registry exists so an agent can work in this repo:
+
+1. **Settings → Workspaces** → **Scan now**: `open-bot` shows up under your dev
+   root (add a scan root if it does not), or add the folder by path.
+2. **Settings → Team → Hire a role**: pick **This Mac**, then the `open-bot`
+   project folder. The agent's shell and file tools now start in the repo.
+3. **Workspaces → Trust** on `open-bot`: add patterns such as
+   `^pnpm (typecheck|smoke|code-tools:smoke|websearch:smoke)$` and
+   `^git (status|diff|log)$` so routine commands skip the approval card. Deny
+   rules still win and file writes keep asking.
+
+If the daemon runs with `tsx watch` (`pnpm dev:daemon`), an edit under
+`packages/core` restarts it and kills the agent's in-flight turn — point the
+agent at a `git worktree` instead, or run the daemon without watch
+(`pnpm --filter @openbot/core start`). App source hot-reloads in the browser;
+the Tauri window needs `pnpm dev:mac` to rebuild.
+
 ## Security
 
 Single-user by design. The daemon binds `127.0.0.1` only, bot computers are
 isolated microVMs, API keys live in the data directory (`0600` inside a `0700`
 directory) or your environment, and commands require approval by default. The
 sandbox is a real boundary: the model can only touch its own microVM. Local-Mac
-agents are the exception — they run as you, restricted to their workspace for
-file tools, and always require approval. There is no per-bot network policy yet,
-so treat microVMs as sharing one network with your Mac.
+agents are the exception — they run as you, restricted to their registered
+project folder (or a managed scratch folder) for file tools, and always require
+approval unless the project's trust patterns allow a command. There is no
+per-bot network policy yet, so treat microVMs as sharing one network with your
+Mac.
 
 ## License
 

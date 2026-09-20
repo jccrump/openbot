@@ -5,11 +5,12 @@ import { providerPresetList } from "@openbot/gateway";
 import { HttpSandboxBackend } from "@openbot/sandbox";
 import { ApprovalBroker } from "../approvals";
 import { ChallengeBroker } from "../challenges";
-import { loadConfig } from "../config";
+import { loadConfig, defaultWorkspaceRoots } from "../config";
 import { openDatabase } from "../db";
 import { ProviderRegistry } from "../provider-registry";
 import { createDaemon } from "../server";
 import { Store } from "../store";
+import { WorkspaceService } from "../workspaces";
 
 for (const candidate of [
   join(process.cwd(), ".env"),
@@ -46,6 +47,7 @@ const sandbox = new HttpSandboxBackend({
 });
 const approvals = new ApprovalBroker({ store });
 const challenges = new ChallengeBroker();
+const workspaces = new WorkspaceService(store, config.workspaceRoots);
 const daemon = createDaemon({
   config,
   store,
@@ -54,6 +56,7 @@ const daemon = createDaemon({
   approvals,
   challenges,
   presets: providerPresetList(),
+  workspaces,
 });
 const { port } = await daemon.start();
 

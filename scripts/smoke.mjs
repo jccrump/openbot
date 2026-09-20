@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -11,6 +18,23 @@ const root = resolve(import.meta.dirname, "..");
 const requireFromCore = createRequire(join(root, "packages/core/package.json"));
 const { WebSocketServer } = requireFromCore("ws");
 const dataDir = mkdtempSync(join(tmpdir(), "openbot-smoke-"));
+
+// A fake developer folder for the workspace registry: one project at the root
+// and one nested, plus a node_modules package that must not be registered.
+const workspaceScanRoot = mkdtempSync(join(tmpdir(), "openbot-workspaces-"));
+const sampleWorkspaceRoot = join(workspaceScanRoot, "Sample Project");
+const nestedWorkspaceRoot = join(workspaceScanRoot, "Tools", "Nested App");
+mkdirSync(join(sampleWorkspaceRoot, ".git"), { recursive: true });
+writeFileSync(join(sampleWorkspaceRoot, "package.json"), "{}\n");
+mkdirSync(join(nestedWorkspaceRoot, ".git"), { recursive: true });
+mkdirSync(join(workspaceScanRoot, "node_modules", "fake-pkg"), {
+  recursive: true,
+});
+writeFileSync(
+  join(workspaceScanRoot, "node_modules", "fake-pkg", "package.json"),
+  "{}\n",
+);
+const manualWorkspaceRoot = mkdtempSync(join(tmpdir(), "openbot-manual-"));
 
 function readBody(request) {
   return new Promise((resolvePromise) => {
@@ -519,6 +543,16 @@ const mockModelServer = createServer(async (request, response) => {
           "[system] Your last reply contained raw tool-call markup",
         )
         ? { name: "shell", args: { command: "uname -a" } }
+        : last.content.startsWith("write-note:")
+        ? {
+            name: "write_file",
+            args: {
+              path: "note-from-agent.txt",
+              content: last.content.slice("write-note:".length).trim() || "hi",
+            },
+          }
+        : last.content.startsWith("read-outside:")
+        ? { name: "read_file", args: { path: "/etc/hosts" } }
         : last.content.startsWith("run-mac:")
         ? {
             name: "shell",
@@ -1296,6 +1330,7 @@ const daemon = spawn(
       OPENBOT_DATA_DIR: dataDir,
       OPENBOT_PORT: "0",
       OPENBOT_SANDBOX_URL: `http://127.0.0.1:${sandboxPort}`,
+      OPENBOT_WORKSPACE_ROOTS: workspaceScanRoot,
       MOCK_API_KEY: "smoke-test-key",
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -3855,8 +3890,298 @@ try {
     "the fresh turn runs on the same thread",
   );
 
+  // Workspaces: the daemon maps local project folders, and an agent assigned
+  // to one roots its file tools and shell in the project (ADR-022).
+  const wsMarker = received.length;
+  socket.send(JSON.stringify({ type: "workspaces.scan" }));
+  const wsScanned = await waitForSince(
+    wsMarker,
+    (item) => item.type === "workspaces",
+  );
+  assert.deepEqual(wsScanned.roots, [workspaceScanRoot]);
+  const sample = wsScanned.workspaces.find(
+    (workspace) => workspace.root === sampleWorkspaceRoot,
+  );
+  assert.ok(sample, "scan should register the sample project");
+  assert.deepEqual(
+    sample.markers,
+    [".git", "package.json"],
+    "the detected markers should be recorded",
+  );
+  assert.ok(
+    wsScanned.workspaces.some(
+      (workspace) => workspace.root === nestedWorkspaceRoot,
+    ),
+    "scan should register nested projects",
+  );
+  assert.equal(
+    wsScanned.workspaces.some((workspace) =>
+      workspace.root.includes("node_modules"),
+    ),
+    false,
+    "scan must skip node_modules",
+  );
+
+  socket.send(
+    JSON.stringify({ type: "workspaces.add", root: manualWorkspaceRoot }),
+  );
+  const wsAdded = await waitForSince(
+    wsMarker,
+    (item) =>
+      item.type === "workspaces" &&
+      item.workspaces.some(
+        (workspace) => workspace.root === manualWorkspaceRoot,
+      ),
+  );
+  const manual = wsAdded.workspaces.find(
+    (workspace) => workspace.root === manualWorkspaceRoot,
+  );
+  assert.equal(manual.ignored, false, "an added folder is active");
+  socket.send(
+    JSON.stringify({
+      type: "workspaces.update",
+      workspaceId: manual.id,
+      ignored: true,
+    }),
+  );
+  await waitForSince(
+    wsMarker,
+    (item) =>
+      item.type === "workspaces" &&
+      item.workspaces.some(
+        (workspace) => workspace.id === manual.id && workspace.ignored === true,
+      ),
+  );
+  socket.send(
+    JSON.stringify({ type: "workspaces.remove", workspaceId: manual.id }),
+  );
+  await waitForSince(
+    wsMarker,
+    (item) =>
+      item.type === "workspaces" &&
+      !item.workspaces.some((workspace) => workspace.id === manual.id),
+  );
+
+  socket.send(
+    JSON.stringify({
+      type: "bots.create",
+      requestId: "bot-workspace-1",
+      name: "Repo Worker",
+      computer: "mac",
+      workspaceId: sample.id,
+    }),
+  );
+  const repoBot = await waitFor("bot.created");
+  assert.equal(repoBot.bot.workspaceId, sample.id);
+
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId: repoBot.bot.id,
+      text: "run: pwd",
+    }),
+  );
+  const repoApproval = await waitFor("approval.request");
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: repoApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const repoPwd = await waitFor("tool.result");
+  assert.equal(repoPwd.ok, true);
+  assert.ok(
+    repoPwd.output.includes(sampleWorkspaceRoot),
+    "the shell should start in the project folder",
+  );
+  await waitFor("chat.done");
+
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId: repoBot.bot.id,
+      text: "write-note: hello workspace",
+    }),
+  );
+  const noteApproval = await waitFor("approval.request");
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: noteApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const noteResult = await waitFor("tool.result");
+  assert.equal(noteResult.ok, true);
+  assert.equal(
+    readFileSync(join(sampleWorkspaceRoot, "note-from-agent.txt"), "utf8"),
+    "hello workspace",
+    "write_file should write inside the project folder",
+  );
+  await waitFor("chat.done");
+
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId: repoBot.bot.id,
+      text: "read-outside:",
+    }),
+  );
+  const outsideApproval = await waitFor("approval.request");
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: outsideApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const outsideResult = await waitFor("tool.result");
+  assert.equal(outsideResult.ok, false);
+  assert.match(
+    outsideResult.output,
+    /escapes the bot workspace/,
+    "file tools must stay inside the project folder",
+  );
+  await waitFor("chat.done");
+
+  // Trusted commands: a workspace pattern auto-approves matching shell calls,
+  // but a deny rule still wins. The deny rule is installed here so the test
+  // does not depend on whatever policy earlier sections left behind.
+  socket.send(
+    JSON.stringify({
+      type: "settings.update",
+      settings: {
+        policy: {
+          timeoutMs: 60_000,
+          defaultTier: "ask",
+          tools: {},
+          rules: [
+            {
+              id: "test-deny-trusted",
+              tool: "shell",
+              scope: "*",
+              match: "command",
+              pattern: "^trusted-echo$",
+              tier: "deny",
+              note: "workspace trust precedence test",
+            },
+          ],
+        },
+      },
+    }),
+  );
+  await waitFor("providers.updated");
+  socket.send(
+    JSON.stringify({
+      type: "workspaces.update",
+      workspaceId: sample.id,
+      autoApprove: ["^pwd$", "^trusted-echo$"],
+    }),
+  );
+  await waitForSince(
+    wsMarker,
+    (item) =>
+      item.type === "workspaces" &&
+      item.workspaces.some(
+        (workspace) =>
+          workspace.id === sample.id &&
+          workspace.autoApprove.includes("^pwd$"),
+      ),
+  );
+  const trustedMarker = received.length;
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId: repoBot.bot.id,
+      text: "run: pwd",
+    }),
+  );
+  const trustedResult = await waitForSince(
+    trustedMarker,
+    (item) => item.type === "tool.result",
+  );
+  assert.equal(trustedResult.ok, true);
+  assert.equal(
+    received
+      .slice(trustedMarker)
+      .some((item) => item.type === "approval.request"),
+    false,
+    "a trusted command should not ask",
+  );
+  await waitForSince(trustedMarker, (item) => item.type === "chat.done");
+
+  const trustDeniedMarker = received.length;
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId: repoBot.bot.id,
+      text: "run: trusted-echo",
+    }),
+  );
+  const trustDeniedResult = await waitForSince(
+    trustDeniedMarker,
+    (item) => item.type === "tool.result",
+  );
+  assert.equal(trustDeniedResult.ok, false);
+  assert.match(trustDeniedResult.output, /Blocked by the approvals policy/);
+  assert.equal(
+    received
+      .slice(trustDeniedMarker)
+      .some((item) => item.type === "approval.request"),
+    false,
+    "a deny rule should beat a workspace trust pattern",
+  );
+  await waitForSince(trustDeniedMarker, (item) => item.type === "chat.done");
+
+  // A worker inherits its caller's workspace.
+  socket.send(
+    JSON.stringify({
+      type: "bots.update",
+      requestId: "lead-workspace-1",
+      botId,
+      workspaceId: sample.id,
+    }),
+  );
+  await waitFor("bot.updated");
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId,
+      text: "create-worker: Repo Helper :: edits the registered repo",
+    }),
+  );
+  const repoWorkerApproval = await waitFor("approval.request");
+  assert.equal(repoWorkerApproval.name, "create_worker");
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: repoWorkerApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const repoWorker = await waitForWhere(
+    (item) =>
+      item.type === "bot.created" && item.bot.name === "Repo Helper",
+  );
+  assert.equal(
+    repoWorker.bot.workspaceId,
+    sample.id,
+    "a worker should inherit the caller's workspace",
+  );
+  socket.send(
+    JSON.stringify({
+      type: "bots.update",
+      requestId: "lead-workspace-2",
+      botId,
+      workspaceId: null,
+    }),
+  );
+  await waitFor("bot.updated");
+  await waitForLeadQuiet();
+
   console.log(
-    `SMOKE OK — text chat, single thread per bot, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), dual-computer routing (per-call computer argument, microVM default, Mac opt-in, unavailable computer rejected), agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, lead delegation (spawn_worker, task grant, in-grant tools without re-approval, out-of-grant escalation and denial, task result + evidence + usage, lead notification), dynamic team building (create_worker, immediate delegation to the new worker, duplicate-name reuse), projects (lead creates a persistent manager, list_projects routing, ask_project request on the project thread, worker sessions in the project computer with their own browser, project survives and is reused), per-task computers (own sandbox id, concurrency cap and queueing, destroyed on settle), memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-role narrowing, egress allowlist), Jev routing (conversation runs without tools, a named project gets the routing hint), harness robustness (list_dir, shell output spill, shell background, browser press/select/wait_for/snapshot/tabs/upload/downloads, duplicate-failure stop, raw-markup retry, changed-file metadata), context discipline (unchanged reads and identical results collapse), working plan (update_plan persists and is injected), output screening (injected instructions in shell output are annotated), busy-turn delivery (queue waits for the stop, steer redirects the running turn, persisted default), chat clear (transcript archived in place, title reset, fresh turn on the same thread)`,
+    `SMOKE OK — text chat, single thread per bot, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), dual-computer routing (per-call computer argument, microVM default, Mac opt-in, unavailable computer rejected), workspace registry (scan roots, marker detection, node_modules skipped, add/ignore/remove, shell and file tools rooted in the project, escape rejected, trusted commands with deny precedence, worker inheritance), agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, lead delegation (spawn_worker, task grant, in-grant tools without re-approval, out-of-grant escalation and denial, task result + evidence + usage, lead notification), dynamic team building (create_worker, immediate delegation to the new worker, duplicate-name reuse), projects (lead creates a persistent manager, list_projects routing, ask_project request on the project thread, worker sessions in the project computer with their own browser, project survives and is reused), per-task computers (own sandbox id, concurrency cap and queueing, destroyed on settle), memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-role narrowing, egress allowlist), Jev routing (conversation runs without tools, a named project gets the routing hint), harness robustness (list_dir, shell output spill, shell background, browser press/select/wait_for/snapshot/tabs/upload/downloads, duplicate-failure stop, raw-markup retry, changed-file metadata), context discipline (unchanged reads and identical results collapse), working plan (update_plan persists and is injected), output screening (injected instructions in shell output are annotated), busy-turn delivery (queue waits for the stop, steer redirects the running turn, persisted default), chat clear (transcript archived in place, title reset, fresh turn on the same thread)`,
   );
 } finally {
   socket?.close();
@@ -3866,4 +4191,6 @@ try {
   mockVnc.close();
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 200));
   rmSync(dataDir, { recursive: true, force: true });
+  rmSync(workspaceScanRoot, { recursive: true, force: true });
+  rmSync(manualWorkspaceRoot, { recursive: true, force: true });
 }

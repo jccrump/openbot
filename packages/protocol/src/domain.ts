@@ -45,6 +45,30 @@ export type BotKind = z.infer<typeof BotKindSchema>;
 export const ComputerKindSchema = z.enum(["firecracker", "mac"]);
 export type ComputerKind = z.infer<typeof ComputerKindSchema>;
 
+/**
+ * A local project folder the daemon knows about. Agents reference a workspace
+ * by id instead of a path, so moving a repo updates one row and every agent
+ * follows. The registry is the allowlist: an agent's file tools are confined
+ * to its workspace root.
+ */
+export const WorkspaceSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  root: z.string(),
+  markers: z.array(z.string()).default([]),
+  ignored: z.boolean().default(false),
+  /** The root no longer exists on disk; kept so the user can fix or remove it. */
+  missing: z.boolean().default(false),
+  /**
+   * Shell command patterns auto-approved for agents working in this project.
+   * Trust is per repo: a deny rule or an ask rule still wins.
+   */
+  autoApprove: z.array(z.string()).default([]),
+  createdAt: z.string(),
+  lastSeenAt: z.string(),
+});
+export type Workspace = z.infer<typeof WorkspaceSchema>;
+
 export const BotSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -58,6 +82,8 @@ export const BotSchema = z.object({
   /** @deprecated use computers; kept so older clients and rows still parse. */
   computer: z.string().nullable().optional(),
   computers: z.array(ComputerKindSchema).default(["firecracker"]),
+  /** The project folder this agent works in; unset means a managed scratch folder. */
+  workspaceId: z.string().nullable().optional(),
   delegates: z.boolean().default(false),
   policy: RolePolicySchema.default("inherit"),
 });

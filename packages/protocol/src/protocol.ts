@@ -26,6 +26,7 @@ import {
   TaskSchema,
   ThreadSchema,
   ToolArtifactSchema,
+  WorkspaceSchema,
 } from "./domain";
 
 export const FileEntrySchema = z.object({
@@ -52,6 +53,7 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     /** @deprecated use computers. */
     computer: ComputerKindSchema.optional(),
     computers: z.array(ComputerKindSchema).optional(),
+    workspaceId: z.string().optional(),
     delegates: z.boolean().optional(),
     policy: RolePolicySchema.optional(),
   }),
@@ -66,6 +68,7 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     /** @deprecated use computers. */
     computer: ComputerKindSchema.optional(),
     computers: z.array(ComputerKindSchema).optional(),
+    workspaceId: z.string().nullable().optional(),
     delegates: z.boolean().optional(),
     policy: RolePolicySchema.optional(),
     model: ModelRefSchema.optional(),
@@ -105,6 +108,31 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("bots.reset"),
     requestId: z.string(),
     botId: z.string(),
+  }),
+  z.object({
+    type: z.literal("workspaces.list"),
+  }),
+  z.object({
+    type: z.literal("workspaces.scan"),
+  }),
+  z.object({
+    type: z.literal("workspaces.add"),
+    root: z.string().min(1),
+  }),
+  z.object({
+    type: z.literal("workspaces.update"),
+    workspaceId: z.string(),
+    name: z.string().min(1).optional(),
+    ignored: z.boolean().optional(),
+    autoApprove: z.array(z.string()).optional(),
+  }),
+  z.object({
+    type: z.literal("workspaces.remove"),
+    workspaceId: z.string(),
+  }),
+  z.object({
+    type: z.literal("workspaces.roots"),
+    roots: z.array(z.string()),
   }),
   z.object({
     type: z.literal("chat.send"),
@@ -249,6 +277,8 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     decision: DecisionInfoSchema.optional(),
     codex: CodexInfoSchema.optional(),
     chatBusyBehavior: ChatBusyBehaviorSchema.optional(),
+    workspaces: z.array(WorkspaceSchema).optional(),
+    workspaceRoots: z.array(z.string()).optional(),
   }),
   z.object({
     type: z.literal("bot.created"),
@@ -301,6 +331,11 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("threads"),
     threads: z.array(ThreadSchema),
+  }),
+  z.object({
+    type: z.literal("workspaces"),
+    workspaces: z.array(WorkspaceSchema),
+    roots: z.array(z.string()),
   }),
   z.object({
     type: z.literal("thread.messages"),

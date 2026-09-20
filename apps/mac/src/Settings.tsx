@@ -11,10 +11,17 @@ import type {
   ModelRef,
   ProviderInfo,
   ProviderPreset,
+  Workspace,
 } from "@openbot/protocol";
 import type { Bot } from "@openbot/protocol";
 import { HarnessLogo, ProviderLogo } from "./components/ProviderLogo";
-import { avatarColor, COMPUTER_LABEL, effortLabel } from "./lib/agentOptions";
+import {
+  avatarColor,
+  COMPUTER_LABEL,
+  effortLabel,
+  hasMac,
+  hasVm,
+} from "./lib/agentOptions";
 import type { DaemonStatus } from "./lib/daemon";
 import type { ThemePreference } from "./lib/useTheme";
 import type {
@@ -59,6 +66,17 @@ interface SettingsProps {
   sandboxStates: Record<string, SandboxState>;
   onHireRole: () => void;
   onEditRole: (botId: string) => void;
+  bots: Bot[];
+  workspaces: Workspace[];
+  workspaceRoots: string[];
+  onScanWorkspaces: () => void;
+  onAddWorkspace: (root: string) => void;
+  onUpdateWorkspace: (
+    workspaceId: string,
+    patch: { name?: string; ignored?: boolean; autoApprove?: string[] },
+  ) => void;
+  onRemoveWorkspace: (workspaceId: string) => void;
+  onSaveWorkspaceRoots: (roots: string[]) => void;
 }
 
 interface FormState {
@@ -83,6 +101,7 @@ type SectionId =
   | "appearance"
   | "providers"
   | "team"
+  | "workspaces"
   | "harness"
   | "decision";
 
@@ -99,6 +118,7 @@ const SECTION_LABEL: Record<SectionId, string> = {
   appearance: "Appearance",
   providers: "Providers",
   team: "Team",
+  workspaces: "Workspaces",
   harness: "Harness",
   decision: "Decision model",
 };
@@ -276,6 +296,25 @@ function PlusIcon() {
   );
 }
 
+function WorkspacesIcon() {
+  return (
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+      <path d="M3 11h18" />
+    </svg>
+  );
+}
+
 const NAV_ITEMS: Array<{
   id: SectionId;
   label: string;
@@ -285,6 +324,7 @@ const NAV_ITEMS: Array<{
   { id: "appearance", label: "Appearance", icon: AppearanceIcon },
   { id: "providers", label: "Providers", icon: ProvidersIcon },
   { id: "team", label: "Team", icon: TeamIcon },
+  { id: "workspaces", label: "Workspaces", icon: WorkspacesIcon },
   { id: "harness", label: "Harness", icon: HarnessIcon },
   { id: "decision", label: "Decision model", icon: DecisionIcon },
 ];
@@ -306,6 +346,12 @@ export function Settings(props: SettingsProps) {
     testing: boolean;
     result: DecisionTestResult | null;
   }>({ testing: false, result: null });
+  const [rootInput, setRootInput] = useState("");
+  const [folderInput, setFolderInput] = useState("");
+  const [trustEditor, setTrustEditor] = useState<{
+    id: string;
+    text: string;
+  } | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -315,6 +361,9 @@ export function Settings(props: SettingsProps) {
       setSearch("");
       setFetchState({ loading: false, error: null });
       setDecisionForm(null);
+      setRootInput("");
+      setFolderInput("");
+      setTrustEditor(null);
     }
   }, [open]);
 
@@ -960,15 +1009,250 @@ export function Settings(props: SettingsProps) {
                           </span>
                         </span>
                         <span className="team-row-state">
-                          {role.computer === "mac"
+                          {!hasVm(role)
                             ? "This Mac"
-                            : COMPUTER_LABEL[state] ?? state}
+                            : hasMac(role)
+                              ? "Both"
+                              : COMPUTER_LABEL[state] ?? state}
                         </span>
                       </button>
                     );
                   })
                 )}
               </section>
+            )}
+
+            {section === "workspaces" && (
+              <>
+                <section className="settings-card">
+                  <div className="settings-row">
+                    <span>Project folders</span>
+                    <button
+                      className="ghost-button"
+                      onClick={() => props.onScanWorkspaces()}
+                    >
+                      Scan now
+                    </button>
+                  </div>
+                  {props.workspaces.length === 0 ? (
+                    <p className="settings-empty">
+                      No project folders yet. Add a scan root below and press
+                      Scan now, or add a folder by path.
+                    </p>
+                  ) : (
+                    props.workspaces.map((workspace) => {
+                      const agentCount = props.bots.filter(
+                        (bot) => bot.workspaceId === workspace.id,
+                      ).length;
+                      const editingTrust = trustEditor?.id === workspace.id;
+                      return (
+                        <div key={workspace.id} className="workspace-entry">
+                          <div
+                            className={`workspace-row${
+                              workspace.ignored ? " workspace-row-ignored" : ""
+                            }`}
+                          >
+                            <div className="workspace-row-body">
+                              <span className="workspace-row-name">
+                                {workspace.name}
+                                {workspace.missing && (
+                                  <span className="workspace-badge">
+                                    missing
+                                  </span>
+                                )}
+                                {workspace.ignored && (
+                                  <span className="workspace-badge">
+                                    ignored
+                                  </span>
+                                )}
+                              </span>
+                              <span
+                                className="workspace-row-root"
+                                title={workspace.root}
+                              >
+                                {workspace.root}
+                              </span>
+                              <span className="workspace-row-meta">
+                                {workspace.markers.join(" · ")}
+                                {agentCount > 0
+                                  ? `${
+                                      workspace.markers.length > 0 ? " · " : ""
+                                    }${agentCount} agent${
+                                      agentCount === 1 ? "" : "s"
+                                    }`
+                                  : ""}
+                                {workspace.autoApprove.length > 0
+                                  ? `${
+                                      workspace.markers.length > 0 ||
+                                      agentCount > 0
+                                        ? " · "
+                                        : ""
+                                    }${workspace.autoApprove.length} trusted`
+                                  : ""}
+                              </span>
+                            </div>
+                            <div className="workspace-row-actions">
+                              <button
+                                className="ghost-button"
+                                onClick={() =>
+                                  setTrustEditor(
+                                    editingTrust
+                                      ? null
+                                      : {
+                                          id: workspace.id,
+                                          text: workspace.autoApprove.join("\n"),
+                                        },
+                                  )
+                                }
+                              >
+                                Trust
+                              </button>
+                              <button
+                                className="ghost-button"
+                                onClick={() =>
+                                  props.onUpdateWorkspace(workspace.id, {
+                                    ignored: !workspace.ignored,
+                                  })
+                                }
+                              >
+                                {workspace.ignored ? "Unignore" : "Ignore"}
+                              </button>
+                              <button
+                                className="danger-button"
+                                onClick={() =>
+                                  props.onRemoveWorkspace(workspace.id)
+                                }
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          </div>
+                          {editingTrust && (
+                            <div className="workspace-trust">
+                              <textarea
+                                value={trustEditor.text}
+                                onChange={(event) =>
+                                  setTrustEditor({
+                                    id: workspace.id,
+                                    text: event.target.value,
+                                  })
+                                }
+                                placeholder={
+                                  "^pnpm (typecheck|smoke)$\n^git status$"
+                                }
+                                aria-label={`Trusted commands for ${workspace.name}`}
+                                spellCheck={false}
+                                rows={4}
+                              />
+                              <div className="workspace-trust-actions">
+                                <button
+                                  className="ghost-button"
+                                  onClick={() => setTrustEditor(null)}
+                                >
+                                  Cancel
+                                </button>
+                                <button
+                                  className="save-button"
+                                  onClick={() => {
+                                    props.onUpdateWorkspace(workspace.id, {
+                                      autoApprove:
+                                        trustEditor.text.split("\n"),
+                                    });
+                                    setTrustEditor(null);
+                                  }}
+                                >
+                                  Save
+                                </button>
+                              </div>
+                              <p className="settings-note">
+                                One regex per line, matched against shell
+                                commands for agents working in this project.
+                                Deny and ask rules still win, and file writes
+                                keep asking.
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
+                </section>
+
+                <section className="settings-card">
+                  <div className="settings-row">
+                    <span>Scan roots</span>
+                  </div>
+                  {props.workspaceRoots.map((root) => (
+                    <div key={root} className="workspace-root-row">
+                      <span className="workspace-row-root" title={root}>
+                        {root}
+                      </span>
+                      <button
+                        className="ghost-button"
+                        onClick={() =>
+                          props.onSaveWorkspaceRoots(
+                            props.workspaceRoots.filter((item) => item !== root),
+                          )
+                        }
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                  <div className="workspace-add-row">
+                    <input
+                      value={rootInput}
+                      onChange={(event) => setRootInput(event.target.value)}
+                      placeholder="/Users/you/code"
+                      aria-label="Add scan root"
+                      spellCheck={false}
+                    />
+                    <button
+                      className="ghost-button"
+                      disabled={!rootInput.trim()}
+                      onClick={() => {
+                        props.onSaveWorkspaceRoots([
+                          ...props.workspaceRoots,
+                          rootInput.trim(),
+                        ]);
+                        setRootInput("");
+                      }}
+                    >
+                      Add root
+                    </button>
+                  </div>
+                  <p className="settings-note">
+                    Folders are scanned a few levels deep for project markers
+                    like .git and package.json. Scans only add folders to the
+                    list — nothing is shared with an agent until you assign it.
+                  </p>
+                </section>
+
+                <section className="settings-card">
+                  <div className="settings-row">
+                    <span>Add a folder directly</span>
+                  </div>
+                  <div className="workspace-add-row">
+                    <input
+                      value={folderInput}
+                      onChange={(event) => setFolderInput(event.target.value)}
+                      placeholder="/Users/you/Projects/My App"
+                      aria-label="Add project folder"
+                      spellCheck={false}
+                    />
+                    <button
+                      className="ghost-button"
+                      disabled={!folderInput.trim()}
+                      onClick={() => {
+                        props.onAddWorkspace(folderInput.trim());
+                        setFolderInput("");
+                      }}
+                    >
+                      Add folder
+                    </button>
+                  </div>
+                </section>
+              </>
             )}
 
             {section === "harness" && (
