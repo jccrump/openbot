@@ -25,6 +25,9 @@ import {
   ProviderInfoSchema,
   RolePolicySchema,
   ProviderPresetSchema,
+  RoutineRunSchema,
+  RoutineScheduleSchema,
+  RoutineSchema,
   SoulVersionSchema,
   ThreadSchema,
   ToolArtifactSchema,
@@ -261,6 +264,45 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     botId: z.string().optional(),
     versionId: z.string(),
   }),
+  z.object({
+    type: z.literal("routines.list"),
+  }),
+  z.object({
+    type: z.literal("routines.create"),
+    requestId: z.string(),
+    botId: z.string(),
+    name: z.string().min(1).max(120),
+    brief: z.string().min(1).max(8000),
+    computer: ComputerKindSchema,
+    schedule: RoutineScheduleSchema,
+    enabled: z.boolean().optional(),
+  }),
+  z.object({
+    type: z.literal("routines.update"),
+    requestId: z.string(),
+    routineId: z.string(),
+    name: z.string().min(1).max(120).optional(),
+    brief: z.string().min(1).max(8000).optional(),
+    computer: ComputerKindSchema.optional(),
+    schedule: RoutineScheduleSchema.optional(),
+    enabled: z.boolean().optional(),
+  }),
+  z.object({
+    type: z.literal("routines.remove"),
+    requestId: z.string(),
+    routineId: z.string(),
+  }),
+  z.object({
+    type: z.literal("routines.run"),
+    requestId: z.string(),
+    routineId: z.string(),
+  }),
+  z.object({
+    type: z.literal("routine.runs"),
+    requestId: z.string(),
+    routineId: z.string(),
+    limit: z.number().int().min(1).max(100).optional(),
+  }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessageSchema>;
 
@@ -281,6 +323,7 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     chatBusyBehavior: ChatBusyBehaviorSchema.optional(),
     workspaces: z.array(WorkspaceSchema).optional(),
     workspaceRoots: z.array(z.string()).optional(),
+    routines: z.array(RoutineSchema).optional(),
   }),
   z.object({
     type: z.literal("bot.created"),
@@ -528,6 +571,43 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     botId: z.string(),
     soul: SoulVersionSchema.nullable(),
     versions: z.array(SoulVersionSchema),
+  }),
+  z.object({
+    type: z.literal("routines"),
+    routines: z.array(RoutineSchema),
+  }),
+  z.object({
+    type: z.literal("routine.created"),
+    requestId: z.string(),
+    routine: RoutineSchema,
+  }),
+  z.object({
+    type: z.literal("routine.updated"),
+    requestId: z.string(),
+    routine: RoutineSchema,
+  }),
+  z.object({
+    type: z.literal("routine.removed"),
+    requestId: z.string(),
+    routineId: z.string(),
+  }),
+  z.object({
+    type: z.literal("routine.started"),
+    requestId: z.string(),
+    routineId: z.string(),
+    ok: z.boolean(),
+    message: z.string().nullable(),
+  }),
+  z.object({
+    type: z.literal("routine.error"),
+    requestId: z.string(),
+    message: z.string(),
+  }),
+  z.object({
+    type: z.literal("routine.runs"),
+    requestId: z.string(),
+    routineId: z.string(),
+    runs: z.array(RoutineRunSchema),
   }),
 ]);
 export type ServerMessage = z.infer<typeof ServerMessageSchema>;

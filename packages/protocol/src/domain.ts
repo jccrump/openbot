@@ -254,6 +254,74 @@ export const CodexInfoSchema = z.object({
 });
 export type CodexInfo = z.infer<typeof CodexInfoSchema>;
 
+/**
+ * A scheduled spawn owned by an agent: a brief and a schedule. The brief is
+ * delivered as a user message in the agent's thread, marked with this ref so
+ * the transcript shows what triggered the turn (ADR-027).
+ */
+export const RoutineRefSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  /** The journal entry for this firing; null for a manual "Run now". */
+  runId: z.string().nullable().optional(),
+});
+export type RoutineRef = z.infer<typeof RoutineRefSchema>;
+
+export const RoutineScheduleSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("interval"),
+    minutes: z.number().int().min(5).max(7 * 24 * 60),
+  }),
+  z.object({
+    kind: z.literal("daily"),
+    hour: z.number().int().min(0).max(23),
+    minute: z.number().int().min(0).max(59),
+  }),
+]);
+export type RoutineSchedule = z.infer<typeof RoutineScheduleSchema>;
+
+export const RoutineRunStatusSchema = z.enum([
+  "running",
+  "ok",
+  "error",
+  "skipped",
+]);
+export type RoutineRunStatus = z.infer<typeof RoutineRunStatusSchema>;
+
+export const RoutineRunSchema = z.object({
+  id: z.string(),
+  routineId: z.string(),
+  botId: z.string(),
+  threadId: z.string().nullable(),
+  status: RoutineRunStatusSchema,
+  /** Why a run was skipped or how it failed. */
+  reason: z.string().nullable(),
+  startedAt: z.string(),
+  finishedAt: z.string().nullable(),
+});
+export type RoutineRun = z.infer<typeof RoutineRunSchema>;
+
+export const RoutineSchema = z.object({
+  id: z.string(),
+  botId: z.string(),
+  name: z.string(),
+  brief: z.string(),
+  /** Which of the agent's computers the run acts on. */
+  computer: ComputerKindSchema,
+  schedule: RoutineScheduleSchema,
+  enabled: z.boolean(),
+  /**
+   * The agent still has the routine's computer. A routine whose computer was
+   * revoked is kept but cannot run until access returns.
+   */
+  available: z.boolean(),
+  nextRunAt: z.string().nullable(),
+  lastRun: RoutineRunSchema.nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+export type Routine = z.infer<typeof RoutineSchema>;
+
 export const MessageSchema = z.object({
   id: z.string(),
   threadId: z.string(),
@@ -264,6 +332,8 @@ export const MessageSchema = z.object({
   usage: TokenUsageSchema.nullable().optional(),
   compaction: CompactionMetaSchema.nullable().optional(),
   foldedAt: z.string().nullable().optional(),
+  /** Set on the user message a routine run injected. */
+  routine: RoutineRefSchema.nullable().optional(),
   createdAt: z.string(),
 });
 export type Message = z.infer<typeof MessageSchema>;

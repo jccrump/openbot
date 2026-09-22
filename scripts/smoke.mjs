@@ -12,6 +12,7 @@ import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { probeRfbFramebuffer } from "./lib/rfb-probe.mjs";
 
 const root = resolve(import.meta.dirname, "..");
@@ -1191,6 +1192,7 @@ const daemon = spawn(
       OPENBOT_PORT: "0",
       OPENBOT_SANDBOX_URL: `http://127.0.0.1:${sandboxPort}`,
       OPENBOT_WORKSPACE_ROOTS: workspaceScanRoot,
+      OPENBOT_ROUTINE_TICK_MS: "200",
       MOCK_API_KEY: "smoke-test-key",
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -1377,6 +1379,7 @@ try {
     ["firecracker"],
     "the seeded bot should default to a microVM",
   );
+  assert.deepEqual(hello.routines, [], "no routines on a fresh install");
   const botId = hello.bots[0].id;
 
   socket.send(JSON.stringify({ type: "chat.send", botId, text: "hello there" }));
@@ -3503,8 +3506,372 @@ try {
     "every access state should be one of the three known values",
   );
 
+  // Routines (ADR-027): an agent-owned scheduled spawn. The brief is delivered
+  // as a marked user message in the agent's thread, runs on the routine's
+  // computer, and is refused when the agent loses that computer.
+  const routineMarker = received.length;
+  socket.send(
+    JSON.stringify({
+      type: "routines.create",
+      requestId: "routine-create-1",
+      botId,
+      name: "Smoke check",
+      brief: "routine-check: report the smoke status",
+      computer: "firecracker",
+      schedule: { kind: "interval", minutes: 5 },
+    }),
+  );
+  const routineCreated = await waitForSince(
+    routineMarker,
+    (item) => item.type === "routine.created",
+  );
+  const routineId = routineCreated.routine.id;
+  assert.equal(routineCreated.routine.computer, "firecracker");
+  assert.equal(routineCreated.routine.enabled, true);
+  assert.equal(routineCreated.routine.available, true);
+  assert.ok(
+    Date.parse(routineCreated.routine.nextRunAt) > Date.now(),
+    "a new routine should be scheduled ahead",
+  );
+  await waitForSince(
+    routineMarker,
+    (item) =>
+      item.type === "routines" &&
+      item.routines.some((routine) => routine.id === routineId),
+  );
+
+  // A routine cannot be pinned to a computer the agent does not have.
+  socket.send(
+    JSON.stringify({
+      type: "routines.create",
+      requestId: "routine-create-mac",
+      botId,
+      name: "Mac routine",
+      brief: "should never exist",
+      computer: "mac",
+      schedule: { kind: "daily", hour: 9, minute: 0 },
+    }),
+  );
+  const routineRefused = await waitForSince(
+    routineMarker,
+    (item) => item.type === "routine.error",
+  );
+  assert.match(routineRefused.message, /no access to This Mac/);
+
+  // Disabling clears the due time; re-enabling schedules it again.
+  socket.send(
+    JSON.stringify({
+      type: "routines.update",
+      requestId: "routine-update-1",
+      routineId,
+      name: "Smoke check v2",
+      enabled: false,
+    }),
+  );
+  const routineDisabled = await waitForSince(
+    routineMarker,
+    (item) => item.type === "routine.updated",
+  );
+  assert.equal(routineDisabled.routine.name, "Smoke check v2");
+  assert.equal(routineDisabled.routine.enabled, false);
+  assert.equal(routineDisabled.routine.nextRunAt, null);
+  socket.send(
+    JSON.stringify({
+      type: "routines.update",
+      requestId: "routine-update-2",
+      routineId,
+      enabled: true,
+      schedule: { kind: "daily", hour: 6, minute: 30 },
+    }),
+  );
+  const routineEnabled = await waitForSince(
+    routineMarker,
+    (item) =>
+      item.type === "routine.updated" &&
+      item.routine.id === routineId &&
+      item.routine.enabled,
+  );
+  assert.equal(routineEnabled.routine.schedule.kind, "daily");
+  assert.ok(
+    routineEnabled.routine.nextRunAt,
+    "re-enabling should schedule the next run",
+  );
+
+  // Run now: the brief lands in the agent's thread with a routine marker, and
+  // the run is journaled.
+  const routineRunMarker = received.length;
+  socket.send(
+    JSON.stringify({
+      type: "routines.run",
+      requestId: "routine-run-1",
+      routineId,
+    }),
+  );
+  const routineStarted = await waitForSince(
+    routineRunMarker,
+    (item) => item.type === "routine.started",
+  );
+  assert.equal(routineStarted.ok, true);
+  const routineUser = await waitForSince(
+    routineRunMarker,
+    (item) =>
+      item.type === "chat.message" &&
+      item.message.role === "user" &&
+      item.message.routine?.id === routineId,
+  );
+  assert.equal(routineUser.message.routine.name, "Smoke check v2");
+  assert.ok(
+    routineUser.message.routine.runId,
+    "a run-now firing should carry its journal id",
+  );
+  assert.equal(
+    routineUser.message.content,
+    "routine-check: report the smoke status",
+  );
+  const routineDone = await waitForSince(
+    routineRunMarker,
+    (item) => item.type === "chat.done",
+  );
+  assert.equal(
+    routineUser.message.threadId,
+    routineDone.threadId,
+    "a routine runs in the agent's thread",
+  );
+  assert.match(routineDone.message.content, /Mock reply to: routine-check/);
+  await waitForSince(
+    routineRunMarker,
+    (item) =>
+      item.type === "routines" &&
+      item.routines.some(
+        (routine) => routine.id === routineId && routine.lastRun?.status === "ok",
+      ),
+  );
+  socket.send(
+    JSON.stringify({
+      type: "routine.runs",
+      requestId: "routine-runs-1",
+      routineId,
+    }),
+  );
+  const routineRuns = await waitForSince(
+    routineRunMarker,
+    (item) => item.type === "routine.runs",
+  );
+  assert.equal(routineRuns.runs.length, 1, "run-now journals one run");
+  assert.equal(routineRuns.runs[0].status, "ok");
+  assert.equal(routineRuns.runs[0].threadId, routineDone.threadId);
+  assert.ok(routineRuns.runs[0].finishedAt, "a finished run has an end time");
+
+  // The scheduler fires a due routine on its own. Backdate the due time so the
+  // next tick picks it up instead of waiting for the daily schedule.
+  const routineDb = new DatabaseSync(join(dataDir, "openbot.db"));
+  routineDb
+    .prepare("UPDATE routines SET next_run_at = ? WHERE id = ?")
+    .run(new Date(Date.now() - 1000).toISOString(), routineId);
+  routineDb.close();
+  const scheduledMarker = received.length;
+  const scheduledDone = await waitForSince(
+    scheduledMarker,
+    (item) => item.type === "chat.done",
+    15_000,
+  );
+  const scheduledUser = received
+    .slice(scheduledMarker)
+    .find(
+      (item) =>
+        item.type === "chat.message" &&
+        item.message.routine?.id === routineId,
+    );
+  assert.ok(scheduledUser, "the scheduler should fire the routine's brief");
+  assert.equal(scheduledDone.message.threadId, scheduledUser.message.threadId);
+  socket.send(
+    JSON.stringify({
+      type: "routine.runs",
+      requestId: "routine-runs-2",
+      routineId,
+    }),
+  );
+  const scheduledRuns = await waitForSince(
+    scheduledMarker,
+    (item) => item.type === "routine.runs",
+  );
+  assert.equal(scheduledRuns.runs.length, 2, "the scheduler journals a run");
+  assert.equal(scheduledRuns.runs[0].status, "ok");
+  await waitForSince(
+    scheduledMarker,
+    (item) =>
+      item.type === "routines" &&
+      item.routines.some(
+        (routine) =>
+          routine.id === routineId &&
+          routine.nextRunAt &&
+          Date.parse(routine.nextRunAt) > Date.now(),
+      ),
+  );
+
+  // Losing the computer blocks the routine: the firing is journaled as
+  // skipped, the due time advances, and nothing runs on the agent.
+  socket.send(
+    JSON.stringify({
+      type: "bots.create",
+      requestId: "bot-routine-mac",
+      name: "Routine Mac",
+      computers: ["mac"],
+    }),
+  );
+  const routineMacBot = await waitFor("bot.created");
+  socket.send(
+    JSON.stringify({
+      type: "routines.create",
+      requestId: "routine-create-mac-2",
+      botId: routineMacBot.bot.id,
+      name: "Mac only",
+      brief: "run: pwd",
+      computer: "mac",
+      schedule: { kind: "interval", minutes: 5 },
+    }),
+  );
+  const macRoutine = await waitForSince(
+    routineMarker,
+    (item) =>
+      item.type === "routine.created" &&
+      item.routine.botId === routineMacBot.bot.id,
+  );
+  assert.equal(macRoutine.routine.available, true);
+
+  // A routine pinned to This Mac runs on the host with the same approvals a
+  // typed turn would need.
+  const macRunMarker = received.length;
+  socket.send(
+    JSON.stringify({
+      type: "routines.run",
+      requestId: "routine-run-mac",
+      routineId: macRoutine.routine.id,
+    }),
+  );
+  const macStarted = await waitForSince(
+    macRunMarker,
+    (item) => item.type === "routine.started",
+  );
+  assert.equal(macStarted.ok, true);
+  const macApproval = await waitForSince(
+    macRunMarker,
+    (item) => item.type === "approval.request",
+  );
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: macApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const macPwd = await waitForSince(
+    macRunMarker,
+    (item) => item.type === "tool.result",
+  );
+  assert.equal(macPwd.ok, true, "a local routine should run on the host");
+  assert.ok(
+    macPwd.output.includes(join(dataDir, "workspaces", routineMacBot.bot.id)),
+    "the local routine's shell should start in the agent's scratch folder",
+  );
+  await waitForSince(macRunMarker, (item) => item.type === "chat.done");
+  await waitForSince(
+    macRunMarker,
+    (item) =>
+      item.type === "routines" &&
+      item.routines.some(
+        (routine) =>
+          routine.id === macRoutine.routine.id &&
+          routine.lastRun?.status === "ok",
+      ),
+  );
+
+  socket.send(
+    JSON.stringify({
+      type: "bots.update",
+      requestId: "routine-mac-bot-update",
+      botId: routineMacBot.bot.id,
+      computers: ["firecracker"],
+    }),
+  );
+  await waitFor("bot.updated");
+  const blocked = await waitForSince(
+    routineMarker,
+    (item) =>
+      item.type === "routines" &&
+      item.routines.some(
+        (routine) =>
+          routine.id === macRoutine.routine.id && routine.available === false,
+      ),
+  );
+  assert.ok(blocked, "revoking the computer marks the routine unavailable");
+  const blockedDb = new DatabaseSync(join(dataDir, "openbot.db"));
+  blockedDb
+    .prepare("UPDATE routines SET next_run_at = ? WHERE id = ?")
+    .run(new Date(Date.now() - 1000).toISOString(), macRoutine.routine.id);
+  blockedDb.close();
+  const blockedMarker = received.length;
+  const skipped = await waitForSince(
+    blockedMarker,
+    (item) =>
+      item.type === "routines" &&
+      item.routines.some(
+        (routine) =>
+          routine.id === macRoutine.routine.id &&
+          routine.lastRun?.status === "skipped",
+      ),
+    15_000,
+  );
+  const skippedRoutine = skipped.routines.find(
+    (routine) => routine.id === macRoutine.routine.id,
+  );
+  assert.match(
+    skippedRoutine.lastRun.reason,
+    /no longer has access to This Mac/,
+  );
+  assert.equal(
+    received
+      .slice(blockedMarker)
+      .some((item) => item.type === "chat.start"),
+    false,
+    "a blocked routine must not start a turn",
+  );
+  socket.send(
+    JSON.stringify({
+      type: "routines.remove",
+      requestId: "routine-remove-mac",
+      routineId: macRoutine.routine.id,
+    }),
+  );
+  await waitForSince(
+    blockedMarker,
+    (item) =>
+      item.type === "routine.removed" &&
+      item.routineId === macRoutine.routine.id,
+  );
+  socket.send(
+    JSON.stringify({
+      type: "routines.remove",
+      requestId: "routine-remove-1",
+      routineId,
+    }),
+  );
+  await waitForSince(
+    blockedMarker,
+    (item) => item.type === "routine.removed" && item.routineId === routineId,
+  );
+  await waitForSince(
+    blockedMarker,
+    (item) =>
+      item.type === "routines" &&
+      !item.routines.some(
+        (routine) =>
+          routine.id === routineId || routine.id === macRoutine.routine.id,
+      ),
+  );
+
   console.log(
-    `SMOKE OK — one agent per thread, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), dual-computer agent (computer argument per call, Mac calls on the host and microVM calls in the sandbox, project confinement on the Mac), workspace registry (scan roots, marker detection, node_modules skipped, add/ignore/remove, shell and file tools rooted in the project, escape rejected, trusted commands with deny precedence), access modes (full reach outside home, home confinement, system_info self-report), permissions report, agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-agent policy narrowing, egress allowlist), harness robustness (list_dir, shell output spill, shell background, browser press/select/wait_for/snapshot/tabs/upload/downloads, duplicate-failure stop, raw-markup retry, changed-file metadata), context discipline (unchanged reads and identical results collapse), working plan (update_plan persists and is injected), output screening (injected instructions in shell output are annotated), busy-turn delivery (queue waits for the stop, steer redirects the running turn, persisted default), chat clear (transcript archived in place, title reset, fresh turn on the same thread)`,
+    `SMOKE OK — one agent per thread, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), dual-computer agent (computer argument per call, Mac calls on the host and microVM calls in the sandbox, project confinement on the Mac), workspace registry (scan roots, marker detection, node_modules skipped, add/ignore/remove, shell and file tools rooted in the project, escape rejected, trusted commands with deny precedence), access modes (full reach outside home, home confinement, system_info self-report), permissions report, agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-agent policy narrowing, egress allowlist), harness robustness (list_dir, shell output spill, shell background, browser press/select/wait_for/snapshot/tabs/upload/downloads, duplicate-failure stop, raw-markup retry, changed-file metadata), context discipline (unchanged reads and identical results collapse), working plan (update_plan persists and is injected), output screening (injected instructions in shell output are annotated), busy-turn delivery (queue waits for the stop, steer redirects the running turn, persisted default), chat clear (transcript archived in place, title reset, fresh turn on the same thread), routines (create/update/run-now with a marked brief and run journal, a local-Mac run through the approval flow, scheduler firing, blocked after the agent loses the computer)`,
   );
 } finally {
   socket?.close();

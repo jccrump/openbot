@@ -17,6 +17,11 @@ import type {
   PlanStep,
   ReasoningEffort,
   RolePolicy,
+  Routine,
+  RoutineRef,
+  RoutineRun,
+  RoutineRunStatus,
+  RoutineSchedule,
   SoulContent,
   SoulVersion,
   Thread,
@@ -24,6 +29,7 @@ import type {
   ToolCallRecord,
   Workspace,
 } from "@openbot/protocol";
+import { botHasComputer } from "@openbot/protocol";
 
 export const DEFAULT_BOT_NAME = "Assistant";
 export const DEFAULT_THREAD_TITLE = "New chat";
@@ -305,7 +311,32 @@ interface MessageRow {
   cache_read_tokens: number | null;
   compaction: string | null;
   folded_at: string | null;
+  routine: string | null;
   created_at: string;
+}
+
+interface RoutineRow {
+  id: string;
+  bot_id: string;
+  name: string;
+  brief: string;
+  computer: string;
+  schedule: string;
+  enabled: number;
+  next_run_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface RoutineRunRow {
+  id: string;
+  routine_id: string;
+  bot_id: string;
+  thread_id: string | null;
+  status: string;
+  reason: string | null;
+  started_at: string;
+  finished_at: string | null;
 }
 
 interface MemoryRow {
@@ -617,6 +648,42 @@ function toWorkspace(row: WorkspaceRow): Workspace {
   };
 }
 
+function toRoutineRun(row: RoutineRunRow): RoutineRun {
+  return {
+    id: row.id,
+    routineId: row.routine_id,
+    botId: row.bot_id,
+    threadId: row.thread_id ?? null,
+    status: row.status as RoutineRunStatus,
+    reason: row.reason ?? null,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at ?? null,
+  };
+}
+
+function toRoutine(row: RoutineRow, available: boolean): Routine {
+  let schedule: RoutineSchedule = { kind: "daily", hour: 9, minute: 0 };
+  try {
+    schedule = JSON.parse(row.schedule) as RoutineSchedule;
+  } catch {
+    // keep the fallback so a corrupt row stays editable
+  }
+  return {
+    id: row.id,
+    botId: row.bot_id,
+    name: row.name,
+    brief: row.brief,
+    computer: row.computer === "mac" ? "mac" : "firecracker",
+    schedule,
+    enabled: row.enabled !== 0,
+    available,
+    nextRunAt: row.next_run_at ?? null,
+    lastRun: null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 function isDefaultSystemPrompt(bot: Bot): boolean {
   const identity = bot.role?.trim()
     ? `You are ${bot.name}, the user's ${bot.role.trim()}`
@@ -691,6 +758,14 @@ function toMessage(row: MessageRow): Message {
       compaction = null;
     }
   }
+  let routine: RoutineRef | null = null;
+  if (row.routine) {
+    try {
+      routine = JSON.parse(row.routine) as RoutineRef;
+    } catch {
+      routine = null;
+    }
+  }
   return {
     id: row.id,
     threadId: row.thread_id,
@@ -704,6 +779,7 @@ function toMessage(row: MessageRow): Message {
     usage,
     compaction,
     foldedAt: row.folded_at ?? null,
+    routine,
     createdAt: row.created_at,
   };
 }
@@ -871,6 +947,8 @@ export class Store {
     this.db.exec("BEGIN");
     try {
       this.deleteThreadsForBot(id);
+      this.deleteRoutineRunsForBot(id);
+      this.db.prepare("DELETE FROM routines WHERE bot_id = ?").run(id);
       this.db.prepare("DELETE FROM bots WHERE id = ?").run(id);
       this.db.exec("COMMIT");
     } catch (error) {
@@ -998,6 +1076,217 @@ export class Store {
     return this.listBots().filter((bot) => bot.workspaceId === workspaceId);
   }
 
+  // --- Routines (ADR-027) ---------------------------------------------------
+  // A routine is an agent-owned scheduled spawn: a brief plus a schedule. The
+  // agent's computer set is the grant: a routine pinned to a computer the
+  // agent no longer has is listed as unavailable and never fires.
+
+  listRoutines(): Routine[] {
+    const rows = this.db
+      .prepare("SELECT * FROM routines ORDER BY created_at ASC")
+      .all() as unknown as RoutineRow[];
+    const bots = new Map(this.listBots().map((bot) => [bot.id, bot]));
+    return rows.map((row) => {
+      const bot = bots.get(row.bot_id) ?? null;
+      const routine = toRoutine(
+        row,
+        bot ? botHasComputer(bot, row.computer === "mac" ? "mac" : "firecracker") : false,
+      );
+      routine.lastRun = this.lastRoutineRun(routine.id);
+      return routine;
+    });
+  }
+
+  getRoutine(id: string): Routine | null {
+    const row = this.db
+      .prepare("SELECT * FROM routines WHERE id = ?")
+      .get(id) as unknown as RoutineRow | undefined;
+    if (!row) {
+      return null;
+    }
+    const bot = this.getBot(row.bot_id);
+    const routine = toRoutine(
+      row,
+      bot ? botHasComputer(bot, row.computer === "mac" ? "mac" : "firecracker") : false,
+    );
+    routine.lastRun = this.lastRoutineRun(routine.id);
+    return routine;
+  }
+
+  createRoutine(input: {
+    botId: string;
+    name: string;
+    brief: string;
+    computer: ComputerKind;
+    schedule: RoutineSchedule;
+    enabled?: boolean;
+    nextRunAt?: string | null;
+  }): Routine {
+    const now = new Date().toISOString();
+    const id = randomUUID();
+    this.db
+      .prepare(
+        "INSERT INTO routines (id, bot_id, name, brief, computer, schedule, enabled, next_run_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        id,
+        input.botId,
+        input.name,
+        input.brief,
+        input.computer,
+        JSON.stringify(input.schedule),
+        input.enabled === false ? 0 : 1,
+        input.nextRunAt ?? null,
+        now,
+        now,
+      );
+    return this.getRoutine(id)!;
+  }
+
+  updateRoutine(
+    id: string,
+    patch: {
+      name?: string;
+      brief?: string;
+      computer?: ComputerKind;
+      schedule?: RoutineSchedule;
+      enabled?: boolean;
+      nextRunAt?: string | null;
+    },
+  ): Routine | null {
+    if (!this.getRoutine(id)) {
+      return null;
+    }
+    const fields: Array<[string, string | number | null]> = [];
+    if (patch.name !== undefined) fields.push(["name", patch.name]);
+    if (patch.brief !== undefined) fields.push(["brief", patch.brief]);
+    if (patch.computer !== undefined) fields.push(["computer", patch.computer]);
+    if (patch.schedule !== undefined) {
+      fields.push(["schedule", JSON.stringify(patch.schedule)]);
+    }
+    if (patch.enabled !== undefined) {
+      fields.push(["enabled", patch.enabled ? 1 : 0]);
+    }
+    if (patch.nextRunAt !== undefined) {
+      fields.push(["next_run_at", patch.nextRunAt]);
+    }
+    fields.push(["updated_at", new Date().toISOString()]);
+    for (const [column, value] of fields) {
+      this.db
+        .prepare(`UPDATE routines SET ${column} = ? WHERE id = ?`)
+        .run(value, id);
+    }
+    return this.getRoutine(id);
+  }
+
+  deleteRoutine(id: string): boolean {
+    if (!this.getRoutine(id)) {
+      return false;
+    }
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare("DELETE FROM routine_runs WHERE routine_id = ?").run(id);
+      this.db.prepare("DELETE FROM routines WHERE id = ?").run(id);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return true;
+  }
+
+  /** Enabled routines whose next occurrence is at or before `now`. */
+  routinesDue(now: string): Routine[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM routines WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ? ORDER BY next_run_at ASC",
+      )
+      .all(now) as unknown as RoutineRow[];
+    const bots = new Map(this.listBots().map((bot) => [bot.id, bot]));
+    return rows.map((row) => {
+      const bot = bots.get(row.bot_id) ?? null;
+      return toRoutine(
+        row,
+        bot ? botHasComputer(bot, row.computer === "mac" ? "mac" : "firecracker") : false,
+      );
+    });
+  }
+
+  lastRoutineRun(routineId: string): RoutineRun | null {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM routine_runs WHERE routine_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1",
+      )
+      .get(routineId) as unknown as RoutineRunRow | undefined;
+    return row ? toRoutineRun(row) : null;
+  }
+
+  listRoutineRuns(routineId: string, limit = 20): RoutineRun[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM routine_runs WHERE routine_id = ? ORDER BY started_at DESC, rowid DESC LIMIT ?",
+      )
+      .all(routineId, limit) as unknown as RoutineRunRow[];
+    return rows.map(toRoutineRun);
+  }
+
+  createRoutineRun(input: {
+    id?: string;
+    routineId: string;
+    botId: string;
+    threadId?: string | null;
+    status: RoutineRunStatus;
+    reason?: string | null;
+    startedAt?: string;
+    finishedAt?: string | null;
+  }): RoutineRun {
+    const run: RoutineRun = {
+      id: input.id ?? randomUUID(),
+      routineId: input.routineId,
+      botId: input.botId,
+      threadId: input.threadId ?? null,
+      status: input.status,
+      reason: input.reason ?? null,
+      startedAt: input.startedAt ?? new Date().toISOString(),
+      finishedAt: input.finishedAt ?? null,
+    };
+    this.db
+      .prepare(
+        "INSERT INTO routine_runs (id, routine_id, bot_id, thread_id, status, reason, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        run.id,
+        run.routineId,
+        run.botId,
+        run.threadId,
+        run.status,
+        run.reason,
+        run.startedAt,
+        run.finishedAt,
+      );
+    return run;
+  }
+
+  finishRoutineRun(
+    id: string,
+    status: RoutineRunStatus,
+    reason: string | null = null,
+  ): RoutineRun | null {
+    this.db
+      .prepare(
+        "UPDATE routine_runs SET status = ?, reason = ?, finished_at = ? WHERE id = ?",
+      )
+      .run(status, reason, new Date().toISOString(), id);
+    const row = this.db
+      .prepare("SELECT * FROM routine_runs WHERE id = ?")
+      .get(id) as unknown as RoutineRunRow | undefined;
+    return row ? toRoutineRun(row) : null;
+  }
+
+  deleteRoutineRunsForBot(botId: string): void {
+    this.db.prepare("DELETE FROM routine_runs WHERE bot_id = ?").run(botId);
+  }
+
   resetBot(id: string): boolean {
     if (!this.getBot(id)) {
       return false;
@@ -1005,6 +1294,12 @@ export class Store {
     this.db.exec("BEGIN");
     try {
       this.deleteThreadsForBot(id);
+      // Routines are agent configuration, so they survive a reset; their run
+      // journal does not, and their schedules restart from now.
+      this.deleteRoutineRunsForBot(id);
+      this.db
+        .prepare("UPDATE routines SET next_run_at = NULL WHERE bot_id = ?")
+        .run(id);
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -1177,6 +1472,7 @@ export class Store {
     usage?: TokenUsage | null;
     compaction?: CompactionMeta | null;
     foldedAt?: string | null;
+    routine?: RoutineRef | null;
     createdAt?: string;
   }): Message {
     const message: Message = {
@@ -1189,11 +1485,12 @@ export class Store {
       usage: input.usage ?? null,
       compaction: input.compaction ?? null,
       foldedAt: input.foldedAt ?? null,
+      routine: input.routine ?? null,
       createdAt: input.createdAt ?? new Date().toISOString(),
     };
     this.db
       .prepare(
-        "INSERT INTO messages (id, thread_id, role, content, provider, model, tool_calls, input_tokens, output_tokens, cache_read_tokens, compaction, folded_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO messages (id, thread_id, role, content, provider, model, tool_calls, input_tokens, output_tokens, cache_read_tokens, compaction, folded_at, routine, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         message.id,
@@ -1208,6 +1505,7 @@ export class Store {
         message.usage?.cacheReadTokens ?? null,
         message.compaction ? JSON.stringify(message.compaction) : null,
         message.foldedAt ?? null,
+        message.routine ? JSON.stringify(message.routine) : null,
         message.createdAt,
       );
     return message;

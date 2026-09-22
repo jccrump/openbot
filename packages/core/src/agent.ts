@@ -21,11 +21,12 @@ import type {
   ModelRef,
   PlanStep,
   PolicySettings,
+  RoutineRef,
   ServerMessage,
   ToolArtifact,
   ToolCallRecord,
 } from "@openbot/protocol";
-import { botComputers, primaryComputer } from "@openbot/protocol";
+import { botComputers, botHasComputer, primaryComputer } from "@openbot/protocol";
 import type { SandboxBackend } from "@openbot/sandbox";
 import type { ApprovalBroker } from "./approvals";
 import type { ChallengeBroker } from "./challenges";
@@ -122,6 +123,13 @@ export interface AgentInput {
   steering?: SteeringChannel;
   /** Extra system context injected for this turn only; never persisted. */
   contextNote?: string;
+  /**
+   * Run this turn on one of the agent's computers instead of its primary.
+   * A routine pins its computer; an ungranted value falls back to the primary.
+   */
+  computer?: ComputerKind;
+  /** Set when a routine's brief started this turn. */
+  routine?: RoutineRef | null;
 }
 
 const PROVIDER_STEP_TIMEOUT_MS = 120_000;
@@ -754,13 +762,24 @@ export async function runAgent(
       : deps.store.getOrCreateThread(bot.id);
 
   if (!input.skipUserMessage) {
-    deps.store.addMessage({
+    const userMessage = deps.store.addMessage({
       id: input.messageId,
       threadId: thread.id,
       role: "user",
       content: input.text,
       model: null,
+      routine: input.routine ?? null,
     });
+    // A routine run starts outside the client, so the marked brief is pushed
+    // to open windows instead of relying on the sender's optimistic bubble.
+    if (input.routine) {
+      emit({
+        type: "chat.message",
+        runId,
+        threadId: thread.id,
+        message: userMessage,
+      });
+    }
 
     if (thread.title === DEFAULT_THREAD_TITLE) {
       const updated = deps.store.touchThread(thread.id, {
@@ -848,10 +867,17 @@ export async function runAgent(
   }
 
   const computers = botComputers(bot);
-  const computer: ComputerKind = primaryComputer(bot);
+  // A run normally acts on the agent's primary computer. A routine can pin a
+  // different one, but only while the agent still has it (ADR-027); the pin
+  // also fixes the run's target, so a routine never reaches across computers.
+  const computer: ComputerKind =
+    input.computer && botHasComputer(bot, input.computer)
+      ? input.computer
+      : primaryComputer(bot);
+  const runComputers: ComputerKind[] = input.routine ? [computer] : computers;
   const local = computer === "mac";
-  const hasVm = computers.includes("firecracker");
-  const hasMac = computers.includes("mac");
+  const hasVm = runComputers.includes("firecracker");
+  const hasMac = runComputers.includes("mac");
   const dual = hasVm && hasMac;
   const decisionRuntime = deps.decision();
   const emitDecision = (notice: DecisionNotice): void => {
@@ -890,7 +916,7 @@ export async function runAgent(
           botId: bot.id,
           guestCwd,
           computer,
-          computers,
+          computers: runComputers,
           access: bot.access,
           self: deps.self,
           requestRestart: deps.requestRestart,
@@ -1004,7 +1030,7 @@ export async function runAgent(
   const turnContext = contextParts.filter(Boolean).join("\n\n");
   const definitions: ToolDefinition[] = toolContext
     ? toolDefinitions(computer, {
-        computers,
+        computers: runComputers,
         browse: Boolean(
           decisionRuntime.client && decisionRuntime.settings.browse,
         ),

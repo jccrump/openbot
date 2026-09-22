@@ -26,6 +26,8 @@ export interface OpenBotConfig {
   harness: HarnessSettings;
   decision: DecisionSettings;
   chatBusyBehavior: ChatBusyBehavior;
+  /** How often the routine scheduler checks for due routines. */
+  routineTickMs?: number;
   /** Folders scanned for local projects on first run; user-editable later. */
   workspaceRoots: string[];
 }
@@ -81,6 +83,7 @@ export function loadConfig(
     }
   }
 
+  const routineTickMs = parseRoutineTickMs(env);
   return {
     port: Number(env.OPENBOT_PORT ?? file.port ?? 4170),
     dataDir,
@@ -118,8 +121,17 @@ export function loadConfig(
     chatBusyBehavior: parseChatBusyBehavior(
       env.OPENBOT_CHAT_BUSY_BEHAVIOR ?? file.chatBusyBehavior,
     ),
+    ...(routineTickMs !== null ? { routineTickMs } : {}),
     workspaceRoots: parseWorkspaceRoots(env, file),
   };
+}
+
+/** Test knob: how often the routine scheduler looks for due routines. */
+function parseRoutineTickMs(
+  env: Record<string, string | undefined>,
+): number | null {
+  const raw = Number(env.OPENBOT_ROUTINE_TICK_MS);
+  return Number.isFinite(raw) && raw >= 50 ? Math.floor(raw) : null;
 }
 
 function parseWorkspaceRoots(

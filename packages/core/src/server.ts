@@ -33,6 +33,7 @@ import {
   type ModelRef,
   type PolicyRule,
   type PolicySettings,
+  type RoutineRef,
   type ServerMessage,
   type Thread,
 } from "@openbot/protocol";
@@ -74,6 +75,12 @@ import {
   serializePolicy,
 } from "./policy";
 import { Reflector } from "./reflection";
+import {
+  computerLabel,
+  RoutineService,
+  type RoutineStartInput,
+  type RoutineStartResult,
+} from "./routines";
 import { SoulService } from "./soul";
 import type { ProviderRegistry } from "./provider-registry";
 import {
@@ -479,6 +486,11 @@ export function createDaemon(options: DaemonOptions): Daemon {
     messageId?: string;
     skipUserMessage?: boolean;
     contextNote?: string;
+    /** Run on one of the agent's computers instead of its primary. */
+    computer?: ComputerKind;
+    /** Set when a routine's brief started this turn. */
+    routine?: RoutineRef | null;
+    onSettled?: (outcome: { ok: boolean; error: string | null }) => void;
   }): void => {
     const runId = randomUUID();
     const controller = new AbortController();
@@ -496,6 +508,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
     const useCodex = harness.default === "codex";
     const run = useCodex ? runCodexTurn : runAgent;
     handle.steerable = !useCodex;
+    let runError: string | null = null;
     const task = run(
       deps,
       {
@@ -507,6 +520,8 @@ export function createDaemon(options: DaemonOptions): Daemon {
         messageId: input.messageId,
         skipUserMessage: input.skipUserMessage,
         contextNote: input.contextNote,
+        computer: input.computer,
+        routine: input.routine ?? null,
         steering: {
           hasPending: () => handle.steering.length > 0,
           drain: () => handle.steering.splice(0),
@@ -516,15 +531,20 @@ export function createDaemon(options: DaemonOptions): Daemon {
       controller.signal,
     )
       .catch((error) => {
+        runError = (error as Error).message;
         broadcast({
           type: "chat.error",
           runId,
-          message: (error as Error).message,
+          message: runError,
         });
       })
       .finally(() => {
         runs.delete(runId);
         pending.delete(task);
+        input.onSettled?.({
+          ok: runError === null && !controller.signal.aborted,
+          error: runError,
+        });
         reflector.schedule();
         // A steer that arrived after the last step never made it into the
         // turn; answer it with a fresh run so it is not left hanging.
@@ -719,6 +739,69 @@ export function createDaemon(options: DaemonOptions): Daemon {
   });
   deps.memory = memory;
   deps.soul = soul;
+
+  // Routines (ADR-027): agent-owned scheduled spawns. A routine fires its
+  // brief as a turn in the agent's thread on the routine's computer — the
+  // microVM or This Mac — but only while the agent still has that computer.
+  const broadcastRoutines = (): void => {
+    broadcast({ type: "routines", routines: options.store.listRoutines() });
+  };
+
+  const startRoutineRun = (input: RoutineStartInput): RoutineStartResult => {
+    const bot = options.store.getBot(input.routine.botId);
+    if (!bot) {
+      return { ok: false, message: "the agent no longer exists" };
+    }
+    if (!botHasComputer(bot, input.routine.computer)) {
+      return {
+        ok: false,
+        message:
+          `the agent no longer has access to ` +
+          computerLabel(input.routine.computer),
+      };
+    }
+    if (activeRunForThread(input.threadId)) {
+      return { ok: false, retry: true, message: "the agent is busy" };
+    }
+    const routine: RoutineRef = {
+      id: input.routine.id,
+      name: input.routine.name,
+      runId: input.runId,
+    };
+    startRun({
+      botId: bot.id,
+      threadId: input.threadId,
+      text: input.routine.brief,
+      computer: input.routine.computer,
+      routine,
+      contextNote:
+        `[routine] This turn was started by your scheduled routine ` +
+        `"${input.routine.name}". The user did not type this brief; it is a ` +
+        "standing instruction. Work autonomously, do not ask the user unless " +
+        "you are genuinely blocked, and finish with a short report of what " +
+        "you did or found.",
+      onSettled: (outcome) => {
+        options.store.finishRoutineRun(
+          input.runId,
+          outcome.ok ? "ok" : "error",
+          outcome.ok
+            ? null
+            : (outcome.error ?? "the run was stopped before it finished"),
+        );
+        broadcastRoutines();
+      },
+    });
+    return { ok: true };
+  };
+
+  const routines = new RoutineService({
+    store: options.store,
+    start: startRoutineRun,
+    changed: broadcastRoutines,
+    ...(options.config.routineTickMs
+      ? { tickMs: options.config.routineTickMs }
+      : {}),
+  });
 
   const codexTimer = setInterval(() => {
     void codex.refresh();
@@ -1199,6 +1282,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
       chatBusyBehavior: readChatBusyBehavior(),
       workspaces: options.workspaces.list(),
       workspaceRoots: options.workspaces.roots(),
+      routines: options.store.listRoutines(),
     });
 
     socket.on("message", (raw) => {
@@ -1265,6 +1349,9 @@ export function createDaemon(options: DaemonOptions): Daemon {
             requestId: message.requestId,
             bot,
           });
+          // Changing the computer set can revoke (or restore) a routine's
+          // computer, so refresh the routine list's availability.
+          broadcastRoutines();
           return;
         }
         case "bots.power": {
@@ -1346,6 +1433,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
             requestId: message.requestId,
             botId: message.botId,
           });
+          broadcastRoutines();
           const sandbox = options.sandbox;
           if (sandbox) {
             void sandbox.destroy(message.botId).catch((error) => {
@@ -1721,6 +1809,132 @@ export function createDaemon(options: DaemonOptions): Daemon {
           });
           return;
         }
+        case "routines.list": {
+          send({ type: "routines", routines: options.store.listRoutines() });
+          return;
+        }
+        case "routines.create": {
+          const bot = options.store.getBot(message.botId);
+          if (!bot) {
+            send({
+              type: "routine.error",
+              requestId: message.requestId,
+              message: `unknown bot: ${message.botId}`,
+            });
+            return;
+          }
+          if (!botHasComputer(bot, message.computer)) {
+            send({
+              type: "routine.error",
+              requestId: message.requestId,
+              message:
+                `${bot.name} has no access to ` +
+                `${computerLabel(message.computer)}, so a routine cannot run there`,
+            });
+            return;
+          }
+          const routine = routines.create({
+            botId: message.botId,
+            name: message.name.trim(),
+            brief: message.brief.trim(),
+            computer: message.computer,
+            schedule: message.schedule,
+            ...(message.enabled !== undefined
+              ? { enabled: message.enabled }
+              : {}),
+          });
+          send({ type: "routine.created", requestId: message.requestId, routine });
+          return;
+        }
+        case "routines.update": {
+          const existing = options.store.getRoutine(message.routineId);
+          if (!existing) {
+            send({
+              type: "routine.error",
+              requestId: message.requestId,
+              message: `unknown routine: ${message.routineId}`,
+            });
+            return;
+          }
+          // A blocked routine can still be renamed or disabled; only changing
+          // its computer to one the agent does not have is refused.
+          if (message.computer !== undefined) {
+            const bot = options.store.getBot(existing.botId);
+            if (!bot || !botHasComputer(bot, message.computer)) {
+              send({
+                type: "routine.error",
+                requestId: message.requestId,
+                message:
+                  `${bot?.name ?? "the agent"} has no access to ` +
+                  `${computerLabel(message.computer)}, so the routine cannot run there`,
+              });
+              return;
+            }
+          }
+          const routine = routines.update(message.routineId, {
+            ...(message.name !== undefined
+              ? { name: message.name.trim() }
+              : {}),
+            ...(message.brief !== undefined
+              ? { brief: message.brief.trim() }
+              : {}),
+            ...(message.computer !== undefined
+              ? { computer: message.computer }
+              : {}),
+            ...(message.schedule !== undefined
+              ? { schedule: message.schedule }
+              : {}),
+            ...(message.enabled !== undefined
+              ? { enabled: message.enabled }
+              : {}),
+          });
+          if (!routine) {
+            send({
+              type: "routine.error",
+              requestId: message.requestId,
+              message: `unknown routine: ${message.routineId}`,
+            });
+            return;
+          }
+          send({ type: "routine.updated", requestId: message.requestId, routine });
+          return;
+        }
+        case "routines.remove": {
+          if (!routines.remove(message.routineId)) {
+            send({
+              type: "routine.error",
+              requestId: message.requestId,
+              message: `unknown routine: ${message.routineId}`,
+            });
+            return;
+          }
+          send({
+            type: "routine.removed",
+            requestId: message.requestId,
+            routineId: message.routineId,
+          });
+          return;
+        }
+        case "routines.run": {
+          const result = routines.runNow(message.routineId);
+          send({
+            type: "routine.started",
+            requestId: message.requestId,
+            routineId: message.routineId,
+            ok: result.ok,
+            message: result.message,
+          });
+          return;
+        }
+        case "routine.runs": {
+          send({
+            type: "routine.runs",
+            requestId: message.requestId,
+            routineId: message.routineId,
+            runs: routines.runs(message.routineId, message.limit ?? 20),
+          });
+          return;
+        }
         case "approval.respond":
           if (message.remember && message.decision === "approve") {
             if (rememberApprovedTool(message.requestId)) {
@@ -1728,8 +1942,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
             }
           }
           options.approvals.resolve(message.requestId, message.decision);
-          return;
-        case "challenge.respond":
+          return;        case "challenge.respond":
           options.challenges.resolve(message.requestId, message.action);
           return;
         case "provider.upsert": {
@@ -1980,6 +2193,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
   return {
     async start() {
       reflector.start();
+      routines.start();
       await codex.refresh();
       await new Promise<void>((resolve, reject) => {
         httpServer.once("error", reject);
@@ -2000,6 +2214,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
       clearInterval(sandboxTimer);
       clearInterval(codexTimer);
       reflector.stop();
+      routines.stop();
       for (const run of runs.values()) {
         run.controller.abort();
       }

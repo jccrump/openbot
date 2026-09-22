@@ -134,6 +134,38 @@ export function openDatabase(dataDir: string): DatabaseSync {
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_root
       ON workspaces(root);
+
+    CREATE TABLE IF NOT EXISTS routines (
+      id TEXT PRIMARY KEY,
+      bot_id TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      brief TEXT NOT NULL,
+      computer TEXT NOT NULL,
+      schedule TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      next_run_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_routines_bot
+      ON routines(bot_id);
+    CREATE INDEX IF NOT EXISTS idx_routines_due
+      ON routines(enabled, next_run_at);
+
+    CREATE TABLE IF NOT EXISTS routine_runs (
+      id TEXT PRIMARY KEY,
+      routine_id TEXT NOT NULL,
+      bot_id TEXT NOT NULL,
+      thread_id TEXT,
+      status TEXT NOT NULL,
+      reason TEXT,
+      started_at TEXT NOT NULL,
+      finished_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_routine_runs_routine
+      ON routine_runs(routine_id, started_at);
   `);
 
   const columns = db
@@ -157,6 +189,9 @@ export function openDatabase(dataDir: string): DatabaseSync {
   }
   if (!messageColumns.has("folded_at")) {
     db.exec("ALTER TABLE messages ADD COLUMN folded_at TEXT");
+  }
+  if (!messageColumns.has("routine")) {
+    db.exec("ALTER TABLE messages ADD COLUMN routine TEXT");
   }
 
   const threadColumns = db
