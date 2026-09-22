@@ -55,6 +55,7 @@ import {
   screenUntrustedText,
 } from "./guardrail";
 import type { SoulService } from "./soul";
+import { renderTodoNote, type TodoService } from "./todos";
 import {
   findTool,
   isApprovalExemptTool,
@@ -95,6 +96,8 @@ export interface AgentDeps {
   resolveProviderKey: (record: ProviderRecord) => string | undefined;
   memory?: MemoryService | null;
   soul?: SoulService | null;
+  /** The agent's durable todo list; the user edits the same list in the app. */
+  todos?: TodoService | null;
   policy?: () => PolicySettings;
   /** What the daemon knows about itself (system_info and the [self] note). */
   self?: SelfInfo;
@@ -937,6 +940,7 @@ export async function runAgent(
           memory: deps.memory ?? null,
           soul: deps.soul ?? null,
           memoryScope: bot.id,
+          todos: deps.todos ?? null,
           updatePlan: (plan: PlanStep[]) => {
             const updated = deps.store.setThreadPlan(thread.id, plan);
             if (updated) {
@@ -1026,6 +1030,16 @@ export async function runAgent(
     contextParts.push(
       `[plan] Current plan for this task (update it with update_plan):\n${lines.join("\n")}`,
     );
+  }
+  if (deps.todos) {
+    try {
+      const note = renderTodoNote(deps.todos.list(bot.id));
+      if (note) {
+        contextParts.push(note);
+      }
+    } catch (error) {
+      console.warn(`todo injection failed: ${(error as Error).message}`);
+    }
   }
   const turnContext = contextParts.filter(Boolean).join("\n\n");
   const definitions: ToolDefinition[] = toolContext

@@ -111,10 +111,53 @@ export function TerminalPanel({
       }
     };
 
+    // Wait until the host's size stops changing before opening the session:
+    // the PTY size is fixed by the first frame, and a fit that settles one
+    // column at a time would spawn the shell at the wrong width.
+    const waitForStableSize = (): Promise<void> =>
+      new Promise((resolve) => {
+        let lastWidth = -1;
+        let lastHeight = -1;
+        let stable = 0;
+        let frames = 0;
+        const step = () => {
+          frames += 1;
+          const width = host.clientWidth;
+          const height = host.clientHeight;
+          const same = width === lastWidth && height === lastHeight;
+          if (same && width > 0 && height > 0) {
+            stable += 1;
+          } else {
+            stable = 0;
+          }
+          lastWidth = width;
+          lastHeight = height;
+          if (stable >= 2 || frames >= 30) {
+            resolve();
+            return;
+          }
+          requestAnimationFrame(step);
+        };
+        requestAnimationFrame(step);
+      });
+
+    let openedSize: { cols: number; rows: number } | null = null;
     socket.onopen = () => {
       setStatus("open");
-      send({ type: "open", cols: term.cols, rows: term.rows });
-      term.focus();
+      void (async () => {
+        await waitForStableSize();
+        if (socket.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        try {
+          fit.fit();
+        } catch {
+          // the container can vanish mid-resize
+        }
+        openedSize = { cols: term.cols, rows: term.rows };
+        send({ type: "open", cols: term.cols, rows: term.rows });
+        term.focus();
+      })();
     };
 
     socket.onmessage = (event) => {
@@ -171,9 +214,25 @@ export function TerminalPanel({
     const dataSub = term.onData((data) =>
       send({ type: "input", data: bytesToBase64(new TextEncoder().encode(data)) }),
     );
-    const resizeSub = term.onResize(({ cols, rows }) =>
-      send({ type: "resize", cols, rows }),
-    );
+    // Coalesce resize churn (layout settling, drags) into one trailing frame,
+    // and skip the echo of the size the session already opened with.
+    let resizeSendTimer: ReturnType<typeof setTimeout> | null = null;
+    const resizeSub = term.onResize(({ cols, rows }) => {
+      if (resizeSendTimer) {
+        clearTimeout(resizeSendTimer);
+      }
+      resizeSendTimer = setTimeout(() => {
+        resizeSendTimer = null;
+        if (
+          openedSize &&
+          cols === openedSize.cols &&
+          rows === openedSize.rows
+        ) {
+          return;
+        }
+        send({ type: "resize", cols, rows });
+      }, 150);
+    });
     const observer = new ResizeObserver(() => safeFit());
     observer.observe(host);
     const focus = () => term.focus();
@@ -182,6 +241,10 @@ export function TerminalPanel({
     return () => {
       closedByUs = true;
       observer.disconnect();
+      if (resizeSendTimer) {
+        clearTimeout(resizeSendTimer);
+        resizeSendTimer = null;
+      }
       dataSub.dispose();
       resizeSub.dispose();
       host.removeEventListener("mousedown", focus);

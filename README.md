@@ -226,6 +226,14 @@ when the Codex CLI is on `PATH`.
   interactive PTY-backed shell in the microVM, with resize, reconnect, and a
   session that survives tab switches. A thread rail on the left lists your
   agents, one thread each.
+- **Todo list** under the panel's screen: one durable list per agent, shared
+  with the agent. Tasks carry a status — on hold, working, waiting, done — and
+  a check circle marks them done; subtasks are a simple done/not-done
+  checklist under a task. The user edits the list in the panel or in a
+  Trello-style board (drag cards between the status columns) and the agent
+  manages the same list with its `todo_list` and `todo_write` tools, so
+  commitments survive chats, restarts, and a chat clear. The list is injected
+  into every turn.
 - **Agents**: create with name/role/avatar/color/model/computer, single thread
   per agent, and a centered **agent settings** modal from the gear button on
   each sidebar row. The modal edits the name, role, icon, and color, switches

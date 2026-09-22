@@ -30,6 +30,8 @@ import { MemoryModal } from "./components/MemoryModal";
 import { RoutineModal, type RoutineDraft } from "./components/RoutineModal";
 import { RoutinesPanel } from "./components/RoutinesPanel";
 import { TerminalPanel } from "./components/TerminalPanel";
+import { TodoBoard } from "./components/TodoBoard";
+import { TodoPanel } from "./components/TodoPanel";
 import { VncView, type VncState } from "./components/VncView";
 import {
   AVATAR_COLORS,
@@ -211,6 +213,16 @@ function ChevronIcon() {
   );
 }
 
+function BoardIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="2" y="2.6" width="3.4" height="10.8" rx="1" stroke="currentColor" strokeWidth="1.3" />
+      <rect x="6.3" y="2.6" width="3.4" height="10.8" rx="1" stroke="currentColor" strokeWidth="1.3" />
+      <rect x="10.6" y="2.6" width="3.4" height="10.8" rx="1" stroke="currentColor" strokeWidth="1.3" />
+    </svg>
+  );
+}
+
 function ArrowUpIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -250,13 +262,21 @@ function ClearIcon() {
   );
 }
 
-function CollapseIcon() {
+// Double chevron: points right to collapse the column, mirrored to expand it.
+function PanelChevronsIcon() {
   return (
-    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <path
-        d="M13.2 6.5H9.5V2.8M9.5 6.5l3.7-3.7M2.8 9.5h3.7v3.7M6.5 9.5 2.8 13.2"
+        d="m3.6 3.6 4.4 4.4-4.4 4.4"
         stroke="currentColor"
-        strokeWidth="1.5"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="m8.4 3.6 4.4 4.4-4.4 4.4"
+        stroke="currentColor"
+        strokeWidth="1.6"
         strokeLinecap="round"
         strokeLinejoin="round"
       />
@@ -872,6 +892,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [memoryOpen, setMemoryOpen] = useState(false);
   const [approvalsOpen, setApprovalsOpen] = useState(false);
+  const [todoBoardOpen, setTodoBoardOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
@@ -939,6 +960,9 @@ export default function App() {
   const botRoutines = screenBot
     ? daemon.routines.filter((routine) => routine.botId === screenBot.id)
     : [];
+  const openTodoCount = daemon.todos.filter(
+    (todo) => todo.status !== "done",
+  ).length;
   const hasUsableProvider = daemon.providers.some(isProviderUsable);
   const hasProviderNeedingKey = daemon.providers.some(
     (provider) =>
@@ -1391,16 +1415,17 @@ export default function App() {
                   aria-label={`Collapse the ${panelComputerLabel} panels`}
                   onClick={togglePanel}
                 >
-                  <CollapseIcon />
+                  <PanelChevronsIcon />
                 </button>
               ) : (
                 <button
-                  className="panel-column-open"
+                  className="icon-button panel-column-expand"
                   title={`Show the ${panelComputerLabel} panels`}
+                  aria-label={`Show the ${panelComputerLabel} panels`}
                   aria-expanded={false}
                   onClick={togglePanel}
                 >
-                  {panelComputerLabel}
+                  <PanelChevronsIcon />
                 </button>
               )}
             </div>
@@ -1477,12 +1502,48 @@ export default function App() {
                 </section>
               )}
 
+              {/* The agent's durable todo list; routines land below it. */}
+              <section className="todo-section">
+                <h2>
+                  Todo
+                  {openTodoCount > 0 && (
+                    <span className="badge">{openTodoCount}</span>
+                  )}
+                  <button
+                    className="icon-button todo-board-open"
+                    title="Open board view"
+                    aria-label="Open board view"
+                    onClick={() => setTodoBoardOpen(true)}
+                  >
+                    <BoardIcon />
+                  </button>
+                </h2>
+                {screenBot && (
+                  <TodoPanel
+                    botId={screenBot.id}
+                    todos={daemon.todos}
+                    onAdd={daemon.addTodo}
+                    onUpdate={daemon.updateTodo}
+                    onRemove={daemon.removeTodo}
+                  />
+                )}
+              </section>
+
               <section className="routines">
-                <h2>Routines</h2>
+                <h2>
+                  Routines
+                  <button
+                    className="icon-button routines-new"
+                    title="New routine"
+                    aria-label="New routine"
+                    onClick={openRoutineCreate}
+                  >
+                    <PlusIcon />
+                  </button>
+                </h2>
                 <RoutinesPanel
                   bot={screenBot}
                   routines={botRoutines}
-                  onCreate={openRoutineCreate}
                   onEdit={openRoutineEdit}
                   onRun={(routine) => daemon.runRoutine(routine.id)}
                   onToggle={async (routine, enabled) => {
@@ -1524,6 +1585,15 @@ export default function App() {
         onConsolidate={daemon.consolidateMemories}
         onLoadSoul={() => daemon.loadSoul()}
         onRevertSoul={daemon.revertSoul}
+      />
+
+      <TodoBoard
+        open={todoBoardOpen}
+        onClose={() => setTodoBoardOpen(false)}
+        todos={daemon.todos}
+        onAdd={(title, status) => daemon.addTodo(title, undefined, status)}
+        onUpdate={daemon.updateTodo}
+        onRemove={daemon.removeTodo}
       />
 
       {daemon.error && (

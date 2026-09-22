@@ -839,6 +839,8 @@ routines      id, bot_id, name, brief, computer, schedule, enabled,
               next_run_at, created_at, updated_at
 routine_runs  id, routine_id, bot_id, thread_id, status, reason, started_at,
               finished_at
+todos         id, bot_id, parent_id, title, status, position, created_at,
+              updated_at
 ```
 
 `memories` also has an FTS5 companion table (`memories_fts`) kept in sync on
@@ -1175,6 +1177,24 @@ cron expressions (surface area without a user need); firing once per granted
 computer (double side effects); a dedicated thread per routine (the one-agent
 model already gives each routine a home, and inline runs keep the surrounding
 context).
+
+**ADR-028: The todo list is durable, per-agent state shared by the user and the
+agent.** Each agent owns one todo list that lives in SQLite, not in a thread:
+items carry a status (`hold`, `working`, `waiting`, `done`), optionally hang
+under a top-level parent as subtasks, and survive chats, restarts, and the
+thread's clear. A subtask is a plain checklist item — done or not — because a
+nested status is more bookkeeping than the work needs; every todo has a check
+circle, and richer statuses belong to top-level tasks. The user edits the list in the app's right column (under the
+screen, above routines); the agent reads and writes the same list through
+`todo_list` and `todo_write`, which are host-side tools offered on either
+computer and exempt from approval cards. A `TodoService` is the one writer, so
+both paths share validation and every change is broadcast as the agent's full
+list, keeping the UI and the next turn's `[todos]` note current. The thread's
+ephemeral `update_plan` working plan stays separate: it is scoped to one task
+and replaced each turn, while todos are the durable commitments. Rejected:
+storing todos on the thread (the user's own items would vanish with a clear);
+letting the agent replace the whole list (it would drop the user's items);
+deeper nesting (one level covers subtasks without a tree UI).
 
 ## Running it
 

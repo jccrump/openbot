@@ -1697,22 +1697,9 @@ body {
   max-width: none;
 }
 
-/* "VM" is the control that expands the collapsed column. */
-.panel-column-open {
-  padding: 2px 8px;
-  border: none;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--text-muted);
-  font-family: inherit;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.panel-column-open:hover {
-  background: var(--hover);
-  color: var(--text);
+/* The double chevron points right to collapse and left to expand. */
+.panel-column-expand svg {
+  transform: scaleX(-1);
 }
 
 .panel-column-actions {
@@ -2339,19 +2326,8 @@ body {
   gap: 10px;
 }
 
-.routines-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-
-.routines-head .routines-sub {
-  line-height: 15px;
-}
-
-.routine-new {
-  flex-shrink: 0;
+.routines-new {
+  margin-left: auto;
 }
 
 .routine-list {
@@ -2555,6 +2531,486 @@ body {
   flex-direction: row;
   align-items: center;
   justify-content: space-between;
+}
+
+/* Todo */
+
+.todo-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 0 1 auto;
+  min-height: 150px;
+  max-height: 42%;
+  padding: 12px;
+  background: var(--bg-chat);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.todo-section h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.1px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.todo-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: 8px;
+}
+
+.todo-list {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  gap: 2px;
+}
+
+.todo-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.todo-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px 3px 6px;
+  border-radius: 8px;
+  min-width: 0;
+}
+
+.todo-row:hover {
+  background: var(--hover);
+}
+
+.todo-row-child {
+  margin-left: 22px;
+}
+
+.todo-chevron,
+.todo-chevron-spacer {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+}
+
+.todo-check {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  margin: 0;
+  border: 1.5px solid var(--text-muted);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent-contrast);
+  cursor: pointer;
+}
+
+.todo-check:hover {
+  border-color: var(--accent);
+}
+
+.todo-check-done,
+.todo-check-done:hover {
+  background: var(--green);
+  border-color: var(--green);
+}
+
+.todo-chevron {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: transform 120ms ease;
+}
+
+.todo-chevron:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+
+.todo-chevron-collapsed {
+  transform: rotate(-90deg);
+}
+
+.todo-sub-count {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.todo-status {
+  flex: 0 0 auto;
+  width: 86px;
+  padding: 2px 4px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.todo-status-hold {
+  color: var(--text-muted);
+}
+
+.todo-status-working {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.todo-status-waiting {
+  color: var(--amber);
+  border-color: var(--amber-border);
+}
+
+.todo-status-done {
+  color: var(--green);
+  border-color: var(--green-border);
+}
+
+.todo-title {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: text;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.todo-title-done {
+  color: var(--text-muted);
+  text-decoration: line-through;
+}
+
+.todo-edit {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--field-focus-border);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+}
+
+.todo-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+  opacity: 0;
+}
+
+.todo-row:hover .todo-actions,
+.todo-row:focus-within .todo-actions {
+  opacity: 1;
+}
+
+.todo-action {
+  width: 22px;
+  height: 22px;
+  color: var(--text-muted);
+}
+
+.todo-action:hover:not(:disabled) {
+  color: var(--text);
+}
+
+.todo-action:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.todo-action-danger:hover:not(:disabled) {
+  color: var(--red);
+}
+
+.todo-add {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.todo-add-input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+}
+
+.todo-add-input::placeholder {
+  color: var(--text-muted);
+}
+
+.todo-add-input:focus {
+  border-color: var(--field-focus-border);
+}
+
+.todo-add-child {
+  margin-left: 22px;
+}
+
+.todo-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 16px 12px;
+  border-radius: 12px;
+  border: 0.5px dashed var(--border);
+  text-align: center;
+}
+
+.todo-empty-title {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.todo-empty-sub {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.todo-board-open {
+  margin-left: auto;
+}
+
+/* Todo board */
+
+.modal.todo-board {
+  width: min(1080px, 94vw);
+  height: min(680px, 88vh);
+  max-height: 88vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.todo-board-columns {
+  display: flex;
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+  overflow-x: auto;
+  padding: 6px 16px 16px;
+}
+
+.todo-board-column {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1 1 0;
+  min-width: 200px;
+  min-height: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-detail);
+}
+
+.todo-board-column-drop {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+.todo-board-column-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.todo-board-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex: 0 0 auto;
+  background: var(--text-muted);
+}
+
+.todo-board-dot-working {
+  background: var(--accent);
+}
+
+.todo-board-dot-waiting {
+  background: var(--amber);
+}
+
+.todo-board-dot-done {
+  background: var(--green);
+}
+
+.todo-board-column-label {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.todo-board-count {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.todo-board-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.todo-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 9px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-chat);
+  cursor: grab;
+}
+
+.todo-card-dragging {
+  opacity: 0.5;
+}
+
+.todo-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.todo-card-title {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 17px;
+  text-align: left;
+  cursor: text;
+  overflow-wrap: anywhere;
+}
+
+.todo-card-edit {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--field-focus-border);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+}
+
+.todo-card .todo-action {
+  opacity: 0;
+}
+
+.todo-card:hover .todo-action,
+.todo-card:focus-within .todo-action {
+  opacity: 1;
+}
+
+.todo-card-subtasks {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.todo-card-subtask {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.todo-card-subtask-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.todo-card-subtask .todo-action {
+  width: 20px;
+  height: 20px;
+}
+
+.todo-board-add {
+  flex: 0 0 auto;
+}
+
+.todo-board-add-input {
+  width: 100%;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+}
+
+.todo-board-add-input::placeholder {
+  color: var(--text-muted);
+}
+
+.todo-board-add-input:focus {
+  border-color: var(--field-focus-border);
 }
 
 /* Create agent modal */

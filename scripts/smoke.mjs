@@ -531,8 +531,18 @@ const mockModelServer = createServer(async (request, response) => {
                            ],
                          },
                        }
-                     : harnessTool
-                     ? harnessTool
+                      : last.content.startsWith("todo:")
+                      ? {
+                          name: "todo_write",
+                          args: {
+                            action: "add",
+                            title: last.content.slice("todo:".length).trim(),
+                          },
+                        }
+                      : last.content.startsWith("todo-list")
+                      ? { name: "todo_list", args: {} }
+                      : harnessTool
+                      ? harnessTool
                      : last.content.startsWith("remember:")
                      ? {
                          name: "remember",
@@ -2906,6 +2916,152 @@ try {
     "the persisted plan should be injected into later turns",
   );
 
+  // The todo list is durable agent state: the agent writes it through
+  // todo_write, the user edits the same list over the protocol, and the list
+  // is injected into later turns.
+  await waitForThreadQuiet();
+  socket.send(
+    JSON.stringify({ type: "chat.send", botId, text: "todo: Ship the release" }),
+  );
+  const todoResult = await waitFor("tool.result");
+  assert.equal(todoResult.ok, true);
+  assert.match(todoResult.output, /\[hold\] Ship the release/);
+  const todoSnapshot = await waitForWhere(
+    (item) =>
+      item.type === "todos" &&
+      item.todos.some((todo) => todo.title === "Ship the release"),
+  );
+  assert.equal(todoSnapshot.todos.length, 1);
+  assert.equal(todoSnapshot.todos[0].status, "hold");
+  assert.equal(todoSnapshot.todos[0].botId, botId);
+  await waitFor("chat.done");
+
+  // The user adds a subtask and moves the parent to working; every change is
+  // broadcast as the agent's full list. A subtask is a plain checklist item,
+  // so a richer status is stored as not done.
+  const parentTodo = todoSnapshot.todos[0];
+  socket.send(
+    JSON.stringify({
+      type: "todos.create",
+      botId,
+      title: "Write the notes",
+      parentId: parentTodo.id,
+      status: "waiting",
+    }),
+  );
+  const withChild = await waitForWhere(
+    (item) => item.type === "todos" && item.todos.length === 2,
+  );
+  const childTodo = withChild.todos.find(
+    (todo) => todo.title === "Write the notes",
+  );
+  assert.equal(childTodo.parentId, parentTodo.id);
+  assert.equal(childTodo.status, "hold");
+
+  socket.send(
+    JSON.stringify({
+      type: "todos.update",
+      id: parentTodo.id,
+      status: "working",
+    }),
+  );
+  await waitForWhere(
+    (item) =>
+      item.type === "todos" &&
+      item.todos.some(
+        (todo) => todo.id === parentTodo.id && todo.status === "working",
+      ),
+  );
+
+  // Checking the subtask off is a done/not-done toggle, and the agent reads it
+  // as [x].
+  socket.send(
+    JSON.stringify({
+      type: "todos.update",
+      id: childTodo.id,
+      status: "done",
+    }),
+  );
+  await waitForWhere(
+    (item) =>
+      item.type === "todos" &&
+      item.todos.some(
+        (todo) => todo.id === childTodo.id && todo.status === "done",
+      ),
+  );
+
+  // The agent reads the same list, including the user's subtask.
+  await waitForThreadQuiet();
+  socket.send(JSON.stringify({ type: "chat.send", botId, text: "todo-list" }));
+  const todoListResult = await waitFor("tool.result");
+  assert.equal(todoListResult.ok, true);
+  assert.match(todoListResult.output, /\[working\] Ship the release/);
+  assert.match(todoListResult.output, /\[x\] Write the notes/);
+  await waitFor("chat.done");
+  const todoRequest = [...modelRequests]
+    .reverse()
+    .find((item) => item.lastUser === "todo-list");
+  assert.match(
+    todoRequest?.system ?? "",
+    /\[todos\] Your todo list/,
+    "the todo list should be injected into later turns",
+  );
+
+  // Deleting a parent deletes its subtasks, and todos.list answers the caller
+  // with the agent's current list.
+  socket.send(JSON.stringify({ type: "todos.delete", id: parentTodo.id }));
+  const emptied = await waitForWhere(
+    (item) => item.type === "todos" && item.todos.length === 0,
+  );
+  assert.equal(emptied.botId, botId);
+  const keepMarker = received.length;
+  socket.send(
+    JSON.stringify({ type: "todos.create", botId, title: "Keep me" }),
+  );
+  const kept = await waitForSince(
+    keepMarker,
+    (item) =>
+      item.type === "todos" &&
+      item.todos.some((todo) => todo.title === "Keep me"),
+  );
+  assert.equal(kept.todos.length, 1);
+
+  const listMarker = received.length;
+  socket.send(JSON.stringify({ type: "todos.list", botId }));
+  const listed = await waitForSince(
+    listMarker,
+    (item) =>
+      item.type === "todos" &&
+      item.todos.some((todo) => todo.title === "Keep me"),
+  );
+  assert.equal(listed.todos.length, 1);
+
+  // Subtasks nest one level: adding under a subtask is refused with an error
+  // instead of silently flattening the list.
+  const deepMarker = received.length;
+  socket.send(
+    JSON.stringify({
+      type: "todos.create",
+      botId,
+      title: "Too deep",
+      parentId: listed.todos[0].id,
+    }),
+  );
+  const tooDeep = await waitForSince(
+    deepMarker,
+    (item) => item.type === "todos" && item.todos.length === 2,
+  );
+  socket.send(
+    JSON.stringify({
+      type: "todos.create",
+      botId,
+      title: "Nested twice",
+      parentId: tooDeep.todos.find((todo) => todo.title === "Too deep").id,
+    }),
+  );
+  const nestedError = await waitFor("chat.error");
+  assert.match(nestedError.message, /one level deep/);
+
   // File and command output is screened for injected instructions; annotate
   // mode keeps the content but warns the model. (Jev was turned off by an
   // earlier settings test; turn it back on.)
@@ -3871,7 +4027,7 @@ try {
   );
 
   console.log(
-    `SMOKE OK — one agent per thread, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), dual-computer agent (computer argument per call, Mac calls on the host and microVM calls in the sandbox, project confinement on the Mac), workspace registry (scan roots, marker detection, node_modules skipped, add/ignore/remove, shell and file tools rooted in the project, escape rejected, trusted commands with deny precedence), access modes (full reach outside home, home confinement, system_info self-report), permissions report, agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-agent policy narrowing, egress allowlist), harness robustness (list_dir, shell output spill, shell background, browser press/select/wait_for/snapshot/tabs/upload/downloads, duplicate-failure stop, raw-markup retry, changed-file metadata), context discipline (unchanged reads and identical results collapse), working plan (update_plan persists and is injected), output screening (injected instructions in shell output are annotated), busy-turn delivery (queue waits for the stop, steer redirects the running turn, persisted default), chat clear (transcript archived in place, title reset, fresh turn on the same thread), routines (create/update/run-now with a marked brief and run journal, a local-Mac run through the approval flow, scheduler firing, blocked after the agent loses the computer)`,
+    `SMOKE OK — one agent per thread, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), dual-computer agent (computer argument per call, Mac calls on the host and microVM calls in the sandbox, project confinement on the Mac), workspace registry (scan roots, marker detection, node_modules skipped, add/ignore/remove, shell and file tools rooted in the project, escape rejected, trusted commands with deny precedence), access modes (full reach outside home, home confinement, system_info self-report), permissions report, agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-agent policy narrowing, egress allowlist), harness robustness (list_dir, shell output spill, shell background, browser press/select/wait_for/snapshot/tabs/upload/downloads, duplicate-failure stop, raw-markup retry, changed-file metadata), context discipline (unchanged reads and identical results collapse), working plan (update_plan persists and is injected), per-agent todo list (agent tool writes, user protocol edits, subtasks, one-level nesting refusal, injection, subtree delete), output screening (injected instructions in shell output are annotated), busy-turn delivery (queue waits for the stop, steer redirects the running turn, persisted default), chat clear (transcript archived in place, title reset, fresh turn on the same thread), routines (create/update/run-now with a marked brief and run journal, a local-Mac run through the approval flow, scheduler firing, blocked after the agent loses the computer)`,
   );
 } finally {
   socket?.close();

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { homedir } from "node:os";
 import {
   createReadStream,
@@ -82,6 +82,7 @@ import {
   type RoutineStartResult,
 } from "./routines";
 import { SoulService } from "./soul";
+import { TodoService } from "./todos";
 import type { ProviderRegistry } from "./provider-registry";
 import {
   systemPromptForBot,
@@ -731,6 +732,11 @@ export function createDaemon(options: DaemonOptions): Daemon {
   };
   const memory = new MemoryService(options.store, embeddingClient);
   const soul = new SoulService(options.store);
+  // Every todo change (the user's edits and the agent's tools both go through
+  // the service) is pushed to every client as the agent's new list.
+  const todos = new TodoService(options.store, ({ botId, todos: list }) =>
+    broadcast({ type: "todos", botId, todos: list }),
+  );
   const reflector = new Reflector({
     store: options.store,
     memory,
@@ -739,6 +745,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
   });
   deps.memory = memory;
   deps.soul = soul;
+  deps.todos = todos;
 
   // Routines (ADR-027): agent-owned scheduled spawns. A routine fires its
   // brief as a turn in the agent's thread on the routine's computer — the
@@ -1060,11 +1067,16 @@ export function createDaemon(options: DaemonOptions): Daemon {
       return;
     }
     const root = macRoot(fileOptions, bot);
-    const cwd = existsSync(root) ? root : homedir();
+    // A full-access agent's root is "/", which is a useless place to open a
+    // shell; fall back to the home folder so the user lands somewhere sane.
+    const cwd = root === "/" ? homedir() : existsSync(root) ? root : homedir();
     const shell = process.env.SHELL || "/bin/zsh";
     let child: ReturnType<typeof spawn> | null = null;
     let closed = false;
     let started = false;
+    let ptyDevice: string | null = null;
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+    let resizeTo: { cols: number; rows: number } | null = null;
     const pendingInput: Buffer[] = [];
 
     const sendFrame = (frame: Record<string, unknown>) => {
@@ -1078,6 +1090,10 @@ export function createDaemon(options: DaemonOptions): Daemon {
         return;
       }
       closed = true;
+      if (resizeTimer) {
+        clearTimeout(resizeTimer);
+        resizeTimer = null;
+      }
       if (child && child.exitCode === null) {
         if (child.pid !== undefined) {
           try {
@@ -1143,6 +1159,70 @@ export function createDaemon(options: DaemonOptions): Daemon {
       }
     };
 
+    /**
+     * The shell runs under `expect`, so the daemon cannot resize its PTY
+     * directly. The shell's tty is an ordinary device, though, so `stty -f` on
+     * it updates the window size and the kernel signals SIGWINCH to the shell.
+     */
+    const shellTty = (): string | null => {
+      if (ptyDevice) {
+        return ptyDevice;
+      }
+      const expectPid = child?.pid;
+      if (!expectPid) {
+        return null;
+      }
+      try {
+        const shellPid = execFileSync(
+          "/usr/bin/pgrep",
+          ["-P", String(expectPid)],
+          { encoding: "utf8" },
+        )
+          .trim()
+          .split("\n")[0];
+        if (!shellPid) {
+          return null;
+        }
+        const tty = execFileSync("/bin/ps", ["-o", "tty=", "-p", shellPid], {
+          encoding: "utf8",
+        }).trim();
+        if (!tty || tty === "??") {
+          return null;
+        }
+        ptyDevice = tty.startsWith("/dev/") ? tty : `/dev/${tty}`;
+        return ptyDevice;
+      } catch {
+        return null;
+      }
+    };
+
+    const applyResize = () => {
+      resizeTimer = null;
+      const target = resizeTo;
+      resizeTo = null;
+      if (!target || closed) {
+        return;
+      }
+      const device = shellTty();
+      if (!device) {
+        return;
+      }
+      execFile(
+        "/bin/stty",
+        [
+          "-f",
+          device,
+          "rows",
+          String(target.rows),
+          "cols",
+          String(target.cols),
+        ],
+        () => {
+          // A failed resize only leaves the shell at its previous size.
+        },
+      );
+    };
+
     client.on("message", (raw) => {
       for (const line of raw.toString().split("\n")) {
         if (!line.trim()) {
@@ -1168,8 +1248,17 @@ export function createDaemon(options: DaemonOptions): Daemon {
           } else {
             pendingInput.push(chunk);
           }
+        } else if (frame.type === "resize") {
+          const cols = Math.floor(Number(frame.cols ?? 0));
+          const rows = Math.floor(Number(frame.rows ?? 0));
+          if (started && cols > 0 && rows > 0) {
+            resizeTo = { cols, rows };
+            if (!resizeTimer) {
+              // Coalesce a drag-resize into one stty call.
+              resizeTimer = setTimeout(applyResize, 100);
+            }
+          }
         }
-        // `resize` is a no-op: the PTY size is fixed when the shell spawns.
       }
     });
     client.on("close", () => shutdown());
@@ -1933,6 +2022,52 @@ export function createDaemon(options: DaemonOptions): Daemon {
             routineId: message.routineId,
             runs: routines.runs(message.routineId, message.limit ?? 20),
           });
+          return;
+        }
+        case "todos.list": {
+          send({
+            type: "todos",
+            botId: message.botId,
+            todos: todos.list(message.botId),
+          });
+          return;
+        }
+        case "todos.create": {
+          const result = todos.create({
+            botId: message.botId,
+            title: message.title,
+            ...(message.parentId ? { parentId: message.parentId } : {}),
+            ...(message.status ? { status: message.status } : {}),
+          });
+          if (!result.ok) {
+            send({
+              type: "chat.error",
+              message: result.error ?? "could not add the todo",
+            });
+          }
+          return;
+        }
+        case "todos.update": {
+          const result = todos.update(message.id, {
+            ...(message.title !== undefined ? { title: message.title } : {}),
+            ...(message.status !== undefined ? { status: message.status } : {}),
+          });
+          if (!result.ok) {
+            send({
+              type: "chat.error",
+              message: result.error ?? "could not update the todo",
+            });
+          }
+          return;
+        }
+        case "todos.delete": {
+          const result = todos.remove(message.id);
+          if (!result.ok) {
+            send({
+              type: "chat.error",
+              message: result.error ?? "could not delete the todo",
+            });
+          }
           return;
         }
         case "approval.respond":

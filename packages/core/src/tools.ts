@@ -4,15 +4,17 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { ToolDefinition } from "@openbot/gateway";
 import { choice } from "@openbot/gateway";
-import type {
-  AccessMode,
-  ComputerKind,
-  FileChange,
-  ModelRef,
-  PlanStep,
-  PolicySettings,
-  ReasoningEffort,
-  ToolArtifact,
+import {
+  TODO_STATUSES,
+  type AccessMode,
+  type ComputerKind,
+  type FileChange,
+  type ModelRef,
+  type PlanStep,
+  type PolicySettings,
+  type ReasoningEffort,
+  type TodoStatus,
+  type ToolArtifact,
 } from "@openbot/protocol";
 import type {
   DesktopActionRequest,
@@ -35,6 +37,10 @@ import {
 } from "./self";
 import type { MemoryService } from "./memory";
 import type { SoulService } from "./soul";
+import {
+  renderTodoLines,
+  type TodoService,
+} from "./todos";
 import {
   GUARDRAIL_BLOCKED,
   GUARDRAIL_WARNING,
@@ -110,13 +116,19 @@ export interface ToolContext {
   memoryScope?: string;
   /** Persist the thread's working plan (the update_plan tool). */
   updatePlan?: (plan: PlanStep[]) => void;
+  /** The agent's durable todo list (the todo_list and todo_write tools). */
+  todos?: TodoService | null;
   /** Content hashes of files read this turn, keyed by path+window. */
   readCache?: Map<string, string>;
 }
 
 /** Memory reads and writes are low risk and never need an approval card. */
 export function isApprovalExemptTool(name: string): boolean {
-  return name === "system_info" || MEMORY_TOOL_NAMES.has(name);
+  return (
+    name === "system_info" ||
+    MEMORY_TOOL_NAMES.has(name) ||
+    TODO_TOOL_NAMES.has(name)
+  );
 }
 
 export interface Tool {
@@ -1353,6 +1365,197 @@ const updatePlanTool: Tool = {
       )
       .join("\n");
     return { ok: true, output: `Plan updated:\n${rendered}`, durationMs: 0 };
+  },
+};
+
+const TODO_STATUS_DESCRIPTION =
+  "hold = parked on purpose, working = being done now, waiting = blocked on " +
+  "something else, done = finished. Subtasks are a plain checklist: done or " +
+  "not done.";
+
+const todoListTool: Tool = {
+  definition: {
+    name: "todo_list",
+    description:
+      "Read your todo list: durable tasks that outlive this chat and are " +
+      "shared with the user, each with a status and an id. Subtasks are " +
+      "listed under their parent as [x] done or [ ] not done. Call it before " +
+      "planning or updating tracked work so you act on the real list instead " +
+      "of guessing.",
+    parameters: { type: "object", properties: {} },
+  },
+  async execute(context) {
+    if (!context.todos) {
+      return {
+        ok: false,
+        output: "the todo list is not available for this run",
+        durationMs: 0,
+      };
+    }
+    const todos = context.todos.list(context.botId);
+    if (todos.length === 0) {
+      return {
+        ok: true,
+        output: "The todo list is empty. Add an item with todo_write.",
+        durationMs: 0,
+      };
+    }
+    const done = todos.filter((todo) => todo.status === "done").length;
+    return {
+      ok: true,
+      output:
+        `Todo list (${todos.length} items, ${todos.length - done} open):\n` +
+        renderTodoLines(todos).join("\n"),
+      durationMs: 0,
+    };
+  },
+};
+
+const todoWriteTool: Tool = {
+  definition: {
+    name: "todo_write",
+    description:
+      "Add, update, or delete items on your todo list. The user sees and " +
+      "edits the same list in the app, so keep it truthful. Use action " +
+      '"add" to create a task (set parentId to make it a subtask), ' +
+      '"update" to rename a task or change its status, and "delete" to ' +
+      "remove a task and its subtasks. Ids come from todo_list. Keep the " +
+      `list short and current. Statuses: ${TODO_STATUS_DESCRIPTION}`,
+    parameters: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["add", "update", "delete"],
+          description: "What to do with the todo list.",
+        },
+        id: {
+          type: "string",
+          description:
+            "Todo id (or its unique short prefix) for update and delete.",
+        },
+        title: {
+          type: "string",
+          description: "Task text when adding, or the new text when updating.",
+        },
+        parentId: {
+          type: "string",
+          description:
+            "Parent todo id when adding a subtask; the parent must be a " +
+            "top-level task.",
+        },
+        status: {
+          type: "string",
+          enum: ["hold", "working", "waiting", "done"],
+          description:
+            "Status for a task, or done/not done for a subtask. " +
+            TODO_STATUS_DESCRIPTION,
+        },
+      },
+      required: ["action"],
+    },
+  },
+  async execute(context, args) {
+    if (!context.todos) {
+      return {
+        ok: false,
+        output: "the todo list is not available for this run",
+        durationMs: 0,
+      };
+    }
+    const action = args.action;
+    const status =
+      typeof args.status === "string" &&
+      TODO_STATUSES.includes(args.status as TodoStatus)
+        ? (args.status as TodoStatus)
+        : undefined;
+    const renderList = (): string =>
+      renderTodoLines(context.todos!.list(context.botId)).join("\n");
+    if (action === "add") {
+      const title = typeof args.title === "string" ? args.title : "";
+      if (!title.trim()) {
+        return {
+          ok: false,
+          output: "title is required to add a todo",
+          durationMs: 0,
+        };
+      }
+      const result = context.todos.create({
+        botId: context.botId,
+        title,
+        ...(typeof args.parentId === "string" && args.parentId
+          ? { parentId: args.parentId }
+          : {}),
+        ...(status ? { status } : {}),
+      });
+      if (!result.ok) {
+        return { ok: false, output: result.error ?? "could not add", durationMs: 0 };
+      }
+      return {
+        ok: true,
+        output: `Added todo:\n${renderList()}`,
+        durationMs: 0,
+      };
+    }
+    if (action === "update") {
+      const id = typeof args.id === "string" ? args.id : "";
+      if (!id) {
+        return {
+          ok: false,
+          output: "id is required to update a todo",
+          durationMs: 0,
+        };
+      }
+      const title = typeof args.title === "string" ? args.title : undefined;
+      if (title === undefined && status === undefined) {
+        return {
+          ok: false,
+          output: "give a title, a status, or both to update a todo",
+          durationMs: 0,
+        };
+      }
+      const result = context.todos.update(id, {
+        ...(title !== undefined ? { title } : {}),
+        ...(status !== undefined ? { status } : {}),
+      });
+      if (!result.ok) {
+        return { ok: false, output: result.error ?? "could not update", durationMs: 0 };
+      }
+      return {
+        ok: true,
+        output: `Updated todo:\n${renderList()}`,
+        durationMs: 0,
+      };
+    }
+    if (action === "delete") {
+      const id = typeof args.id === "string" ? args.id : "";
+      if (!id) {
+        return {
+          ok: false,
+          output: "id is required to delete a todo",
+          durationMs: 0,
+        };
+      }
+      const result = context.todos.remove(id);
+      if (!result.ok) {
+        return { ok: false, output: result.error ?? "could not delete", durationMs: 0 };
+      }
+      const extra = (result.removed?.length ?? 1) - 1;
+      return {
+        ok: true,
+        output:
+          `Deleted todo${extra > 0 ? ` and ${extra} subtask${extra === 1 ? "" : "s"}` : ""}:\n` +
+          (context.todos.list(context.botId).length
+            ? renderList()
+            : "The todo list is empty."),
+        durationMs: 0,
+      };
+    }
+    return {
+      ok: false,
+      output: `unknown action: ${String(action)}; use add, update, or delete`,
+      durationMs: 0,
+    };
   },
 };
 
@@ -2976,6 +3179,8 @@ const MEMORY_TOOL_NAMES = new Set([
   "update_soul",
 ]);
 
+const TODO_TOOL_NAMES = new Set(["todo_list", "todo_write"]);
+
 export const tools: Tool[] = [
   shellTool,
   readFileTool,
@@ -2985,6 +3190,8 @@ export const tools: Tool[] = [
   globTool,
   listDirTool,
   updatePlanTool,
+  todoListTool,
+  todoWriteTool,
   browserTool,
   browserExecuteTool,
   browserStepTool,

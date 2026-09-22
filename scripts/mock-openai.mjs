@@ -300,6 +300,18 @@ const server = createServer((request, response) => {
       typeof last.content === "string" &&
       last.content.trim().startsWith("soul:");
 
+    const wantsTodo =
+      Array.isArray(parsed.tools) &&
+      last?.role === "user" &&
+      typeof last.content === "string" &&
+      last.content.trim().startsWith("todo:");
+
+    const wantsTodoList =
+      Array.isArray(parsed.tools) &&
+      last?.role === "user" &&
+      typeof last.content === "string" &&
+      last.content.trim().startsWith("todo-list");
+
     const emitToolCall = (name, args) => {
       const split = Math.min(8, args.length);
       const callId = `call_mock_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -405,6 +417,22 @@ const server = createServer((request, response) => {
           reason: "test update",
         }),
       );
+      return;
+    }
+
+    if (wantsTodo) {
+      emitToolCall(
+        "todo_write",
+        JSON.stringify({
+          action: "add",
+          title: last.content.trim().slice("todo:".length).trim(),
+        }),
+      );
+      return;
+    }
+
+    if (wantsTodoList) {
+      emitToolCall("todo_list", JSON.stringify({}));
       return;
     }
 
