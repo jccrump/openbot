@@ -196,10 +196,11 @@ body {
 .thread-row {
   display: flex;
   align-items: center;
-  gap: 0;
-  padding: 7px 10px;
-  margin: 1px 8px;
-  border-radius: 8px;
+  gap: 10px;
+  padding: 8px;
+  margin: 1px 6px;
+  border-radius: 12px;
+  border: 1px solid transparent;
   cursor: pointer;
   min-width: 0;
 }
@@ -211,32 +212,37 @@ body {
 .thread-row-selected,
 .thread-row-selected:hover {
   background: var(--row-selected);
+  border-color: var(--border);
 }
 
-.thread-dot {
-  width: 8px;
-  height: 8px;
+.agent-avatar {
+  position: relative;
+  width: 36px;
+  height: 36px;
   border-radius: 9999px;
   flex-shrink: 0;
-  background: var(--text-muted);
-  opacity: 0.5;
 }
 
-.thread-dot-working {
+.agent-avatar-working::after {
+  content: "";
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 10px;
+  height: 10px;
+  border-radius: 9999px;
   background: var(--green);
-  opacity: 1;
-  animation: thread-pulse 1.6s ease-in-out infinite;
+  border: 2px solid var(--bg-chat);
+  animation: agent-working-pulse 1.6s ease-in-out infinite;
 }
 
-@keyframes thread-pulse {
+@keyframes agent-working-pulse {
   0%,
   100% {
     opacity: 1;
-    transform: scale(1);
   }
   50% {
-    opacity: 0.4;
-    transform: scale(0.85);
+    opacity: 0.3;
   }
 }
 
@@ -287,16 +293,49 @@ body {
 .agent-row-body {
   flex: 1;
   min-width: 0;
-  margin-left: 10px;
   display: flex;
   flex-direction: column;
-  gap: 1px;
+  gap: 2px;
+}
+
+.agent-row-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
 }
 
 .agent-row-name {
+  flex: 0 0 auto;
+  max-width: 72%;
+  min-width: 0;
   font-size: 13px;
   font-weight: 600;
   letter-spacing: -0.1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-role {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 55%;
+  padding: 1px 6px;
+  border-radius: 9999px;
+  background: var(--badge-bg);
+  color: var(--text-muted);
+  font-size: 11px;
+  letter-spacing: -0.05px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-row-preview {
+  color: var(--text-muted);
+  font-size: 12px;
+  letter-spacing: -0.05px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -691,6 +730,75 @@ body {
 
 .markdown a:hover {
   text-decoration: underline;
+}
+
+/* Clickable references in chat: external links open in the browser, file
+   paths open in the Files panel (or with the Mac's default app). */
+.md-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: min(100%, 340px);
+  min-width: 0;
+  padding: 1px 8px 1px 6px;
+  border: 0.5px solid var(--border);
+  border-radius: 9999px;
+  background: var(--badge-bg);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 18px;
+  letter-spacing: -0.1px;
+  text-decoration: none;
+  vertical-align: baseline;
+  cursor: pointer;
+}
+
+.md-chip svg {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.md-chip-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.md-chip-file .md-chip-label {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  letter-spacing: -0.2px;
+}
+
+.md-chip:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.markdown a.md-chip:hover {
+  text-decoration: none;
+}
+
+.md-chip-link {
+  color: var(--accent);
+}
+
+.md-chip-link svg {
+  color: currentColor;
+  opacity: 0.8;
+}
+
+.tool-row-detail.md-chip {
+  padding: 0 7px 0 5px;
+  border: none;
+  background: transparent;
+}
+
+.tool-row-detail.md-chip:hover {
+  background: var(--hover);
+  color: var(--text);
 }
 
 .markdown ol {
@@ -1496,6 +1604,22 @@ body {
   color: var(--text);
 }
 
+.changed-files-path-slot {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+}
+
+.changed-files-path.md-chip {
+  flex: 0 1 auto;
+  gap: 5px;
+  padding: 1px 6px 1px 4px;
+}
+
+.changed-files-path.md-chip .md-chip-label {
+  font-size: 12.5px;
+}
+
 .changed-files-chevron {
   display: inline-flex;
   flex-shrink: 0;
@@ -2224,7 +2348,7 @@ body {
 /* The thread rail floats left of the chat and grows with its list. */
 .thread-rail {
   flex: 0 1 auto;
-  width: 232px;
+  width: 248px;
   min-width: 168px;
   max-height: 100%;
   min-height: 0;
@@ -2246,7 +2370,8 @@ body {
 .panel-threads-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
+  min-height: 24px;
   padding: 0 2px 4px;
 }
 
@@ -4095,7 +4220,7 @@ body {
 .agent-badge {
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   gap: 8px;
   flex-shrink: 0;
   padding: 8px 16px;

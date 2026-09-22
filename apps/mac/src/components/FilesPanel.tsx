@@ -108,6 +108,7 @@ export function FilesPanel({
   computer,
   rootLabel: rootLabelProp,
   active,
+  openRequest,
   listFiles,
   readFile,
 }: {
@@ -116,6 +117,8 @@ export function FilesPanel({
   /** Shown for the root crumb; defaults to "Workspace" on This Mac. */
   rootLabel?: string;
   active: boolean;
+  /** A file (or folder) the transcript asked to open; `nonce` re-fires it. */
+  openRequest?: { path: string; nonce: number } | null;
   listFiles: (
     botId: string,
     path?: string,
@@ -137,6 +140,7 @@ export function FilesPanel({
   const [previewName, setPreviewName] = useState("");
   const [previewLoading, setPreviewLoading] = useState(false);
   const requestSeq = useRef(0);
+  const handledRequest = useRef<number | null>(null);
 
   const load = useCallback(
     async (target: string) => {
@@ -180,6 +184,57 @@ export function FilesPanel({
     setRootPath("");
     void load("");
   }, [botId, computer, load, started]);
+
+  const fileName = (value: string) =>
+    value.replace(/\/+$/, "").split("/").pop() || value;
+
+  useEffect(() => {
+    if (!started || !openRequest) {
+      return;
+    }
+    if (handledRequest.current === openRequest.nonce) {
+      return;
+    }
+    handledRequest.current = openRequest.nonce;
+    let cancelled = false;
+    const open = async () => {
+      setPreviewName(fileName(openRequest.path));
+      setPreviewLoading(true);
+      setPreview(null);
+      const result = await readFile(botId, openRequest.path, computer);
+      if (cancelled) {
+        return;
+      }
+      setPreviewLoading(false);
+      if (!result.error && result.kind === "dir") {
+        setPreview(null);
+        if (!rootPath) {
+          await load("");
+        }
+        void load(result.path);
+        return;
+      }
+      setPreviewName(fileName(result.path || openRequest.path));
+      setPreview(result);
+      const parent = result.path
+        .replace(/\/+$/, "")
+        .split("/")
+        .slice(0, -1)
+        .join("/");
+      if (parent) {
+        if (!rootPath) {
+          await load("");
+        }
+        if (!cancelled) {
+          void load(parent);
+        }
+      }
+    };
+    void open();
+    return () => {
+      cancelled = true;
+    };
+  }, [botId, computer, load, openRequest, readFile, started]);
 
   const openEntry = (entry: FileEntry) => {
     const child = path ? `${path.replace(/\/+$/, "")}/${entry.name}` : entry.name;

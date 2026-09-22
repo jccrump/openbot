@@ -22,6 +22,7 @@ import { Settings } from "./Settings";
 import { botComputers, primaryComputer } from "@openbot/protocol";
 import { AgentSettingsModal } from "./components/AgentSettingsModal";
 import { ApprovalsModal } from "./components/ApprovalsModal";
+import { FileChip } from "./components/Chips";
 import { ComputerChoices } from "./components/ComputerChoices";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { FilesPanel } from "./components/FilesPanel";
@@ -42,6 +43,7 @@ import {
   isMacOnly,
 } from "./lib/agentOptions";
 import { DAEMON_HTTP_URL } from "./lib/daemon";
+import { openPathOnMac } from "./lib/openLocal";
 import { useTheme } from "./lib/useTheme";
 import {
   isProviderUsable,
@@ -384,6 +386,9 @@ function CopyIcon() {
 interface ThreadRow {
   id: string;
   name: string;
+  color: string;
+  role: string | null;
+  preview: string | null;
   selected: boolean;
   working: boolean;
   title: string;
@@ -412,56 +417,72 @@ function Transcript({
   );
 }
 
-function pulseSeed(id: string): number {
-  let hash = 0;
-  for (let index = 0; index < id.length; index += 1) {
-    hash = (hash * 31 + id.charCodeAt(index)) | 0;
+function previewText(content: string): string {
+  return content
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`\n]*)`/g, "$1")
+    .replace(/!\[([^\]]*)\]\([^)\s]+\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)\s]+\)/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function fileComputer(
+  bot: Bot,
+  path: string,
+  hint: ComputerKind | undefined,
+): ComputerKind {
+  const computers = botComputers(bot);
+  if (hint && computers.includes(hint)) {
+    return hint;
   }
-  return Math.abs(hash);
+  if (computers.length <= 1) {
+    return computers[0] ?? "firecracker";
+  }
+  if (path.startsWith("~") || /^\/(Users|Volumes|Applications)\b/.test(path)) {
+    return "mac";
+  }
+  if (/^\/(root|home|workspace|opt|srv|etc|var|usr)\b/.test(path)) {
+    return "firecracker";
+  }
+  return "mac";
 }
 
 function ThreadList({
   rows,
   query,
-  searchOpen,
   onSearchChange,
-  onToggleSearch,
   onSelect,
+  onNewAgent,
 }: {
   rows: ThreadRow[];
   query: string;
-  searchOpen: boolean;
   onSearchChange: (value: string) => void;
-  onToggleSearch: () => void;
   onSelect: (row: ThreadRow) => void;
+  onNewAgent: () => void;
 }) {
   return (
     <section className="panel-threads">
-      <div className="panel-threads-head">
-        <span className="panel-section-title">Agents</span>
+      <div className="panel-threads-head" data-tauri-drag-region>
         <button
           className="icon-button icon-mini"
-          title="Search agents"
-          aria-label="Search agents"
-          aria-pressed={searchOpen}
-          onClick={onToggleSearch}
+          title="New agent"
+          aria-label="New agent"
+          onClick={onNewAgent}
         >
-          <SearchIcon />
+          <PlusIcon />
         </button>
       </div>
-      {searchOpen && (
-        <label className="sidebar-search panel-search">
-          <SearchIcon />
-          <input
-            autoFocus
-            value={query}
-            onChange={(event) => onSearchChange(event.target.value)}
-            placeholder="Search agents"
-            aria-label="Search agents"
-            spellCheck={false}
-          />
-        </label>
-      )}
+      <label className="sidebar-search panel-search">
+        <SearchIcon />
+        <input
+          value={query}
+          onChange={(event) => onSearchChange(event.target.value)}
+          placeholder="Search"
+          aria-label="Search agents"
+          spellCheck={false}
+        />
+      </label>
       <div className="agent-list panel-thread-list">
         {rows.map((row) => (
           <div
@@ -482,20 +503,17 @@ function ThreadList({
               }
             }}
           >
-            <span
-              className={`thread-dot${row.working ? " thread-dot-working" : ""}`}
-              title={row.working ? "Working" : "Idle"}
-              style={
-                row.working
-                  ? {
-                      animationDelay: `-${pulseSeed(row.id) % 700}ms`,
-                      animationDuration: `${1000 + (pulseSeed(row.id) % 900)}ms`,
-                    }
-                  : undefined
-              }
-            />
+            <span className="agent-avatar" style={{ background: row.color }}>
+              {row.working && <span className="agent-avatar-working" />}
+            </span>
             <span className="agent-row-body">
-              <span className="agent-row-name">{row.name}</span>
+              <span className="agent-row-top">
+                <span className="agent-row-name">{row.name}</span>
+                {row.role && <span className="agent-role">{row.role}</span>}
+              </span>
+              {row.preview && (
+                <span className="agent-row-preview">{row.preview}</span>
+              )}
             </span>
           </div>
         ))}
@@ -541,6 +559,7 @@ function ThreadChat({
   challenges,
   onCancel,
   queuedMessageIds,
+  onOpenFile,
 }: {
   daemon: ReturnType<typeof useDaemon>;
   bot: Bot | null;
@@ -563,6 +582,7 @@ function ThreadChat({
   challenges: PendingChallenge[];
   onCancel: () => void;
   queuedMessageIds: string[];
+  onOpenFile: (path: string, computer?: ComputerKind) => void;
 }) {
   const modelValue = daemon.selectedModel
     ? `${daemon.selectedModel.provider}::${daemon.selectedModel.model}`
@@ -580,13 +600,14 @@ function ThreadChat({
   const renderMessages = (list: Message[], live: boolean) =>
     groupTranscript(list, live).map((entry) =>
       entry.kind === "turn" ? (
-        <TurnBubble key={entry.final.id} entry={entry} />
+        <TurnBubble key={entry.final.id} entry={entry} onOpenFile={onOpenFile} />
       ) : (
         <MessageBubble
           key={entry.message.id}
           message={entry.message}
           queued={queuedMessageIds.includes(entry.message.id)}
           live={entry.live}
+          onOpenFile={onOpenFile}
         />
       ),
     );
@@ -694,6 +715,7 @@ function ThreadChat({
                 activity={activity}
                 approvals={approvals}
                 onRespondApproval={daemon.respondToApproval}
+                onOpenFile={onOpenFile}
               >
                 {challenges.map((challenge) => (
                   <ChallengeCard
@@ -895,13 +917,16 @@ export default function App() {
   const [todoBoardOpen, setTodoBoardOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [search, setSearch] = useState("");
-  const [searchOpen, setSearchOpen] = useState(false);
   const [settingsBotId, setSettingsBotId] = useState<string | null>(null);
   const [routineModalOpen, setRoutineModalOpen] = useState(false);
   const [routineEditing, setRoutineEditing] = useState<Routine | null>(null);
   const [panelOpen, setPanelOpen] = useState<boolean>(storedPanelOpen);
   const [panelTab, setPanelTab] = useState<PanelTab>("screen");
   const [panelComputer, setPanelComputer] = useState<ComputerKind | null>(null);
+  const [fileRequest, setFileRequest] = useState<{
+    path: string;
+    nonce: number;
+  } | null>(null);
   const [screenImageUrl, setScreenImageUrl] = useState<string | null>(null);
   const [screenUpdatedAt, setScreenUpdatedAt] = useState<number | null>(null);
   const [screenStatus, setScreenStatus] = useState<ScreenStatus>("loading");
@@ -1135,17 +1160,68 @@ export default function App() {
       !q || parts.some((part) => (part ?? "").toLowerCase().includes(q));
     return daemon.bots
       .filter((bot) => matches(bot.name, bot.role))
-      .map((bot) => ({
-        id: bot.id,
-        name: bot.name,
-        selected: bot.id === daemon.selectedBotId,
-        working: daemon.streamingByThread[threadByBot.get(bot.id)?.id ?? ""] !== undefined,
-        title: bot.role ?? bot.name,
-      }));
+      .map((bot) => {
+        const thread = threadByBot.get(bot.id) ?? null;
+        return {
+          id: bot.id,
+          name: bot.name,
+          color: bot.color ?? avatarColor(bot.id),
+          role: bot.role ?? null,
+          preview: thread?.lastMessage
+            ? previewText(thread.lastMessage)
+            : null,
+          selected: bot.id === daemon.selectedBotId,
+          working:
+            daemon.streamingByThread[thread?.id ?? ""] !== undefined,
+          title: bot.role ?? bot.name,
+        };
+      });
   })();
 
   const openThread = (row: ThreadRow) => {
     daemon.selectBot(row.id);
+  };
+
+  const showFileInPanel = (path: string, computer: ComputerKind) => {
+    setPanelOpen(true);
+    try {
+      localStorage.setItem(PANEL_OPEN_KEY, "1");
+    } catch {}
+    setPanelComputer(computer);
+    setPanelTab("files");
+    setFileRequest({ path, nonce: Date.now() });
+  };
+
+  const openFile = (path: string, hint?: ComputerKind) => {
+    if (!screenBot) {
+      return;
+    }
+    const computer = fileComputer(screenBot, path, hint);
+    if (computer !== "mac") {
+      showFileInPanel(path, computer);
+      return;
+    }
+    void (async () => {
+      const result = await daemon.readFile(screenBot.id, path, "mac");
+      if (result.error || result.kind === "missing") {
+        if (agentHasVm) {
+          showFileInPanel(path, "firecracker");
+          return;
+        }
+        void navigator.clipboard?.writeText(path).catch(() => undefined);
+        return;
+      }
+      if (await openPathOnMac(result.path)) {
+        return;
+      }
+      if (isMacOnly(screenBot)) {
+        void navigator.clipboard
+          ?.writeText(result.path || path)
+          .catch(() => undefined);
+        return;
+      }
+      showFileInPanel(path, "mac");
+    })();
   };
 
   useEffect(() => {
@@ -1321,17 +1397,9 @@ export default function App() {
           <ThreadList
             rows={threadRows}
             query={search}
-            searchOpen={searchOpen}
             onSearchChange={setSearch}
-            onToggleSearch={() =>
-              setSearchOpen((value) => {
-                if (value) {
-                  setSearch("");
-                }
-                return !value;
-              })
-            }
             onSelect={openThread}
+            onNewAgent={() => setCreateOpen(true)}
           />
         </aside>
         <button
@@ -1382,6 +1450,7 @@ export default function App() {
           challenges={challenges}
           onCancel={daemon.cancel}
           queuedMessageIds={daemon.queuedMessageIds}
+          onOpenFile={openFile}
         />
       </main>
 
@@ -1493,6 +1562,7 @@ export default function App() {
                             ? { rootLabel: filesRootLabel }
                             : {})}
                           active={activeTab === "files"}
+                          openRequest={fileRequest}
                           listFiles={daemon.listFiles}
                           readFile={daemon.readFile}
                         />
@@ -1754,7 +1824,13 @@ function diffLineClass(line: string): string {
   return "";
 }
 
-function ChangedFilesCard({ changes }: { changes: AggregatedFileChange[] }) {
+function ChangedFilesCard({
+  changes,
+  onOpenFile,
+}: {
+  changes: AggregatedFileChange[];
+  onOpenFile?: (path: string, computer?: ComputerKind) => void;
+}) {
   const [openPath, setOpenPath] = useState<string | null>(null);
   if (changes.length === 0) {
     return null;
@@ -1779,43 +1855,68 @@ function ChangedFilesCard({ changes }: { changes: AggregatedFileChange[] }) {
         {changes.map((change) => {
           const open = openPath === change.path;
           const hasDiff = Boolean(change.diff);
-          const row = (
+          const stats = (
             <>
-              <span className="changed-files-path" title={change.path}>
-                {change.path}
-              </span>
               <span className="changed-files-stat changed-files-add">
                 +{change.additions}
               </span>
               <span className="changed-files-stat changed-files-del">
                 −{change.deletions}
               </span>
-              {hasDiff && (
-                <span
-                  className={`changed-files-chevron${open ? " open" : ""}`}
-                >
-                  <ChevronIcon />
-                </span>
-              )}
             </>
           );
           return (
             <div className="changed-files-item" key={change.path}>
-              {hasDiff ? (
-                <button
-                  type="button"
-                  className="changed-files-row"
-                  aria-expanded={open}
-                  aria-label={open ? "Hide diff" : "Show diff"}
-                  onClick={() => setOpenPath(open ? null : change.path)}
-                >
-                  {row}
-                </button>
-              ) : (
-                <div className="changed-files-row changed-files-static">
-                  {row}
-                </div>
-              )}
+              <div
+                className={`changed-files-row${hasDiff ? "" : " changed-files-static"}`}
+                role={hasDiff ? "button" : undefined}
+                tabIndex={hasDiff ? 0 : undefined}
+                aria-expanded={hasDiff ? open : undefined}
+                onClick={
+                  hasDiff
+                    ? () => setOpenPath(open ? null : change.path)
+                    : undefined
+                }
+                onKeyDown={
+                  hasDiff
+                    ? (event) => {
+                        if (event.target !== event.currentTarget) {
+                          return;
+                        }
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          setOpenPath(open ? null : change.path);
+                        }
+                      }
+                    : undefined
+                }
+              >
+                {onOpenFile ? (
+                  <span
+                    className="changed-files-path-slot"
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <FileChip
+                      className="changed-files-path"
+                      label={change.path}
+                      title={`Open ${change.path}`}
+                      onClick={() => onOpenFile(change.path)}
+                    />
+                  </span>
+                ) : (
+                  <span className="changed-files-path" title={change.path}>
+                    {change.path}
+                  </span>
+                )}
+                {stats}
+                {hasDiff && (
+                  <span
+                    className={`changed-files-chevron${open ? " open" : ""}`}
+                  >
+                    <ChevronIcon />
+                  </span>
+                )}
+              </div>
               {open && change.diff && (
                 <pre className="changed-files-diff">
                   {change.diff.split("\n").map((line, index) => (
@@ -1838,10 +1939,12 @@ function MessageBubble({
   message,
   queued,
   live,
+  onOpenFile,
 }: {
   message: Message;
   queued?: boolean;
   live?: boolean;
+  onOpenFile: (path: string, computer?: ComputerKind) => void;
 }) {
   const calls = message.toolCalls ?? [];
 
@@ -1901,15 +2004,19 @@ function MessageBubble({
             artifacts: call.artifacts,
           }))}
           running={false}
+          onOpenFile={onOpenFile}
         />
       )}
       {message.content && (
         <div className="entry-body">
-          <Markdown text={message.content} />
+          <Markdown text={message.content} onOpenFile={onOpenFile} />
         </div>
       )}
       {!live && !message.compaction && (
-        <ChangedFilesCard changes={collectFileChanges([message])} />
+        <ChangedFilesCard
+          changes={collectFileChanges([message])}
+          onOpenFile={onOpenFile}
+        />
       )}
     </div>
   );
@@ -1968,8 +2075,10 @@ function groupTranscript(messages: Message[], live: boolean): TranscriptEntry[] 
 
 function TurnBubble({
   entry,
+  onOpenFile,
 }: {
   entry: { work: Message[]; final: Message };
+  onOpenFile: (path: string, computer?: ComputerKind) => void;
 }) {
   const items: WorkItem[] = entry.work.flatMap((message) =>
     (message.toolCalls ?? []).map((call) => ({
@@ -1998,14 +2107,16 @@ function TurnBubble({
         items={items}
         narration={narration}
         running={false}
+        onOpenFile={onOpenFile}
       />
       {entry.final.content && (
         <div className="entry-body">
-          <Markdown text={entry.final.content} />
+          <Markdown text={entry.final.content} onOpenFile={onOpenFile} />
         </div>
       )}
       <ChangedFilesCard
         changes={collectFileChanges([...entry.work, entry.final])}
+        onOpenFile={onOpenFile}
       />
     </div>
   );
@@ -2051,6 +2162,7 @@ function WorkGroup({
   running,
   approvals,
   onRespondApproval,
+  onOpenFile,
 }: {
   items: WorkItem[];
   narration?: NarrationItem[];
@@ -2059,6 +2171,7 @@ function WorkGroup({
   running: boolean;
   approvals?: PendingApproval[];
   onRespondApproval?: (requestId: string, decision: "approve" | "deny", remember?: boolean) => void;
+  onOpenFile?: (path: string, computer?: ComputerKind) => void;
 }) {
   const pending = (approvals ?? []).filter((approval) => !approval.decision);
   // Collapsed by default, live or finished; the user opens it, or an
@@ -2172,13 +2285,20 @@ function WorkGroup({
         if (entry.type === "narration") {
           return (
             <div key={entry.narration.id} className="work-narration">
-              <Markdown text={entry.narration.text} />
+              <Markdown
+                text={entry.narration.text}
+                {...(onOpenFile ? { onOpenFile } : {})}
+              />
             </div>
           );
         }
         if (entry.type === "reads") {
           return (
-            <ReadsRow key={entry.items[0]!.callId} items={entry.items} />
+            <ReadsRow
+              key={entry.items[0]!.callId}
+              items={entry.items}
+              onOpenFile={onOpenFile}
+            />
           );
         }
         const item = entry.item;
@@ -2200,6 +2320,7 @@ function WorkGroup({
               durationMs={item.durationMs}
               artifacts={item.artifacts}
               at={item.at}
+              onOpenFile={onOpenFile}
             />
           </div>
         );
@@ -2234,6 +2355,8 @@ function WorkGroup({
   );
 }
 
+const FILE_TOOLS = new Set(["read_file", "write_file", "edit"]);
+
 function ToolRow({
   name,
   arguments: rawArguments,
@@ -2243,6 +2366,7 @@ function ToolRow({
   durationMs,
   artifacts,
   at,
+  onOpenFile,
 }: {
   name: string;
   arguments: string;
@@ -2252,6 +2376,7 @@ function ToolRow({
   durationMs: number | null;
   artifacts: ToolArtifact[] | null;
   at?: number;
+  onOpenFile?: (path: string, computer?: ComputerKind) => void;
 }) {
   const [now, setNow] = useState(() => Date.now());
   const [open, setOpen] = useState(false);
@@ -2273,6 +2398,11 @@ function ToolRow({
 
   const label = toolLabel(name);
   const detail = toolDetail(rawArguments);
+  const parsed = parseToolArguments(rawArguments);
+  const filePath =
+    FILE_TOOLS.has(name) && typeof parsed.path === "string" && parsed.path
+      ? parsed.path
+      : null;
   const local = output?.startsWith("[local Mac]") ?? false;
   const failed = status === "done" && ok === false;
   const runningFor =
@@ -2287,10 +2417,19 @@ function ToolRow({
           {label.text}
           {label.code && <code className="tool-row-name">{label.code}</code>}
         </span>
-        {detail && (
-          <span className="tool-row-detail" title={detail}>
-            {detail}
-          </span>
+        {filePath && onOpenFile ? (
+          <FileChip
+            className="tool-row-detail"
+            label={detail}
+            title={`Open ${filePath}`}
+            onClick={() => onOpenFile(filePath, local ? "mac" : undefined)}
+          />
+        ) : (
+          detail && (
+            <span className="tool-row-detail" title={detail}>
+              {detail}
+            </span>
+          )
         )}
         {local && <span className="tool-row-local">this Mac</span>}
         {status === "running" ? (
@@ -2339,7 +2478,13 @@ function ToolRow({
   );
 }
 
-function ReadsRow({ items }: { items: WorkItem[] }) {
+function ReadsRow({
+  items,
+  onOpenFile,
+}: {
+  items: WorkItem[];
+  onOpenFile?: (path: string, computer?: ComputerKind) => void;
+}) {
   const [open, setOpen] = useState(false);
   const running = items.some((item) => item.status === "running");
   const failed = items.filter((item) => item.ok === false).length;
@@ -2383,6 +2528,7 @@ function ReadsRow({ items }: { items: WorkItem[] }) {
               durationMs={item.durationMs}
               artifacts={item.artifacts}
               at={item.at}
+              onOpenFile={onOpenFile}
             />
           ))}
         </div>
@@ -2511,14 +2657,23 @@ function ChallengeCard({
   );
 }
 
-function StreamingRow({ streaming }: { streaming: StreamingState }) {
+function StreamingRow({
+  streaming,
+  onOpenFile,
+}: {
+  streaming: StreamingState;
+  onOpenFile?: (path: string, computer?: ComputerKind) => void;
+}) {
   if (!streaming.text) {
     return null;
   }
 
   return (
     <div className="entry-body">
-      <Markdown text={streaming.text} />
+      <Markdown
+        text={streaming.text}
+        {...(onOpenFile ? { onOpenFile } : {})}
+      />
       <span className="caret" />
     </div>
   );
@@ -2533,12 +2688,14 @@ function LiveAssistant({
   activity,
   approvals,
   onRespondApproval,
+  onOpenFile,
   children,
 }: {
   streaming: StreamingState;
   activity: ToolActivity[];
   approvals: PendingApproval[];
   onRespondApproval: (requestId: string, decision: "approve" | "deny", remember?: boolean) => void;
+  onOpenFile?: (path: string, computer?: ComputerKind) => void;
   children?: ReactNode;
 }) {
   if (streaming.mode !== "work") {
@@ -2546,7 +2703,7 @@ function LiveAssistant({
       <div className="entry entry-assistant">
         {children}
         {streaming.text ? (
-          <StreamingRow streaming={streaming} />
+          <StreamingRow streaming={streaming} onOpenFile={onOpenFile} />
         ) : (
           <div
             className="typing-dots"
@@ -2571,8 +2728,9 @@ function LiveAssistant({
         running
         approvals={approvals}
         onRespondApproval={onRespondApproval}
+        onOpenFile={onOpenFile}
       />
-      <StreamingRow streaming={streaming} />
+      <StreamingRow streaming={streaming} onOpenFile={onOpenFile} />
     </div>
   );
 }

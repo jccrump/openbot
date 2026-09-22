@@ -1,45 +1,37 @@
 import type { ReactNode } from "react";
-
-async function openExternal(url: string): Promise<void> {
-  try {
-    if ("__TAURI_INTERNALS__" in window) {
-      const { openUrl } = await import("@tauri-apps/plugin-opener");
-      await openUrl(url);
-      return;
-    }
-  } catch {
-    // Fall through to the browser behavior below.
-  }
-  window.open(url, "_blank", "noopener,noreferrer");
-}
+import { FileChip, LinkChip, urlChipLabel } from "./Chips";
+import { filePathFromText, filePathFromUrl } from "../lib/filePaths";
 
 function isExternalUrl(url: string): boolean {
   return /^(https?:|mailto:)/i.test(url);
 }
 
-function Link({ url, children }: { url: string; children: ReactNode }) {
-  if (!isExternalUrl(url)) {
-    return <span>{children}</span>;
-  }
+function FileLink({
+  path,
+  label,
+  onOpenFile,
+}: {
+  path: string;
+  label: ReactNode;
+  onOpenFile: (path: string) => void;
+}) {
   return (
-    <a
-      href={url}
-      target="_blank"
-      rel="noreferrer"
-      onClick={(event) => {
-        event.preventDefault();
-        void openExternal(url);
-      }}
-    >
-      {children}
-    </a>
+    <FileChip
+      label={typeof label === "string" ? label : path}
+      title={`Open ${path}`}
+      onClick={() => onOpenFile(path)}
+    />
   );
 }
 
-function renderInline(text: string, keyPrefix: string): ReactNode[] {
+function renderInline(
+  text: string,
+  keyPrefix: string,
+  onOpenFile?: (path: string) => void,
+): ReactNode[] {
   const nodes: ReactNode[] = [];
   const pattern =
-    /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\[[^\]\n]+\]\([^)\s]+\))|(~~[^~\n]+~~)|(\*[^*\n]+\*)|(_[^_\n]+_)|(https?:\/\/[^\s<>()]+)/g;
+    /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\[[^\]\n]+\]\([^)\s]+\))|(~~[^~\n]+~~)|(\*[^*\n]+\*)|(_[^_\n]+_)|(https?:\/\/[^\s<>()]+)|((?:~\/|\/)[\w@+.-]+(?:\/[\w@+.-]+)+)/g;
   let last = 0;
   let index = 0;
   let match: RegExpExecArray | null;
@@ -51,35 +43,80 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
     const token = match[0];
     const key = `${keyPrefix}-i-${index}`;
     if (match[1]) {
-      nodes.push(<code key={key}>{token.slice(1, -1)}</code>);
+      const code = token.slice(1, -1);
+      const file = onOpenFile ? filePathFromText(code, true) : null;
+      if (file) {
+        nodes.push(
+          <FileChip
+            key={key}
+            label={file.label}
+            title={`Open ${file.path}`}
+            onClick={() => onOpenFile?.(file.path)}
+          />,
+        );
+      } else {
+        nodes.push(<code key={key}>{code}</code>);
+      }
     } else if (match[2]) {
       nodes.push(
         <strong key={key}>
-          {renderInline(token.slice(2, -2), `${key}-b`)}
+          {renderInline(token.slice(2, -2), `${key}-b`, onOpenFile)}
         </strong>,
       );
     } else if (match[3]) {
       const labelEnd = token.indexOf("](");
       const label = token.slice(1, labelEnd);
       const url = token.slice(labelEnd + 2, -1);
-      nodes.push(
-        <Link key={key} url={url}>
-          {renderInline(label, `${key}-a`)}
-        </Link>,
-      );
+      const fileUrl = filePathFromUrl(url);
+      const file =
+        onOpenFile && !fileUrl ? filePathFromText(url, true) : null;
+      if (fileUrl && onOpenFile) {
+        nodes.push(
+          <FileLink key={key} path={fileUrl} label={label} onOpenFile={onOpenFile} />,
+        );
+      } else if (file && onOpenFile) {
+        nodes.push(
+          <FileLink
+            key={key}
+            path={file.path}
+            label={label || file.label}
+            onOpenFile={onOpenFile}
+          />,
+        );
+      } else if (isExternalUrl(url)) {
+        nodes.push(
+          <LinkChip key={key} url={url} label={renderInline(label, `${key}-a`)} />,
+        );
+      } else {
+        nodes.push(<span key={key}>{renderInline(label, `${key}-p`, onOpenFile)}</span>);
+      }
     } else if (match[4]) {
       nodes.push(<del key={key}>{token.slice(2, -2)}</del>);
     } else if (match[5] || match[6]) {
       nodes.push(<em key={key}>{token.slice(1, -1)}</em>);
     } else if (match[7]) {
       const url = token.replace(/[.,;:!?]+$/, "");
-      nodes.push(
-        <Link key={key} url={url}>
-          {url}
-        </Link>,
-      );
+      nodes.push(<LinkChip key={key} url={url} label={urlChipLabel(url)} />);
       if (url.length < token.length) {
         nodes.push(token.slice(url.length));
+      }
+    } else if (match[8]) {
+      const trimmed = token.replace(/[.,;:!?]+$/, "");
+      const file = onOpenFile ? filePathFromText(trimmed, true) : null;
+      if (file) {
+        nodes.push(
+          <FileChip
+            key={key}
+            label={file.label}
+            title={`Open ${file.path}`}
+            onClick={() => onOpenFile?.(file.path)}
+          />,
+        );
+      } else {
+        nodes.push(token);
+      }
+      if (trimmed.length < token.length) {
+        nodes.push(token.slice(trimmed.length));
       }
     }
     last = match.index + token.length;
@@ -139,7 +176,13 @@ function listItemText(line: string): string {
     .trim();
 }
 
-export function Markdown({ text }: { text: string }) {
+export function Markdown({
+  text,
+  onOpenFile,
+}: {
+  text: string;
+  onOpenFile?: (path: string) => void;
+}) {
   const lines = text.replace(/\r\n?/g, "\n").split("\n");
   const blocks: ReactNode[] = [];
   let key = 0;
@@ -176,6 +219,7 @@ export function Markdown({ text }: { text: string }) {
       const content = renderInline(
         (heading[2] ?? "").replace(/\s+#+\s*$/, ""),
         `h-${key}`,
+        onOpenFile,
       );
       const Tag = `h${level}` as "h1" | "h2" | "h3" | "h4";
       blocks.push(<Tag key={`h-${key++}`}>{content}</Tag>);
@@ -197,7 +241,7 @@ export function Markdown({ text }: { text: string }) {
       }
       blocks.push(
         <blockquote key={`quote-${key++}`}>
-          {renderInline(quote.join(" "), `q-${key}`)}
+          {renderInline(quote.join(" "), `q-${key}`, onOpenFile)}
         </blockquote>,
       );
       continue;
@@ -226,7 +270,11 @@ export function Markdown({ text }: { text: string }) {
                     key={`th-${cellIndex}`}
                     style={{ textAlign: alignments[cellIndex] ?? "left" }}
                   >
-                    {renderInline(cell, `th-${tableKey}-${cellIndex}`)}
+                    {renderInline(
+                      cell,
+                      `th-${tableKey}-${cellIndex}`,
+                      onOpenFile,
+                    )}
                   </th>
                 ))}
               </tr>
@@ -242,6 +290,7 @@ export function Markdown({ text }: { text: string }) {
                       {renderInline(
                         row[cellIndex] ?? "",
                         `td-${tableKey}-${rowIndex}-${cellIndex}`,
+                        onOpenFile,
                       )}
                     </td>
                   ))}
@@ -266,7 +315,7 @@ export function Markdown({ text }: { text: string }) {
       const listKey = key++;
       const content = items.map((item, itemIndex) => (
         <li key={`li-${itemIndex}`}>
-          {renderInline(item, `li-${listKey}-${itemIndex}`)}
+          {renderInline(item, `li-${listKey}-${itemIndex}`, onOpenFile)}
         </li>
       ));
       blocks.push(
@@ -282,7 +331,7 @@ export function Markdown({ text }: { text: string }) {
     const paragraphKey = key++;
     blocks.push(
       <p key={`p-${paragraphKey}`}>
-        {renderInline(line, `p-${paragraphKey}`)}
+        {renderInline(line, `p-${paragraphKey}`, onOpenFile)}
       </p>,
     );
     index += 1;
