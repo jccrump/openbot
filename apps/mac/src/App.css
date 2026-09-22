@@ -1796,14 +1796,6 @@ body {
   color: var(--text);
 }
 
-.panel-tabs-actions {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  margin-left: auto;
-  min-width: 0;
-}
-
 .panel-tab-pane {
   display: flex;
   flex-direction: column;
@@ -2192,32 +2184,24 @@ body {
   color: var(--text-muted);
 }
 
-.screen-caption {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
-.screen-caption-title {
-  min-width: 0;
+/* The status pill rides on the screen itself: the tab bar has no caption. */
+.screen-status {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 2;
+  max-width: calc(100% - 16px);
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--bg-chat);
+  border: 0.5px solid var(--border);
+  font-size: 11px;
+  color: var(--text-secondary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.screen-caption-status {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.screen-caption .icon-button {
-  width: 22px;
-  height: 22px;
-  flex-shrink: 0;
+  pointer-events: none;
+  opacity: 0.92;
 }
 
 /* The left column holds the agent rail and pins Settings to the bottom-left
@@ -2345,6 +2329,232 @@ body {
   margin: 0;
   font-size: 12px;
   color: var(--text-muted);
+}
+
+/* Routines panel */
+
+.routines-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.routines-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.routines-head .routines-sub {
+  line-height: 15px;
+}
+
+.routine-new {
+  flex-shrink: 0;
+}
+
+.routine-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.routine-card {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px 11px;
+  border: 0.5px solid var(--border);
+  border-radius: 12px;
+}
+
+.routine-card-blocked {
+  border-color: var(--amber-border);
+  background: var(--amber-tint);
+}
+
+.routine-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.routine-card-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.routine-name {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.routine-computer {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 0.5px solid var(--border);
+  color: var(--text-secondary);
+}
+
+.routine-computer-firecracker {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.routine-brief {
+  margin: 0;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--text-secondary);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.routine-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.routine-status {
+  font-weight: 600;
+}
+
+.routine-status-ok {
+  color: var(--green);
+}
+
+.routine-status-running {
+  color: var(--accent);
+}
+
+.routine-status-error {
+  color: var(--red);
+}
+
+.routine-status-skipped {
+  color: var(--amber);
+}
+
+.routine-blocked {
+  margin: 0;
+  font-size: 11px;
+  line-height: 15px;
+  color: var(--amber);
+}
+
+.routine-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 2px;
+}
+
+.routine-action {
+  font-size: 11px;
+  padding: 3px 8px;
+}
+
+.routine-action-danger {
+  color: var(--red);
+}
+
+.routine-history {
+  border-top: 0.5px solid var(--hairline);
+  padding-top: 7px;
+}
+
+.routine-run-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.routine-run {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.routine-run-time {
+  flex-shrink: 0;
+}
+
+.routine-run-reason {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.routine-error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--red);
+}
+
+.entry-routine {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 4px;
+}
+
+.routine-badge {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 0.5px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.routine-schedule-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.routine-interval-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+}
+
+.routine-interval-row input {
+  width: 72px;
+}
+
+.field.routine-enabled-row {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
 }
 
 /* Create agent modal */

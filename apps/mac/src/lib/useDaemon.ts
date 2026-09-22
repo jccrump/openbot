@@ -22,6 +22,9 @@ import type {
   ProviderInfo,
   ProviderPreset,
   RolePolicy,
+  Routine,
+  RoutineRun,
+  RoutineSchedule,
   ServerMessage,
   SoulVersion,
   Thread,
@@ -131,6 +134,28 @@ export interface FileReadResult {
   size: number;
   truncated: boolean;
   error: string | null;
+}
+
+export interface CreateRoutineInput {
+  botId: string;
+  name: string;
+  brief: string;
+  computer: ComputerKind;
+  schedule: RoutineSchedule;
+  enabled?: boolean;
+}
+
+export interface RoutinePatch {
+  name?: string;
+  brief?: string;
+  computer?: ComputerKind;
+  schedule?: RoutineSchedule;
+  enabled?: boolean;
+}
+
+export interface RoutineActionResult {
+  ok: boolean;
+  message: string | null;
 }
 
 const SELECTED_BOT_KEY = "openbot.bot";
@@ -248,6 +273,7 @@ export function useDaemon() {
     merged: number;
   } | null>(null);
   const [approvalRecords, setApprovalRecords] = useState<ApprovalRecord[]>([]);
+  const [routines, setRoutines] = useState<Routine[]>([]);
 
   const activeThreadIdRef = useRef<string | null>(null);
   activeThreadIdRef.current = activeThreadId;
@@ -286,6 +312,24 @@ export function useDaemon() {
       string,
       { resolve: (bot: Bot) => void; reject: (error: Error) => void }
     >(),
+  );
+  const routineRequests = useRef(
+    new Map<
+      string,
+      { resolve: (routine: Routine) => void; reject: (error: Error) => void }
+    >(),
+  );
+  const routineRemoveRequests = useRef(
+    new Map<
+      string,
+      { resolve: () => void; reject: (error: Error) => void }
+    >(),
+  );
+  const routineRunRequests = useRef(
+    new Map<string, (result: RoutineActionResult) => void>(),
+  );
+  const routineRunsRequests = useRef(
+    new Map<string, (runs: RoutineRun[]) => void>(),
   );
 
   const activateBot = useCallback(
@@ -411,6 +455,7 @@ export function useDaemon() {
           setChatBusyBehavior(message.chatBusyBehavior ?? "steer");
           setWorkspaces(message.workspaces ?? []);
           setWorkspaceRoots(message.workspaceRoots ?? []);
+          setRoutines(message.routines ?? []);
           setQueuedMessageIds([]);
           const stored = storedBotId();
           const current = selectedBotIdRef.current;
@@ -922,6 +967,76 @@ export function useDaemon() {
           setSoulVersions(message.versions);
           break;
         }
+        case "routines": {
+          setRoutines(message.routines);
+          break;
+        }
+        case "routine.created":
+        case "routine.updated": {
+          const pending = routineRequests.current.get(message.requestId);
+          if (pending) {
+            routineRequests.current.delete(message.requestId);
+            pending.resolve(message.routine);
+          }
+          setRoutines((current) => {
+            const exists = current.some(
+              (routine) => routine.id === message.routine.id,
+            );
+            return exists
+              ? current.map((routine) =>
+                  routine.id === message.routine.id
+                    ? message.routine
+                    : routine,
+                )
+              : [...current, message.routine];
+          });
+          break;
+        }
+        case "routine.removed": {
+          const pending = routineRemoveRequests.current.get(message.requestId);
+          if (pending) {
+            routineRemoveRequests.current.delete(message.requestId);
+            pending.resolve();
+          }
+          setRoutines((current) =>
+            current.filter((routine) => routine.id !== message.routineId),
+          );
+          break;
+        }
+        case "routine.started": {
+          const pending = routineRunRequests.current.get(message.requestId);
+          if (pending) {
+            routineRunRequests.current.delete(message.requestId);
+            pending({ ok: message.ok, message: message.message });
+          }
+          break;
+        }
+        case "routine.runs": {
+          const pending = routineRunsRequests.current.get(message.requestId);
+          if (pending) {
+            routineRunsRequests.current.delete(message.requestId);
+            pending(message.runs);
+          }
+          break;
+        }
+        case "routine.error": {
+          const pending = routineRequests.current.get(message.requestId);
+          if (pending) {
+            routineRequests.current.delete(message.requestId);
+            pending.reject(new Error(message.message));
+            break;
+          }
+          const removePending = routineRemoveRequests.current.get(
+            message.requestId,
+          );
+          if (removePending) {
+            routineRemoveRequests.current.delete(message.requestId);
+            removePending.reject(new Error(message.message));
+            break;
+          }
+          setError(message.message);
+          break;
+        }
         case "chat.message": {
           if (message.message.role === "assistant") {
             setToolActivity((current) =>
@@ -1196,6 +1311,100 @@ export function useDaemon() {
         type: "soul.revert",
         versionId,
         ...(botId ? { botId } : {}),
+      });
+    },
+    [client],
+  );
+
+  const routineRequestId = () =>
+    `routine-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+  const createRoutine = useCallback(
+    (input: CreateRoutineInput): Promise<Routine> => {
+      const requestId = routineRequestId();
+      return new Promise((resolve, reject) => {
+        routineRequests.current.set(requestId, { resolve, reject });
+        client.send({ type: "routines.create", requestId, ...input });
+        setTimeout(() => {
+          const pending = routineRequests.current.get(requestId);
+          if (pending) {
+            routineRequests.current.delete(requestId);
+            pending.reject(new Error("timed out waiting for the daemon"));
+          }
+        }, 15_000);
+      });
+    },
+    [client],
+  );
+
+  const updateRoutine = useCallback(
+    (routineId: string, patch: RoutinePatch): Promise<Routine> => {
+      const requestId = routineRequestId();
+      return new Promise((resolve, reject) => {
+        routineRequests.current.set(requestId, { resolve, reject });
+        client.send({ type: "routines.update", requestId, routineId, ...patch });
+        setTimeout(() => {
+          const pending = routineRequests.current.get(requestId);
+          if (pending) {
+            routineRequests.current.delete(requestId);
+            pending.reject(new Error("timed out waiting for the daemon"));
+          }
+        }, 15_000);
+      });
+    },
+    [client],
+  );
+
+  const removeRoutine = useCallback(
+    (routineId: string): Promise<void> => {
+      const requestId = routineRequestId();
+      return new Promise((resolve, reject) => {
+        routineRemoveRequests.current.set(requestId, { resolve, reject });
+        client.send({ type: "routines.remove", requestId, routineId });
+        setTimeout(() => {
+          const pending = routineRemoveRequests.current.get(requestId);
+          if (pending) {
+            routineRemoveRequests.current.delete(requestId);
+            pending.reject(new Error("timed out waiting for the daemon"));
+          }
+        }, 15_000);
+      });
+    },
+    [client],
+  );
+
+  const runRoutine = useCallback(
+    (routineId: string): Promise<RoutineActionResult> => {
+      const requestId = routineRequestId();
+      return new Promise((resolve) => {
+        routineRunRequests.current.set(requestId, resolve);
+        client.send({ type: "routines.run", requestId, routineId });
+        setTimeout(() => {
+          if (routineRunRequests.current.has(requestId)) {
+            routineRunRequests.current.delete(requestId);
+            resolve({
+              ok: false,
+              message: "timed out waiting for the daemon",
+            });
+          }
+        }, 15_000);
+      });
+    },
+    [client],
+  );
+
+  const loadRoutineRuns = useCallback(
+    (routineId: string, limit = 20): Promise<RoutineRun[]> => {
+      const requestId = routineRequestId();
+      return new Promise((resolve) => {
+        routineRunsRequests.current.set(requestId, resolve);
+        client.send({ type: "routine.runs", requestId, routineId, limit });
+        setTimeout(() => {
+          if (routineRunsRequests.current.has(requestId)) {
+            routineRunsRequests.current.delete(requestId);
+            resolve([]);
+          }
+        }, 15_000);
       });
     },
     [client],
@@ -1629,6 +1838,12 @@ export function useDaemon() {
     accessReport,
     checkAccess,
     openAccessPane,
+    routines,
+    createRoutine,
+    updateRoutine,
+    removeRoutine,
+    runRoutine,
+    loadRoutineRuns,
     activeThreadId,
     messages,
     streaming,

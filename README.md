@@ -153,12 +153,15 @@ Ask the agent something that requires its computer — "what OS are you running
 on?" or "open Hacker News and take a screenshot". The agent streams its reply,
 the app shows a tool card, and execution pauses on an **Approval needed** card
 with the exact command and Approve/Deny buttons. Approved browser screenshots
-appear in the chat. The agent panel on the right has three tabs — **Screen**
+appear in the chat. The agent panel on the right has tabs for **Screen**
 (the live desktop, connected only while that tab is open, with the latest
 captured screenshot as fallback), **Files** (browse the agent's computer and
 preview text or image files; on This Mac it is confined to the agent's
 workspace), and **Terminal** (an interactive shell in the agent's microVM with
-a real PTY, so `vim`, `top`, and REPLs work). The thread rail on the left lists
+a real PTY, so `vim`, `top`, and REPLs work), with a **Routines** section
+below them (scheduled briefs, described below). An agent with both computers
+gets a VM/Local switch; Screen only exists on the VM. The thread rail on the
+left lists
 your agents, one thread each. A toggle in Settings turns the approval gate off
 for trusted work; local-Mac tools follow the same switch, and deny rules still
 win.
@@ -214,7 +217,8 @@ when the Codex CLI is on `PATH`.
 - **Providers** as user data: add/edit/remove/enable, presets for nine
   providers, "fetch models" from any OpenAI-compatible `/models` endpoint, and
   live rebuilds without restarting the daemon.
-- **Agent panel** on the right with Screen, Files, and Terminal tabs. Screen is
+- **Agent panel** on the right with Screen, Files, and Terminal tabs, plus a
+  Routines section below them. Screen is
   the on-demand live desktop (noVNC connects only while that tab is open, and
   it falls back to the latest captured screenshot). Files browses the agent's
   computer — breadcrumbs, sizes and dates, and a text or image preview — using
@@ -267,6 +271,16 @@ when the Codex CLI is on `PATH`.
   folder only, the whole home folder, or full filesystem access. While approvals
   are on, local actions ask unless the project trusts the command or a policy
   rule allows them; with approvals off they follow the same global switch.
+- **Routines**: scheduled briefs owned by an agent. A routine pins one of the
+  agent's computers (the microVM or This Mac), runs its brief as a turn in the
+  agent's thread on a simple schedule — every N minutes/hours, or daily at a
+  time — and journals every firing. The brief arrives marked with a **Routine**
+  badge in the transcript, and runs on This Mac still follow the approvals
+  policy. If the agent loses the routine's computer, the routine is shown as
+  unavailable and its firings are journaled as skipped instead of running
+  somewhere else; a firing never interrupts a turn that is already running. The
+  right column's **Routines** section creates, edits, runs, disables, and
+  inspects the run history.
 - **Self-knowledge**: the daemon knows how it is installed and where it runs
   (dev checkout or packaged app, source and app paths, version, git revision,
   data directory, launch command, check commands), tells each agent in its
@@ -361,8 +375,11 @@ Be honest with yourself about the following before filing issues:
   mutations.** Files under `/root`, `/home`, `/srv`, and the workspace
   directories migrate; hand-edited files elsewhere in the guest OS may be
   replaced by the new base. Only the newest compressed recovery image is kept.
-- **Routines and the scheduler are not implemented.** The Routines section in
-  the right panel is a labeled placeholder.
+- **Routine notifications are not implemented.** A routine run lands in the
+  agent's thread and its history shows in the Routines section, but the app does
+  not raise a system notification when it finishes, and occurrences missed
+  while the daemon was down fire once on the next tick instead of replaying
+  every missed time.
 - **The Marketplace row is a placeholder** and is disabled.
 - **Voice input and attachments are not implemented.** The mic and "+" buttons
   in the composer are disabled/labeled "coming soon".

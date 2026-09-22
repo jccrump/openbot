@@ -27,7 +27,7 @@ models through the local responses bridge.
 - **M4 (done):** one agent per thread — every agent owns its own computer set
   (the microVM, This Mac, or both), its own memory and soul, and nothing routes
   work between agents. See [Agents](#agents).
-- **M5+ (planned):** routines, mobile.
+- **M5+ (planned):** mobile. Routines shipped ahead of the milestone (ADR-027).
 
 Subagent handoffs and group chats are not implemented. Every agent is
 independent: it has exactly one thread and its own computer set, and nothing
@@ -124,7 +124,7 @@ docs/                      This document and screenshots
   the collapse control) returns to the view-only preview. Model actions over
   VNC and manual takeover share the same display, so the model can keep
   working while the user watches, and either can take over.
-- Not present yet: approvals inbox, routines browser, memory browser, and
+- Not present yet: approvals inbox, memory browser, and
   group chats. The thread rail is a flat list of agents.
 
 **Settings layout.** Seven sections in a left nav with search:
@@ -317,9 +317,19 @@ status (`active` / `suspect` / `archived`).
   and the reflection pass rewrites it once enough new memories accumulate.
   Every version is kept and the user can revert from the Memory panel.
 
-**Routines (planned).** A routine is an agent-owned scheduled spawn: a brief
-template and a schedule. The agent watches routine runs, summarizes the
-outcome, and notifies the user; the run itself stays replayable.
+**Routines.** A routine is an agent-owned scheduled spawn: a brief template
+and a schedule, pinned to one of the agent's computers. The daemon's
+`RoutineService` fires due routines into the agent's thread — the brief lands
+as a user message marked with a `routine` ref, so the transcript shows what
+triggered the turn — and journals every firing in `routine_runs`. A routine
+runs on its computer only while the agent still has that computer (ADR-021):
+when the grant is revoked the routine is listed as unavailable and its
+firings are journaled as skipped instead of silently running elsewhere. The
+scheduler never interrupts a running turn; a firing waits for the agent to go
+idle. The schedule is structural — an interval or a daily local time — so
+there is no cron parser. Runs keep the agent's approval policy, so an
+unattended This Mac routine can stall on an approval card until the policy
+timeout denies it (ADR-027).
 
 ### Model gateway (`packages/gateway`)
 
@@ -812,9 +822,10 @@ providers  id, label, base_url, api_key, api_key_env, models, enabled,
 settings   key, value
 ```
 
-A bot has a single `computer` (`firecracker` or `mac`), an optional
-`workspace_id`, an `access` mode for This Mac reach, and an optional `policy`
-that can only narrow the global approvals policy.
+A bot has a `computers` capability set (`firecracker`, `mac`, or both), an
+optional `workspace_id`, an `access` mode for This Mac reach, and an optional
+`policy` that can only narrow the global approvals policy. A routine is a
+brief plus a schedule pinned to one of the agent's computers.
 
 ```
 approvals     id, request_id, run_id, thread_id, bot_id, tool, arguments,
@@ -824,10 +835,14 @@ memories      id, scope, type, content, evidence, confidence, importance,
               created_at, updated_at, last_used_at, use_count
 soul_versions id, bot_id, version, content, summary, reason, source,
               created_at
+routines      id, bot_id, name, brief, computer, schedule, enabled,
+              next_run_at, created_at, updated_at
+routine_runs  id, routine_id, bot_id, thread_id, status, reason, started_at,
+              finished_at
 ```
 
 `memories` also has an FTS5 companion table (`memories_fts`) kept in sync on
-write. Planned additions: `runs` (journal), `routines`, `approvals`, `secrets`
+write. Planned additions: a general `runs` journal, `secrets`.
 (references only; values would move to the macOS Keychain).
 
 ## Security model
@@ -865,7 +880,7 @@ write. Planned additions: `runs` (journal), `routines`, `approvals`, `secrets`
 | M2 | Browser automation, persistent sign-ins, live screen view | Browser automation, screenshots, and live noVNC desktop done; sign-in polish pending |
 | M3 | Codex provider with ChatGPT sign-in | Optional Codex harness + responses bridge implemented; bridge verified end to end with a real non-OpenAI provider; ChatGPT subscription flow not verified end to end; SDK provider planned |
 | M4 | One agent per thread: independent agents, each with its own computer, memory, and soul | Done |
-| M5 | Routines: scheduled spawns, procedural memory, replay | Planned |
+| M5 | Routines: scheduled spawns, procedural memory, replay | Routines done (ADR-027); procedural memory and replay planned |
 | M6 | Mobile thin client over Tailscale | Planned |
 
 ## Decisions
@@ -1141,6 +1156,25 @@ between agents. Agents can still run on This Mac via a registered workspace and 
 per-agent access mode. Rejected: keeping the hierarchy (complexity without a
 clear win); a middle-ground shared-memory model (reintroduces the identity
 problem the revert removed).
+
+**ADR-027: Routines are agent-owned scheduled spawns.** A routine is a brief
+plus a schedule, pinned to one of the agent's computers. The daemon's
+`RoutineService` fires due routines into the agent's thread: the brief is
+persisted as a user message marked with a `routine` ref (id, name, run id) so
+the transcript shows what triggered the turn, and the run is journaled in
+`routine_runs`. Execution uses the routine's computer only while the agent
+still has it (`botHasComputer`); if the grant is revoked, the routine is listed
+as unavailable and its firings are journaled as skipped rather than run on the
+other computer. An agent that is mid-turn is never interrupted: the firing
+keeps its due time and retries on a later tick. The schedule is structural — an
+interval (5 minutes to 7 days) or a daily local time — so there is no cron
+parser. Runs on This Mac keep the agent's approval policy, so an unattended
+routine can stall on an approval card until the policy timeout denies it.
+Rejected: a per-routine model override (the agent's model is its identity);
+cron expressions (surface area without a user need); firing once per granted
+computer (double side effects); a dedicated thread per routine (the one-agent
+model already gives each routine a home, and inline runs keep the surrounding
+context).
 
 ## Running it
 

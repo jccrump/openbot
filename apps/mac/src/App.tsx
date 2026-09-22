@@ -12,6 +12,7 @@ import type {
   Message,
   ModelRef,
   ReasoningEffort,
+  Routine,
   Thread,
   ToolArtifact,
   ToolCallRecord,
@@ -26,12 +27,15 @@ import { ConfirmDialog } from "./components/ConfirmDialog";
 import { FilesPanel } from "./components/FilesPanel";
 import { Markdown } from "./components/Markdown";
 import { MemoryModal } from "./components/MemoryModal";
+import { RoutineModal, type RoutineDraft } from "./components/RoutineModal";
+import { RoutinesPanel } from "./components/RoutinesPanel";
 import { TerminalPanel } from "./components/TerminalPanel";
 import { VncView, type VncState } from "./components/VncView";
 import {
   AVATAR_COLORS,
   avatarColor,
   EFFORT_OPTIONS,
+  hasMac,
   hasVm,
   isMacOnly,
 } from "./lib/agentOptions";
@@ -242,23 +246,6 @@ function ClearIcon() {
         strokeLinecap="round"
         strokeLinejoin="round"
       />
-    </svg>
-  );
-}
-
-function PauseIcon() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-      <rect x="2.6" y="2" width="2.4" height="8" rx="1" fill="currentColor" />
-      <rect x="7" y="2" width="2.4" height="8" rx="1" fill="currentColor" />
-    </svg>
-  );
-}
-
-function PlayIcon() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-      <path d="M3.4 2.4 9.6 6l-6.2 3.6V2.4Z" fill="currentColor" />
     </svg>
   );
 }
@@ -889,10 +876,11 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [settingsBotId, setSettingsBotId] = useState<string | null>(null);
+  const [routineModalOpen, setRoutineModalOpen] = useState(false);
+  const [routineEditing, setRoutineEditing] = useState<Routine | null>(null);
   const [panelOpen, setPanelOpen] = useState<boolean>(storedPanelOpen);
   const [panelTab, setPanelTab] = useState<PanelTab>("screen");
   const [panelComputer, setPanelComputer] = useState<ComputerKind | null>(null);
-  const [screenPlaying, setScreenPlaying] = useState(true);
   const [screenImageUrl, setScreenImageUrl] = useState<string | null>(null);
   const [screenUpdatedAt, setScreenUpdatedAt] = useState<number | null>(null);
   const [screenStatus, setScreenStatus] = useState<ScreenStatus>("loading");
@@ -914,6 +902,7 @@ export default function App() {
   // all: their computer is this one, so the user already has their own screen,
   // terminal, and Finder.
   const agentHasVm = hasVm(screenBot);
+  const agentHasMac = hasMac(screenBot);
   const availableComputers: ComputerKind[] = screenBot
     ? botComputers(screenBot)
     : ["firecracker"];
@@ -946,6 +935,10 @@ export default function App() {
         : (screenBot?.access ?? "project") === "full"
           ? "Filesystem"
           : filesWorkspace?.name;
+  // Routines belong to the agent, not to the panel's computer tab.
+  const botRoutines = screenBot
+    ? daemon.routines.filter((routine) => routine.botId === screenBot.id)
+    : [];
   const hasUsableProvider = daemon.providers.some(isProviderUsable);
   const hasProviderNeedingKey = daemon.providers.some(
     (provider) =>
@@ -988,7 +981,6 @@ export default function App() {
   const vncActive =
     canStream &&
     showScreen &&
-    screenPlaying &&
     panelOpen &&
     activeTab === "screen" &&
     screenStatus !== "vm-off";
@@ -1012,15 +1004,34 @@ export default function App() {
     } catch {}
   };
 
-  const screenCaption = (() => {
+  const openRoutineCreate = () => {
+    setRoutineEditing(null);
+    setRoutineModalOpen(true);
+  };
+
+  const openRoutineEdit = (routine: Routine) => {
+    setRoutineEditing(routine);
+    setRoutineModalOpen(true);
+  };
+
+  const submitRoutine = async (draft: RoutineDraft) => {
+    if (!screenBot) {
+      return;
+    }
+    if (routineEditing) {
+      await daemon.updateRoutine(routineEditing.id, draft);
+    } else {
+      await daemon.createRoutine({ botId: screenBot.id, ...draft });
+    }
+  };
+
+  // The status rides on the screen itself; the tab bar carries no caption.
+  const screenStatusLabel = (() => {
     if (!screenBot) {
       return "No agent selected";
     }
     if (!hasVm(screenBot)) {
       return "Screen view is available for Firecracker microVM computers.";
-    }
-    if (!screenPlaying) {
-      return "Paused";
     }
     if (vncLive) {
       return "Live desktop";
@@ -1135,7 +1146,6 @@ export default function App() {
       !panelOpen ||
       activeTab !== "screen" ||
       !agentHasVm ||
-      !screenPlaying ||
       !windowActive ||
       !screenBot ||
       vncLive
@@ -1216,7 +1226,6 @@ export default function App() {
     panelOpen,
     activeTab,
     agentHasVm,
-    screenPlaying,
     windowActive,
     screenBot,
     vncLive,
@@ -1240,6 +1249,8 @@ export default function App() {
     setDraft("");
   };
 
+  const showScreenImage =
+    hasVm(screenBot) && screenStatus !== "vm-off" && Boolean(screenImageUrl);
   const screenPane = (
     <section className="screen-view">
       <div className="screen-frame">
@@ -1253,12 +1264,10 @@ export default function App() {
         )}
         {!vncLive && (
           <div className="screen-fallback">
-            {hasVm(screenBot) &&
-            screenStatus !== "vm-off" &&
-            screenImageUrl ? (
+            {showScreenImage ? (
               <img
                 className="screen-image"
-                src={screenImageUrl}
+                src={screenImageUrl ?? undefined}
                 alt={`${screenBotName}'s screen`}
               />
             ) : (
@@ -1272,6 +1281,10 @@ export default function App() {
               </div>
             )}
           </div>
+        )}
+        {/* Over the empty state the centered message is already the status. */}
+        {(vncLive || showScreenImage) && (
+          <span className="screen-status">{screenStatusLabel}</span>
         )}
       </div>
     </section>
@@ -1348,7 +1361,7 @@ export default function App() {
         />
       </main>
 
-      {agentHasVm && (
+      {(agentHasVm || agentHasMac) && (
         <aside
           className={`panel-column${panelOpen ? "" : " panel-column-empty"}`}
         >
@@ -1395,101 +1408,89 @@ export default function App() {
 
           {panelOpen && (
             <>
-              <section className="panel-window">
-                <div className="panel-tabs" role="tablist">
-                  {panelTabs.map((entry) => (
-                    <button
-                      key={entry.id}
-                      role="tab"
-                      aria-selected={activeTab === entry.id}
-                      className={`panel-tab${
-                        activeTab === entry.id ? " panel-tab-active" : ""
-                      }`}
-                      onClick={() => setPanelTab(entry.id)}
-                    >
-                      {entry.label}
-                    </button>
-                  ))}
-                  {activeTab === "screen" && (
-                    <span className="panel-tabs-actions">
+              {agentHasVm && (
+                <section className="panel-window">
+                  <div className="panel-tabs" role="tablist">
+                    {panelTabs.map((entry) => (
                       <button
-                        className="icon-button"
-                        title={
-                          screenPlaying ? "Pause live view" : "Resume live view"
-                        }
-                        aria-label={
-                          screenPlaying ? "Pause live view" : "Resume live view"
-                        }
-                        onClick={() => setScreenPlaying((value) => !value)}
+                        key={entry.id}
+                        role="tab"
+                        aria-selected={activeTab === entry.id}
+                        className={`panel-tab${
+                          activeTab === entry.id ? " panel-tab-active" : ""
+                        }`}
+                        onClick={() => setPanelTab(entry.id)}
                       >
-                        {screenPlaying ? <PauseIcon /> : <PlayIcon />}
+                        {entry.label}
                       </button>
-                      <span className="screen-caption">
-                        <span className="screen-caption-status">
-                          {screenCaption}
-                        </span>
-                      </span>
-                    </span>
-                  )}
-                </div>
-                <div className="panel-section-body">
-                  {showScreen && (
+                    ))}
+                  </div>
+                  <div className="panel-section-body">
+                    {showScreen && (
+                      <div
+                        className="panel-tab-pane"
+                        hidden={activeTab !== "screen"}
+                      >
+                        {screenPane}
+                      </div>
+                    )}
+                    {availableComputers.map((computer) => (
+                      <div
+                        key={computer}
+                        className="panel-tab-pane"
+                        hidden={
+                          activeTab !== "terminal" ||
+                          activeComputer !== computer
+                        }
+                      >
+                        {screenBot && (
+                          <TerminalPanel
+                            botId={screenBot.id}
+                            canConnect={canConnectTerminal}
+                            url={terminalUrl(computer)}
+                            active={
+                              activeTab === "terminal" &&
+                              activeComputer === computer
+                            }
+                          />
+                        )}
+                      </div>
+                    ))}
                     <div
                       className="panel-tab-pane"
-                      hidden={activeTab !== "screen"}
-                    >
-                      {screenPane}
-                    </div>
-                  )}
-                  {availableComputers.map((computer) => (
-                    <div
-                      key={computer}
-                      className="panel-tab-pane"
-                      hidden={
-                        activeTab !== "terminal" || activeComputer !== computer
-                      }
+                      hidden={activeTab !== "files"}
                     >
                       {screenBot && (
-                        <TerminalPanel
+                        <FilesPanel
                           botId={screenBot.id}
-                          canConnect={canConnectTerminal}
-                          url={terminalUrl(computer)}
-                          active={
-                            activeTab === "terminal" &&
-                            activeComputer === computer
-                          }
+                          computer={activeComputer}
+                          {...(filesRootLabel
+                            ? { rootLabel: filesRootLabel }
+                            : {})}
+                          active={activeTab === "files"}
+                          listFiles={daemon.listFiles}
+                          readFile={daemon.readFile}
                         />
                       )}
                     </div>
-                  ))}
-                  <div className="panel-tab-pane" hidden={activeTab !== "files"}>
-                    {screenBot && (
-                      <FilesPanel
-                        botId={screenBot.id}
-                        computer={activeComputer}
-                        {...(filesRootLabel
-                          ? { rootLabel: filesRootLabel }
-                          : {})}
-                        active={activeTab === "files"}
-                        listFiles={daemon.listFiles}
-                        readFile={daemon.readFile}
-                      />
-                    )}
                   </div>
-                </div>
-              </section>
+                </section>
+              )}
 
               <section className="routines">
-                <h2>
-                  Routines
-                  <span className="badge">Soon</span>
-                </h2>
-                <div className="routines-empty">
-                  <p className="routines-title">Not implemented yet</p>
-                  <p className="routines-sub">
-                    Scheduled and replayable routines are planned, not wired up.
-                  </p>
-                </div>
+                <h2>Routines</h2>
+                <RoutinesPanel
+                  bot={screenBot}
+                  routines={botRoutines}
+                  onCreate={openRoutineCreate}
+                  onEdit={openRoutineEdit}
+                  onRun={(routine) => daemon.runRoutine(routine.id)}
+                  onToggle={async (routine, enabled) => {
+                    await daemon.updateRoutine(routine.id, { enabled });
+                  }}
+                  onRemove={(routine) => daemon.removeRoutine(routine.id)}
+                  onLoadRuns={daemon.loadRoutineRuns}
+                />
               </section>
             </>
           )}
@@ -1581,6 +1582,17 @@ export default function App() {
           }
           setSettingsBotId(null);
         }}
+      />
+
+      <RoutineModal
+        open={routineModalOpen}
+        bot={screenBot}
+        routine={routineEditing}
+        onClose={() => {
+          setRoutineModalOpen(false);
+          setRoutineEditing(null);
+        }}
+        onSubmit={submitRoutine}
       />
 
       <Settings
@@ -1774,6 +1786,16 @@ function MessageBubble({
   if (message.role === "user") {
     return (
       <div className="entry entry-user">
+        {message.routine && (
+          <div className="entry-routine">
+            <span
+              className="routine-badge"
+              title={`Scheduled routine: ${message.routine.name}`}
+            >
+              Routine · {message.routine.name}
+            </span>
+          </div>
+        )}
         <div className="entry-user-row">
           <div className="entry-body">{message.content}</div>
           {queued && <span className="queued-badge">Queued</span>}
