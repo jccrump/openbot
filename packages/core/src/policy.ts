@@ -206,8 +206,9 @@ function sanitizeRule(value: unknown): PolicyRule | null {
     (match !== "command" &&
       match !== "path" &&
       match !== "domain" &&
-      match !== "text") ||
-    !pattern
+      match !== "text" &&
+      match !== "any") ||
+    (!pattern && match !== "any")
   ) {
     return null;
   }
@@ -300,6 +301,9 @@ function matchValue(
   args: Record<string, unknown>,
 ): string | null {
   switch (rule.match) {
+    case "any":
+      // An empty pattern matches every call of the tool.
+      return "";
     case "command":
       return typeof args.command === "string" ? args.command : null;
     case "path":
@@ -355,7 +359,6 @@ export function evaluatePolicy(input: {
   tool: string;
   args: Record<string, unknown>;
   computer: ComputerKind;
-  granted: boolean;
   local: boolean;
 }): PolicyDecision {
   let ruleDecision: PolicyDecision | null = null;
@@ -430,28 +433,25 @@ export function evaluatePolicy(input: {
         : "approvals are off by default"
       : `the default tier is ${explicit}`;
 
-  // Local-Mac runs always ask unless a mac-scoped rule says otherwise
-  // (ADR-010); tool tiers and the default never auto-allow local tools.
+  // Local-Mac tools ask while approvals are on, even when a tool tier or the
+  // default says auto, unless a mac-scoped rule allows them (ADR-010, ADR-018).
+  // With approvals off, the computed tier applies: the user's global switch
+  // governs the whole machine, and deny rules still win.
   if (input.local) {
-    return {
-      tier: tier === "deny" ? "deny" : "ask",
-      reason:
-        tier === "deny"
-          ? reason
-          : "local Mac tools always ask unless a mac-scoped rule allows them",
-      ruleId: null,
-    };
+    if (tier === "deny") {
+      return { tier: "deny", reason, ruleId: null };
+    }
+    if (input.requireApproval) {
+      return {
+        tier: "ask",
+        reason:
+          "local Mac tools ask while approvals are on unless a mac-scoped rule allows them",
+        ruleId: null,
+      };
+    }
+    return { tier, reason, ruleId: null };
   }
 
-  // A task grant is the user's approval of the brief: it pre-approves ask-tier
-  // tools, but it can never widen a deny.
-  if (tier === "ask" && input.granted) {
-    return {
-      tier: "auto",
-      reason: "covered by the task grant",
-      ruleId: null,
-    };
-  }
   return { tier, reason, ruleId: null };
 }
 

@@ -61,34 +61,6 @@ export function openDatabase(dataDir: string): DatabaseSync {
       value TEXT NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS tasks (
-      id TEXT PRIMARY KEY,
-      lead_id TEXT NOT NULL,
-      role_id TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
-      project_id TEXT,
-      thread_id TEXT REFERENCES threads(id) ON DELETE SET NULL,
-      parent_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
-      depth INTEGER NOT NULL DEFAULT 0,
-      title TEXT NOT NULL,
-      brief TEXT NOT NULL,
-      status TEXT NOT NULL,
-      display TEXT NOT NULL DEFAULT 'none',
-      grant TEXT,
-      budget TEXT,
-      usage TEXT,
-      result TEXT,
-      evidence TEXT,
-      error TEXT,
-      created_at TEXT NOT NULL,
-      started_at TEXT,
-      ended_at TEXT
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_tasks_role
-      ON tasks(role_id, created_at);
-    CREATE INDEX IF NOT EXISTS idx_tasks_lead
-      ON tasks(lead_id, created_at);
-
     CREATE TABLE IF NOT EXISTS memories (
       id TEXT PRIMARY KEY,
       scope TEXT NOT NULL,
@@ -134,8 +106,6 @@ export function openDatabase(dataDir: string): DatabaseSync {
       run_id TEXT,
       thread_id TEXT,
       bot_id TEXT,
-      task_id TEXT,
-      project_id TEXT,
       tool TEXT NOT NULL,
       arguments TEXT NOT NULL,
       tier TEXT NOT NULL,
@@ -247,34 +217,11 @@ export function openDatabase(dataDir: string): DatabaseSync {
   if (!workspaceColumns.some((column) => column.name === "settings")) {
     db.exec("ALTER TABLE workspaces ADD COLUMN settings TEXT");
   }
-  if (!botColumnNames.has("kind")) {
-    db.exec("ALTER TABLE bots ADD COLUMN kind TEXT NOT NULL DEFAULT 'role'");
-  }
-  if (!botColumnNames.has("delegates")) {
-    db.exec("ALTER TABLE bots ADD COLUMN delegates INTEGER NOT NULL DEFAULT 0");
-  }
   if (!botColumnNames.has("policy")) {
     db.exec("ALTER TABLE bots ADD COLUMN policy TEXT NOT NULL DEFAULT 'inherit'");
   }
   if (!botColumnNames.has("effort")) {
     db.exec("ALTER TABLE bots ADD COLUMN effort TEXT");
-  }
-
-  const taskColumns = db
-    .prepare("PRAGMA table_info(tasks)")
-    .all() as unknown as Array<{ name: string }>;
-  const taskColumnNames = new Set(taskColumns.map((column) => column.name));
-  if (!taskColumnNames.has("parent_id")) {
-    db.exec("ALTER TABLE tasks ADD COLUMN parent_id TEXT");
-  }
-  if (!taskColumnNames.has("depth")) {
-    db.exec("ALTER TABLE tasks ADD COLUMN depth INTEGER NOT NULL DEFAULT 0");
-  }
-  if (!taskColumnNames.has("usage")) {
-    db.exec("ALTER TABLE tasks ADD COLUMN usage TEXT");
-  }
-  if (!taskColumnNames.has("project_id")) {
-    db.exec("ALTER TABLE tasks ADD COLUMN project_id TEXT");
   }
 
   return db;

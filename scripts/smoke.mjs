@@ -66,14 +66,7 @@ const mockModelServer = createServer(async (request, response) => {
   }
   if (request.method === "POST" && request.url?.endsWith("/v1/systemone")) {
     const body = JSON.parse(await readBody(request));
-    const questionIds = Object.keys(body?.questions ?? {});
-    // Routing decisions are their own pass; keep the audit/browse/guardrail
-    // counter meaningful for the Jev scenarios.
-    const isRouting =
-      questionIds.includes("needs_work") || questionIds.includes("route");
-    if (!isRouting) {
-      decisionCalls += 1;
-    }
+    decisionCalls += 1;
     const state = body?.state ?? {};
     const proposed = String(state.proposed_answer ?? state.answer ?? "");
     const needsRepair = proposed.includes("definitely locally in stock");
@@ -82,10 +75,6 @@ const mockModelServer = createServer(async (request, response) => {
     const visitedCount = Array.isArray(state.pages_visited)
       ? state.pages_visited.length
       : 0;
-    const routeMessage =
-      state && typeof state === "object" && typeof state.message === "string"
-        ? state.message
-        : "";
     const answers = {};
     for (const [id, question] of Object.entries(body?.questions ?? {})) {
       if (question.type === "noul") {
@@ -98,17 +87,9 @@ const mockModelServer = createServer(async (request, response) => {
             ? 0.98
             : 0.02;
         }
-      if (id === "goal_met") {
-        value = browseState ? (visitedCount >= 3 ? 0.95 : 0.1) : 0.95;
-      }
-      if (id === "needs_work") {
-        value =
-          /^(hi|hello|hey|thanks|thank you|good (morning|afternoon|evening))\b/i.test(
-            routeMessage.trim(),
-          )
-            ? 0.05
-            : 0.95;
-      }
+        if (id === "goal_met") {
+          value = browseState ? (visitedCount >= 3 ? 0.95 : 0.1) : 0.95;
+        }
         if (needsRepair) {
           value = id === "overstated" ? 0.9 : 0.3;
         }
@@ -127,19 +108,6 @@ const mockModelServer = createServer(async (request, response) => {
             visitedCount < 3 && candidate
               ? candidate
               : keys[keys.length - 1] ?? "";
-        }
-        if (id === "route") {
-          const matchedProject = keys.find((key) => {
-            if (!key.startsWith("project:")) {
-              return false;
-            }
-            const description = String(question.criteria[key] ?? "");
-            const name = /"([^"]+)"/.exec(description)?.[1] ?? "";
-            return (
-              name && routeMessage.toLowerCase().includes(name.toLowerCase())
-            );
-          });
-          choice = matchedProject ?? "direct";
         }
         if (!keys.includes(choice)) {
           choice = keys[0] ?? "";
@@ -302,53 +270,6 @@ const mockModelServer = createServer(async (request, response) => {
     return;
   }
 
-  const spawnRest =
-    Array.isArray(parsed.tools) &&
-    last?.role === "user" &&
-    typeof last.content === "string" &&
-    last.content.startsWith("spawn:")
-      ? last.content.slice("spawn:".length).trim()
-      : "";
-  const spawnSeparator = spawnRest.indexOf("::");
-  const spawnRoleId =
-    spawnSeparator === -1 ? spawnRest : spawnRest.slice(0, spawnSeparator).trim();
-  const spawnBrief =
-    spawnSeparator === -1 ? "" : spawnRest.slice(spawnSeparator + 2).trim();
-
-  const createProjectRest =
-    Array.isArray(parsed.tools) &&
-    last?.role === "user" &&
-    typeof last.content === "string" &&
-    last.content.startsWith("create-project:")
-      ? last.content.slice("create-project:".length).trim()
-      : "";
-  const createProjectSeparator = createProjectRest.indexOf("::");
-  const createProjectName =
-    createProjectSeparator === -1
-      ? createProjectRest
-      : createProjectRest.slice(0, createProjectSeparator).trim();
-  const createProjectScope =
-    createProjectSeparator === -1
-      ? ""
-      : createProjectRest.slice(createProjectSeparator + 2).trim();
-
-  const createWorkerRest =
-    Array.isArray(parsed.tools) &&
-    last?.role === "user" &&
-    typeof last.content === "string" &&
-    last.content.startsWith("create-worker:")
-      ? last.content.slice("create-worker:".length).trim()
-      : "";
-  const createWorkerSeparator = createWorkerRest.indexOf("::");
-  const createWorkerName =
-    createWorkerSeparator === -1
-      ? createWorkerRest
-      : createWorkerRest.slice(0, createWorkerSeparator).trim();
-  const createWorkerSpecialty =
-    createWorkerSeparator === -1
-      ? ""
-      : createWorkerRest.slice(createWorkerSeparator + 2).trim();
-
   const harnessSub =
     Array.isArray(parsed.tools) &&
     last?.role === "user" &&
@@ -404,34 +325,6 @@ const mockModelServer = createServer(async (request, response) => {
                     },
                   }
                 : null;
-
-  const askRest =
-    Array.isArray(parsed.tools) &&
-    last?.role === "user" &&
-    typeof last.content === "string" &&
-    last.content.startsWith("ask:")
-      ? last.content.slice("ask:".length).trim()
-      : "";
-  const askSeparator = askRest.indexOf("::");
-  const askProjectId =
-    askSeparator === -1 ? askRest : askRest.slice(0, askSeparator).trim();
-  const askRequest =
-    askSeparator === -1 ? "" : askRest.slice(askSeparator + 2).trim();
-
-  const limitedRest =
-    Array.isArray(parsed.tools) &&
-    last?.role === "user" &&
-    typeof last.content === "string" &&
-    last.content.startsWith("spawn-limited:")
-      ? last.content.slice("spawn-limited:".length).trim()
-      : "";
-  const limitedSeparator = limitedRest.indexOf("::");
-  const limitedRoleId =
-    limitedSeparator === -1
-      ? limitedRest
-      : limitedRest.slice(0, limitedSeparator).trim();
-  const limitedBrief =
-    limitedSeparator === -1 ? "" : limitedRest.slice(limitedSeparator + 2).trim();
 
   const systemContent =
     typeof messages.find((message) => message.role === "system")?.content ===
@@ -555,14 +448,6 @@ const mockModelServer = createServer(async (request, response) => {
           }
         : last.content.startsWith("read-outside:")
         ? { name: "read_file", args: { path: "/etc/hosts" } }
-        : last.content.startsWith("run-mac:")
-        ? {
-            name: "shell",
-            args: {
-              command: last.content.slice("run-mac:".length).trim(),
-              computer: "mac",
-            },
-          }
         : last.content.startsWith("run:")
         ? {
             name: "shell",
@@ -597,32 +482,7 @@ const mockModelServer = createServer(async (request, response) => {
                     startUrl: "https://example.com",
                   },
                 }
-                : last.content.startsWith("create-project-ask:")
-                  ? {
-                      name: "create_project",
-                      args: {
-                        name: "Scope Probe",
-                        scope: "checks the computer ask",
-                      },
-                    }
-                : last.content.startsWith("create-project:")
-                  ? {
-                      name: "create_project",
-                      args: {
-                        name: createProjectName,
-                        scope: createProjectScope,
-                        computers: ["firecracker"],
-                      },
-                    }
-                  : last.content.startsWith("create-worker:")
-                    ? {
-                        name: "create_worker",
-                        args: {
-                          name: createWorkerName,
-                          specialty: createWorkerSpecialty,
-                        },
-                      }
-                   : last.content.startsWith("repeat-fail:")
+                : last.content.startsWith("repeat-fail:")
                      ? { name: "shell", args: { command: "fail-command" } }
                      : last.content.startsWith("repeat-ok:")
                      ? { name: "shell", args: { command: "stable-output" } }
@@ -670,17 +530,7 @@ const mockModelServer = createServer(async (request, response) => {
                               reason: "test update",
                             },
                           }
-                        : last.content.startsWith("list-projects:")
-                    ? { name: "list_projects", args: {} }
-                    : last.content.startsWith("ask:")
-                      ? {
-                          name: "ask_project",
-                          args: {
-                            projectId: askProjectId,
-                            request: askRequest,
-                          },
-                        }
-                      : last.content.startsWith("slow-run:")
+                        : last.content.startsWith("slow-run:")
                   ? {
                       name: "shell",
                       args: { command: "sleep 1.5", timeoutSeconds: 30 },
@@ -692,29 +542,7 @@ const mockModelServer = createServer(async (request, response) => {
                       command: last.content.slice("narrate:".length).trim(),
                     },
                   }
-                : last.content.startsWith("spawn-limited:")
-                  ? {
-                      name: "spawn_worker",
-                      args: {
-                        roleId: limitedRoleId,
-                        brief: limitedBrief,
-                        title: "Limited task",
-                        grant: {
-                          tools: ["browser"],
-                          budget: { toolCalls: 5, wallClockMs: 60_000 },
-                        },
-                      },
-                    }
-                  : last.content.startsWith("spawn:")
-                    ? {
-                        name: "spawn_worker",
-                        args: {
-                          roleId: spawnRoleId,
-                          brief: spawnBrief,
-                          title: "Delegated task",
-                        },
-                      }
-                    : null
+                : null
       : null;
 
   if (requestedTool) {
@@ -1421,36 +1249,9 @@ try {
       check();
     });
 
-  const waitForTaskWhere = (predicate, timeoutMs = 30000) =>
-    new Promise((resolvePromise, rejectPromise) => {
-      const check = () => {
-        for (const item of received) {
-          if (
-            item.type === "task.upserted" &&
-            predicate(item.task)
-          ) {
-            cleanup();
-            resolvePromise(item.task);
-            return;
-          }
-        }
-      };
-      const timer = setTimeout(() => {
-        cleanup();
-        rejectPromise(new Error("timeout waiting for matching task"));
-      }, timeoutMs);
-      const waiter = () => check();
-      const cleanup = () => {
-        clearTimeout(timer);
-        waiters.delete(waiter);
-      };
-      waiters.add(waiter);
-      check();
-    });
-
-  // The lead serializes its own turns; task notifications arrive as internal
-  // turns, so tests that send lead messages wait for the thread to go quiet.
-  const waitForLeadQuiet = async (timeoutMs = 30_000) => {
+  // The daemon serializes a thread's turns, so tests that send messages wait
+  // for the thread to go quiet.
+  const waitForThreadQuiet = async (timeoutMs = 30_000) => {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       let lastStart = -1;
@@ -1538,16 +1339,14 @@ try {
   assert.equal(hello.requireApproval, true);
   assert.match(
     hello.bots[0].systemPrompt,
-    /one voice they talk to/,
-    "the seeded bot should be the lead",
+    /agent with your own computer/,
+    "the seeded bot should be a plain agent",
   );
-  assert.equal(hello.bots[0].kind, "lead", "the seeded bot should be the lead");
-  assert.equal(
-    hello.bots[0].access,
-    "full",
-    "the lead should run with full local access",
+  assert.deepEqual(
+    hello.bots[0].computers,
+    ["firecracker"],
+    "the seeded bot should default to a microVM",
   );
-  assert.ok(Array.isArray(hello.tasks), "hello should include the task list");
   const botId = hello.bots[0].id;
 
   socket.send(JSON.stringify({ type: "chat.send", botId, text: "hello there" }));
@@ -1866,35 +1665,6 @@ try {
   assert.equal(decisionSettings.decision.enabled, true);
   assert.equal(decisionSettings.decision.hasApiKey, true);
   assert.equal(decisionSettings.decision.audit, true);
-  assert.equal(
-    decisionSettings.decision.route,
-    true,
-    "routing should default to on when Jev is enabled",
-  );
-
-  // Jev routes conversation: the turn runs without tools.
-  await waitForLeadQuiet();
-  const chatRouteMarker = received.length;
-  socket.send(
-    JSON.stringify({ type: "chat.send", botId, text: "hello there" }),
-  );
-  const routedChat = await waitForSince(
-    chatRouteMarker,
-    (item) => item.type === "chat.decision" && item.kind === "route",
-  );
-  assert.match(routedChat.summary, /chat/, "conversation should route as chat");
-  await waitForSince(
-    chatRouteMarker,
-    (item) => item.type === "chat.done" && item.runId === routedChat.runId,
-  );
-  const chatRequest = [...modelRequests]
-    .reverse()
-    .find((request) => request.lastUser === "hello there");
-  assert.equal(
-    chatRequest?.hasTools,
-    false,
-    "a conversational turn should run without tools",
-  );
 
   socket.send(
     JSON.stringify({ type: "decision.test", requestId: "decision-test-1" }),
@@ -2156,11 +1926,11 @@ try {
       type: "bots.create",
       requestId: "bot-local-1",
       name: "Local Tester",
-      computer: "mac",
+      computers: ["mac"],
     }),
   );
   const localCreated = await waitFor("bot.created");
-  assert.equal(localCreated.bot.computer, "mac");
+  assert.deepEqual(localCreated.bot.computers, ["mac"]);
   const localBotId = localCreated.bot.id;
 
   socket.send(
@@ -2168,22 +1938,22 @@ try {
       type: "bots.update",
       requestId: "bot-update-1",
       botId: localBotId,
-      computer: "firecracker",
+      computers: ["firecracker"],
     }),
   );
   const updatedToVm = await waitFor("bot.updated");
-  assert.equal(updatedToVm.bot.computer, "firecracker");
+  assert.deepEqual(updatedToVm.bot.computers, ["firecracker"]);
 
   socket.send(
     JSON.stringify({
       type: "bots.update",
       requestId: "bot-update-2",
       botId: localBotId,
-      computer: "mac",
+      computers: ["mac"],
     }),
   );
   const updatedToLocal = await waitFor("bot.updated");
-  assert.equal(updatedToLocal.bot.computer, "mac");
+  assert.deepEqual(updatedToLocal.bot.computers, ["mac"]);
 
   const macScreen = await fetch(
     `http://127.0.0.1:${daemonPort}/bots/${localBotId}/screen`,
@@ -2232,6 +2002,38 @@ try {
   );
   await waitFor("providers.updated");
 
+  // With approvals off, the global switch governs local Mac tools too: the
+  // command runs without a card.
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId: localBotId,
+      text: "run: echo approvals-off",
+    }),
+  );
+  const offResult = await waitFor("tool.result");
+  assert.equal(offResult.ok, true);
+  assert.match(offResult.output, /\[local Mac\]/);
+  assert.equal(
+    received.some(
+      (item) =>
+        item.type === "approval.request" && item.name === "shell" &&
+        item.arguments.includes("approvals-off"),
+    ),
+    false,
+    "approvals off should auto-approve local tools",
+  );
+  await waitFor("chat.done");
+
+  socket.send(
+    JSON.stringify({
+      type: "settings.update",
+      settings: { requireApproval: true },
+    }),
+  );
+  await waitFor("providers.updated");
+
+  // Back on: the next local call asks again, and a deny is respected.
   socket.send(
     JSON.stringify({
       type: "chat.send",
@@ -2252,14 +2054,6 @@ try {
   assert.equal(forcedDenied.ok, false);
   assert.match(forcedDenied.output, /denied/);
   await waitFor("chat.done");
-
-  socket.send(
-    JSON.stringify({
-      type: "settings.update",
-      settings: { requireApproval: true },
-    }),
-  );
-  await waitFor("providers.updated");
 
   const localWorkspace = join(dataDir, "workspaces", localBotId);
   assert.ok(
@@ -2319,72 +2113,8 @@ try {
     "deleted bot messages should be removed",
   );
 
-  // An agent with both computers routes per call (ADR-021): the microVM is the
-  // default, the computer argument targets This Mac, and a computer the agent
-  // does not have is rejected instead of silently substituted.
-  socket.send(
-    JSON.stringify({
-      type: "bots.create",
-      requestId: "bot-dual-1",
-      name: "Dual Tester",
-      computers: ["firecracker", "mac"],
-    }),
-  );
-  const dualCreated = await waitFor("bot.created");
-  assert.deepEqual(dualCreated.bot.computers, ["firecracker", "mac"]);
-
-  const sandboxRuns = executedCommands.length;
-  socket.send(
-    JSON.stringify({
-      type: "chat.send",
-      botId: dualCreated.bot.id,
-      text: "run: uname -a",
-    }),
-  );
-  const vmApproval = await waitFor("approval.request");
-  assert.equal(vmApproval.name, "shell");
-  socket.send(
-    JSON.stringify({
-      type: "approval.respond",
-      requestId: vmApproval.requestId,
-      decision: "approve",
-    }),
-  );
-  const vmResult = await waitFor("tool.result");
-  assert.equal(vmResult.ok, true);
-  assert.deepEqual(
-    executedCommands.slice(sandboxRuns),
-    ["uname -a"],
-    "a dual-computer agent should default to the microVM",
-  );
-  await waitFor("chat.done");
-
-  socket.send(
-    JSON.stringify({
-      type: "chat.send",
-      botId: dualCreated.bot.id,
-      text: "run-mac: echo mac-call",
-    }),
-  );
-  const macApproval = await waitFor("approval.request");
-  assert.equal(macApproval.name, "shell");
-  socket.send(
-    JSON.stringify({
-      type: "approval.respond",
-      requestId: macApproval.requestId,
-      decision: "approve",
-    }),
-  );
-  const macResult = await waitFor("tool.result");
-  assert.equal(macResult.ok, true);
-  assert.match(macResult.output, /\[local Mac\]/);
-  assert.deepEqual(
-    executedCommands.slice(sandboxRuns),
-    ["uname -a"],
-    "the mac call must run on the host, not in the sandbox",
-  );
-  await waitFor("chat.done");
-
+  // An agent's computer set defaults to the microVM when it is not given: a
+  // VM agent runs in the sandbox.
   socket.send(
     JSON.stringify({
       type: "bots.create",
@@ -2398,20 +2128,21 @@ try {
     JSON.stringify({
       type: "chat.send",
       botId: vmOnlyCreated.bot.id,
-      text: "run-mac: echo nope",
+      text: "run: uname -a",
     }),
   );
-  const blockedApproval = await waitFor("approval.request");
+  const vmRunApproval = await waitFor("approval.request");
+  assert.equal(vmRunApproval.name, "shell");
   socket.send(
     JSON.stringify({
       type: "approval.respond",
-      requestId: blockedApproval.requestId,
+      requestId: vmRunApproval.requestId,
       decision: "approve",
     }),
   );
-  const blockedResult = await waitFor("tool.result");
-  assert.equal(blockedResult.ok, false);
-  assert.match(blockedResult.output, /does not have This Mac/);
+  const vmRunResult = await waitFor("tool.result");
+  assert.equal(vmRunResult.ok, true);
+  assert.match(vmRunResult.output, /Linux mockvm/);
   await waitFor("chat.done");
 
   socket.send(
@@ -2521,633 +2252,6 @@ try {
     "progress narration must not be folded into the final answer",
   );
 
-  socket.send(
-    JSON.stringify({
-      type: "bots.create",
-      requestId: "role-1",
-      name: "Researcher",
-      role: "researcher",
-    }),
-  );
-  const roleCreated = await waitFor("bot.created");
-  assert.equal(roleCreated.bot.kind, "role", "new bots should be roles");
-  assert.equal(roleCreated.bot.delegates, false, "roles default to workers");
-  const roleId = roleCreated.bot.id;
-
-  // A grant-approved worker runs its in-grant tools without asking again.
-  socket.send(
-    JSON.stringify({
-      type: "chat.send",
-      botId,
-      text: `spawn: ${roleId} :: browse: https://example.com`,
-    }),
-  );
-  const spawnApproval = await waitFor("approval.request");
-  assert.equal(spawnApproval.name, "spawn_worker");
-  assert.match(spawnApproval.arguments, /example\.com/);
-  socket.send(
-    JSON.stringify({
-      type: "approval.respond",
-      requestId: spawnApproval.requestId,
-      decision: "approve",
-    }),
-  );
-  const afterSpawnApproval = received.length;
-  const taskDone = await waitForTaskWhere(
-    (task) => task.roleId === roleId && task.status === "done",
-  );
-  assert.ok(taskDone.result, "the task should carry the worker's result");
-  assert.ok(
-    taskDone.grant.tools.includes("browser"),
-    "the default grant should include the tools the worker used",
-  );
-  assert.ok(taskDone.budget.toolCalls > 0, "the task should carry a budget");
-  assert.ok(taskDone.usage, "the task should record usage");
-  assert.ok(
-    taskDone.usage.cacheReadTokens > 0,
-    "task usage should keep cached prompt tokens separate from the input total",
-  );
-  assert.match(
-    taskDone.evidence ?? "",
-    /Example Domain/,
-    "the evidence ledger should include the worker's observation",
-  );
-  assert.equal(
-    received
-      .slice(afterSpawnApproval)
-      .some((item) => item.type === "approval.request"),
-    false,
-    "in-grant tool calls should not ask for approval again",
-  );
-  const taskMessages = await fetchMessages(taskDone.threadId);
-  assert.ok(
-    taskMessages.some((message) =>
-      (message.toolCalls ?? []).some(
-        (call) => call.name === "browser" && /Example Domain/.test(call.output),
-      ),
-    ),
-    "the task thread should hold the worker transcript",
-  );
-  const notify = await waitForWhere(
-    (item) =>
-      item.type === "chat.done" &&
-      item.threadId === threadId &&
-      /team task just finished/.test(item.message.content),
-  );
-  assert.match(notify.message.content, /Mock reply to: A team task/);
-  assert.equal(
-    browserActions.filter((action) => action.url === "https://example.com")
-      .length >= 2,
-    true,
-    "the worker should have browsed on its own computer",
-  );
-  const leadMessages = await fetchMessages(threadId);
-  assert.ok(
-    leadMessages.some(
-      (message) =>
-        message.role === "assistant" &&
-        /team task just finished/.test(message.content),
-    ),
-    "the lead should persist its task report in the conversation",
-  );
-
-  // The lead builds the team when no role fits: create_worker adds a
-  // persistent worker, and a duplicate name reuses the existing role.
-  socket.send(
-    JSON.stringify({
-      type: "chat.send",
-      botId,
-      text: "create-worker: Weather Watcher :: checks NWS forecasts and alerts",
-    }),
-  );
-  const createWorkerApproval = await waitFor("approval.request");
-  assert.equal(createWorkerApproval.name, "create_worker");
-  assert.match(createWorkerApproval.arguments, /Weather Watcher/);
-  socket.send(
-    JSON.stringify({
-      type: "approval.respond",
-      requestId: createWorkerApproval.requestId,
-      decision: "approve",
-    }),
-  );
-  const workerCreated = await waitForWhere(
-    (item) =>
-      item.type === "bot.created" && item.bot.name === "Weather Watcher",
-  );
-  assert.equal(workerCreated.bot.kind, "role", "created workers should be roles");
-  assert.equal(
-    workerCreated.bot.delegates,
-    false,
-    "created workers should not be managers",
-  );
-  assert.equal(
-    workerCreated.bot.computer,
-    "firecracker",
-    "created workers should default to a microVM",
-  );
-  assert.match(
-    workerCreated.bot.role ?? "",
-    /forecasts/,
-    "the specialty should become the worker's role",
-  );
-  const hiredWorkerId = workerCreated.bot.id;
-  await waitForLeadQuiet();
-
-  // The freshly created worker is immediately usable for the task that
-  // needed it.
-  socket.send(
-    JSON.stringify({
-      type: "chat.send",
-      botId,
-      text: `spawn: ${hiredWorkerId} :: run: uname -a`,
-    }),
-  );
-  const hireApproval = await waitFor("approval.request");
-  assert.equal(hireApproval.name, "spawn_worker");
-  socket.send(
-    JSON.stringify({
-      type: "approval.respond",
-      requestId: hireApproval.requestId,
-      decision: "approve",
-    }),
-  );
-  const hiredTask = await waitForTaskWhere(
-    (task) => task.roleId === hiredWorkerId && task.status === "done",
-  );
-  assert.ok(hiredTask.result, "the new worker should complete a task");
-  assert.match(
-    hiredTask.grant.tools.join(","),
-    /shell/,
-    "the new worker's default grant should cover the tools it used",
-  );
-
-  // Let the task notification turn finish before the next lead turn.
-  await waitForLeadQuiet();
-
-  // Repeating a name reuses the role instead of forking the team.
-  socket.send(
-    JSON.stringify({
-      type: "chat.send",
-      botId,
-      text: "create-worker: Weather Watcher :: checks NWS forecasts and alerts",
-    }),
-  );
-  const reuseApproval = await waitFor("approval.request");
-  assert.equal(reuseApproval.name, "create_worker");
-  socket.send(
-    JSON.stringify({
-      type: "approval.respond",
-      requestId: reuseApproval.requestId,
-      decision: "approve",
-    }),
-  );
-  const reuseCall = await waitForWhere(
-    (item) =>
-      item.type === "chat.message" &&
-      (item.message?.toolCalls ?? []).some(
-        (call) =>
-          call.name === "create_worker" && /already exists/.test(call.output),
-      ),
-  );
-  assert.match(
-    reuseCall.message.toolCalls.find((call) => call.name === "create_worker")
-      .output,
-    /already exists/,
-    "a duplicate worker name should reuse the existing role",
-  );
-  assert.equal(
-    received.filter(
-      (item) =>
-        item.type === "bot.created" && item.bot.name === "Weather Watcher",
-    ).length,
-    1,
-    "a duplicate worker name must not create a second bot",
-  );
-
-  // A tool outside the grant escalates instead of running silently.
-  socket.send(
-    JSON.stringify({
-      type: "chat.send",
-      botId,
-      text: `spawn-limited: ${roleId} :: run: uname -a`,
-    }),
-  );
-  const limitedApproval = await waitFor("approval.request");
-  assert.equal(limitedApproval.name, "spawn_worker");
-  socket.send(
-    JSON.stringify({
-      type: "approval.respond",
-      requestId: limitedApproval.requestId,
-      decision: "approve",
-    }),
-  );
-  const escalation = await waitFor("approval.request");
-  assert.equal(
-    escalation.name,
-    "shell",
-    "a tool outside the grant should escalate to the user",
-  );
-  socket.send(
-    JSON.stringify({
-      type: "approval.respond",
-      requestId: escalation.requestId,
-      decision: "deny",
-    }),
-  );
-  const limitedDone = await waitForTaskWhere(
-    (task) =>
-      task.roleId === roleId &&
-      task.status === "done" &&
-      task.id !== taskDone.id,
-  );
-  assert.deepEqual(
-    limitedDone.grant.tools,
-    ["browser"],
-    "the explicit grant should be stored on the task",
-  );
-  const limitedMessages = await fetchMessages(limitedDone.threadId);
-  assert.ok(
-    limitedMessages.some((message) =>
-      (message.toolCalls ?? []).some(
-        (call) => call.name === "shell" && /denied/.test(call.output),
-      ),
-    ),
-    "the denied escalation should be reported back to the worker",
-  );
-
-  // A project created without a chosen computer is not silently defaulted:
-  // the tool tells the lead to ask the user first (ADR-021).
-  const askComputersMarker = received.length;
-  socket.send(
-    JSON.stringify({ type: "chat.send", botId, text: "create-project-ask:" }),
-  );
-  const askComputersApproval = await waitForSince(
-    askComputersMarker,
-    (item) =>
-      item.type === "approval.request" && item.name === "create_project",
-  );
-  socket.send(
-    JSON.stringify({
-      type: "approval.respond",
-      requestId: askComputersApproval.requestId,
-      decision: "approve",
-    }),
-  );
-  const askComputersDone = await waitForSince(
-    askComputersMarker,
-    (item) =>
-      item.type === "chat.done" &&
-      /No computers were chosen/.test(item.message.content),
-  );
-  assert.match(
-    askComputersDone.message.content,
-    /No computers were chosen/,
-    "create_project without computers should ask the user instead of guessing",
-  );
-
-  // Projects: the lead creates a persistent manager for a topic and routes
-  // requests to it. Workers run as sessions inside the project's computer with
-  // their own browser, and the project survives its requests.
-  const createProjectMarker = received.length;
-  socket.send(
-    JSON.stringify({
-      type: "chat.send",
-      botId,
-      text: "create-project: Buddy Weather :: weather forecasts and alerts",
-    }),
-  );
-  const createProjectApproval = await waitForSince(
-    createProjectMarker,
-    (item) =>
-      item.type === "approval.request" && item.name === "create_project",
-  );
-  socket.send(
-    JSON.stringify({
-      type: "approval.respond",
-      requestId: createProjectApproval.requestId,
-      decision: "approve",
-    }),
-  );
-  const projectCreated = await waitForSince(
-    createProjectMarker,
-    (item) => item.type === "bot.created" && item.bot.kind === "project",
-  );
-  assert.equal(
-    projectCreated.bot.delegates,
-    true,
-    "a project manager can delegate",
-  );
-  assert.match(projectCreated.bot.systemPrompt, /Buddy Weather/);
-  const projectId = projectCreated.bot.id;
-
-  const listMarker = received.length;
-  socket.send(
-    JSON.stringify({ type: "chat.send", botId, text: "list-projects:" }),
-  );
-  await waitForSince(
-    listMarker,
-    (item) =>
-      item.type === "chat.done" &&
-      item.threadId === threadId &&
-      /Buddy Weather/.test(item.message.content),
-  );
-
-  const askMarker = received.length;
-  socket.send(
-    JSON.stringify({
-      type: "chat.send",
-      botId,
-      text: `ask: ${projectId} :: spawn: ${roleId} :: browse: https://example.com`,
-    }),
-  );
-  const askApproval = await waitForSince(
-    askMarker,
-    (item) => item.type === "approval.request" && item.name === "ask_project",
-  );
-  socket.send(
-    JSON.stringify({
-      type: "approval.respond",
-      requestId: askApproval.requestId,
-      decision: "approve",
-    }),
-  );
-  const requestTask = await waitForTaskWhere(
-    (task) => task.projectId === projectId && task.roleId === projectId,
-  );
-  assert.equal(requestTask.parentId, null, "a request is a root task");
-  assert.ok(requestTask.threadId, "a request uses the project's thread");
-  const sessionTask = await waitForTaskWhere(
-    (task) => task.parentId === requestTask.id,
-  );
-  assert.equal(sessionTask.depth, 1, "a worker session is depth 1");
-  assert.equal(
-    sessionTask.projectId,
-    projectId,
-    "the worker session belongs to the project",
-  );
-  assert.ok(
-    sessionTask.grant.tools.every((tool) =>
-      requestTask.grant.tools.includes(tool),
-    ),
-    "a worker grant must be inside the request grant",
-  );
-  const sessionDone = await waitForTaskWhere(
-    (task) => task.id === sessionTask.id && task.status === "done",
-  );
-  assert.match(sessionDone.evidence ?? "", /Example Domain/);
-  assert.ok(
-    sandboxCalls.some(
-      (call) => call.id === sessionTask.id && call.kind === "browser",
-    ),
-    "a worker session browses with its own browser",
-  );
-  const requestDone = await waitForTaskWhere(
-    (task) => task.id === requestTask.id && task.status === "done",
-  );
-  assert.match(
-    requestDone.result ?? "",
-    /Mock reply to: A child task finished/,
-    "the project manager reports after reviewing its worker",
-  );
-  assert.equal(
-    destroyedVms.includes(projectId),
-    false,
-    "the project's computer persists across requests",
-  );
-
-  // A second request reuses the same project and thread; its worker session
-  // runs shell in the project's computer instead of one of its own.
-  const secondAskMarker = received.length;
-  socket.send(
-    JSON.stringify({
-      type: "chat.send",
-      botId,
-      text: `ask: ${projectId} :: spawn: ${roleId} :: run: uname -a`,
-    }),
-  );
-  const secondAskApproval = await waitForSince(
-    secondAskMarker,
-    (item) => item.type === "approval.request" && item.name === "ask_project",
-  );
-  socket.send(
-    JSON.stringify({
-      type: "approval.respond",
-      requestId: secondAskApproval.requestId,
-      decision: "approve",
-    }),
-  );
-  const secondRequest = await waitForTaskWhere(
-    (task) =>
-      task.projectId === projectId &&
-      task.roleId === projectId &&
-      task.id !== requestTask.id,
-  );
-  assert.equal(
-    secondRequest.threadId,
-    requestTask.threadId,
-    "requests reuse the project's thread",
-  );
-  const secondSession = await waitForTaskWhere(
-    (task) => task.parentId === secondRequest.id,
-  );
-  const secondSessionDone = await waitForTaskWhere(
-    (task) => task.id === secondSession.id && task.status === "done",
-  );
-  assert.ok(secondSessionDone.result, "the session should report a result");
-  // The manager reports and the lead is notified after this point.
-  const secondNotifyMarker = received.length;
-  const secondMessages = await fetchMessages(secondSession.threadId);
-  assert.ok(
-    secondMessages.some((message) =>
-      (message.toolCalls ?? []).some(
-        (call) => call.name === "shell" && /Linux mockvm/.test(call.output),
-      ),
-    ),
-    "the worker session ran the command in the project's computer",
-  );
-  assert.ok(
-    sandboxCalls.some(
-      (call) => call.id === projectId && call.kind === "exec",
-    ),
-    "a worker session runs shell in the project's computer",
-  );
-  assert.equal(
-    sandboxCalls.some(
-      (call) => call.id === secondSession.id && call.kind === "exec",
-    ),
-    false,
-    "a worker session does not get a computer of its own",
-  );
-  assert.equal(
-    destroyedVms.includes(projectId),
-    false,
-    "the project's computer still persists after the second request",
-  );
-
-  await waitForSince(
-    secondNotifyMarker,
-    (item) =>
-      item.type === "chat.done" &&
-      item.threadId === threadId &&
-      /A team task just finished/.test(item.message.content),
-  );
-  await waitForLeadQuiet();
-
-  // Jev routes a request that names a project to that project's manager.
-  // (Jev was turned off by the earlier settings test; turn it back on.)
-  socket.send(
-    JSON.stringify({
-      type: "settings.update",
-      settings: { decision: { enabled: true } },
-    }),
-  );
-  const jevBackOn = await waitFor("providers.updated");
-  assert.equal(jevBackOn.decision.enabled, true);
-  const projectRouteMarker = received.length;
-  socket.send(
-    JSON.stringify({
-      type: "chat.send",
-      botId,
-      text: "Buddy Weather: add a 3-day outlook to the project notes",
-    }),
-  );
-  const routedProject = await waitForSince(
-    projectRouteMarker,
-    (item) => item.type === "chat.decision" && item.kind === "route",
-  );
-  assert.match(
-    routedProject.summary,
-    /project "Buddy Weather"/,
-    "a named project should be selected for routing",
-  );
-  await waitForSince(
-    projectRouteMarker,
-    (item) => item.type === "chat.done" && item.runId === routedProject.runId,
-  );
-  const projectRouteRequest = [...modelRequests]
-    .reverse()
-    .find(
-      (request) =>
-        request.lastUser ===
-        "Buddy Weather: add a 3-day outlook to the project notes",
-    );
-  assert.match(
-    projectRouteRequest.system,
-    /\[routing\] Jev routed this message to the project/,
-    "the lead should receive the routing hint",
-  );
-  assert.match(projectRouteRequest.system, /ask_project/);
-
-  // Per-task computers, the concurrency cap, and cleanup: three slow tasks on
-  // one role run two at a time, each in its own computer, and clean up after.
-  const capMarker = received.length;
-  const slowTaskIds = [];
-  for (let index = 0; index < 5; index += 1) {
-    const doneBefore = received.length;
-    socket.send(
-      JSON.stringify({
-        type: "chat.send",
-        botId,
-        text: `spawn: ${roleId} :: slow-run: ${index}`,
-      }),
-    );
-    const slowApproval = await waitForSince(
-      doneBefore,
-      (item) =>
-        item.type === "approval.request" && item.name === "spawn_worker",
-    );
-    socket.send(
-      JSON.stringify({
-        type: "approval.respond",
-        requestId: slowApproval.requestId,
-        decision: "approve",
-      }),
-    );
-    const created = await waitForSince(
-      doneBefore,
-      (item) =>
-        item.type === "task.upserted" &&
-        item.task.brief === `slow-run: ${index}`,
-    );
-    slowTaskIds.push(created.task.id);
-    await waitForSince(
-      doneBefore,
-      (item) =>
-        item.type === "chat.done" &&
-        item.threadId === threadId &&
-        /Command finished|Task created/.test(item.message.content),
-    );
-  }
-  await Promise.all(
-    slowTaskIds.map((id) =>
-      waitForTaskWhere((task) => task.id === id && task.status === "done"),
-    ),
-  );
-
-  const capEvents = received
-    .slice(capMarker)
-    .filter(
-      (item) =>
-        item.type === "task.upserted" && slowTaskIds.includes(item.task.id),
-    );
-  const runningNow = new Set();
-  let maxRunning = 0;
-  let queuedSeen = false;
-  for (const item of capEvents) {
-    const task = item.task;
-    if (task.status === "queued") {
-      queuedSeen = true;
-    }
-    if (task.status === "running") {
-      runningNow.add(task.id);
-    }
-    if (
-      task.status === "done" ||
-      task.status === "failed" ||
-      task.status === "cancelled"
-    ) {
-      runningNow.delete(task.id);
-    }
-    maxRunning = Math.max(maxRunning, runningNow.size);
-  }
-  assert.equal(
-    queuedSeen,
-    true,
-    "the concurrency cap should queue a task when two are already running",
-  );
-  assert.ok(
-    maxRunning <= 4,
-    `at most four tasks should run at once (saw ${maxRunning})`,
-  );
-  const waitForDestroy = async (id) => {
-    for (let attempt = 0; attempt < 50; attempt += 1) {
-      if (destroyedVms.includes(id)) {
-        return true;
-      }
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
-    }
-    return false;
-  };
-  for (const id of slowTaskIds) {
-    assert.ok(
-      sandboxCalls.some((call) => call.id === id && call.kind === "exec"),
-      "each task should run on its own computer",
-    );
-    assert.ok(
-      await waitForDestroy(id),
-      "the task computer should be destroyed when the task ends",
-    );
-  }
-  assert.equal(
-    sandboxCalls.some((call) => call.id === roleId),
-    false,
-    "task work must never touch the role's home computer",
-  );
-  assert.ok(
-    destroyedVms.includes(taskDone.id),
-    "the first delegated task's computer should be destroyed",
-  );
-
   // Memory and soul: explicit writes, retrieval, background reflection,
   // decay/prune, and soul versioning with revert.
   const rememberMarker = received.length;
@@ -3165,13 +2269,13 @@ try {
       item.threadId === threadId &&
       /Saved memory/.test(item.message.content),
   );
-  socket.send(JSON.stringify({ type: "memory.list", scope: "user" }));
+  socket.send(JSON.stringify({ type: "memory.list", scope: botId }));
   const memoryList = await waitFor("memory.list");
   const remembered = memoryList.memories.find((memory) =>
     /metric units/.test(memory.content),
   );
   assert.ok(remembered, "remember should persist a memory");
-  assert.equal(remembered.scope, "user");
+  assert.equal(remembered.scope, botId);
   assert.equal(remembered.status, "active");
 
   const recallMarker = received.length;
@@ -3195,15 +2299,15 @@ try {
   // The background reflection pass runs on a debounce after a turn; it
   // extracts durable memories and reflects them into the soul.
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 12_000));
-  socket.send(JSON.stringify({ type: "memory.list", scope: "user" }));
+  socket.send(JSON.stringify({ type: "memory.list", scope: botId }));
   const reflected = await waitFor("memory.list");
   assert.ok(
     reflected.memories.some((memory) => memory.source === "reflection"),
     "reflection should extract memories in the background",
   );
-  socket.send(JSON.stringify({ type: "soul.get" }));
+  socket.send(JSON.stringify({ type: "soul.get", botId }));
   const soulState = await waitFor("soul");
-  assert.ok(soulState.soul, "the lead should have a soul");
+  assert.ok(soulState.soul, "the agent should have a soul");
   assert.ok(
     soulState.versions.length >= 2,
     "reflection should version the soul automatically",
@@ -3225,13 +2329,13 @@ try {
       item.threadId === threadId &&
       /Soul updated/.test(item.message.content),
   );
-  socket.send(JSON.stringify({ type: "soul.get" }));
+  socket.send(JSON.stringify({ type: "soul.get", botId }));
   const soulAfter = await waitFor("soul");
   assert.match(soulAfter.soul.content.voice, /bullet/i);
   const firstVersion = soulAfter.versions.find((version) => version.version === 1);
   assert.ok(firstVersion, "the seed soul should be version 1");
   socket.send(
-    JSON.stringify({ type: "soul.revert", versionId: firstVersion.id }),
+    JSON.stringify({ type: "soul.revert", botId, versionId: firstVersion.id }),
   );
   const reverted = await waitFor("soul");
   assert.equal(
@@ -3255,7 +2359,7 @@ try {
     consolidated.archived >= 1,
     "stale, unused memories should archive on consolidation",
   );
-  socket.send(JSON.stringify({ type: "memory.list", scope: "user" }));
+  socket.send(JSON.stringify({ type: "memory.list", scope: botId }));
   const afterPrune = await waitFor("memory.list");
   assert.equal(
     afterPrune.memories.find((memory) => memory.id === remembered.id)?.status,
@@ -3315,7 +2419,7 @@ try {
   );
   await waitFor("chat.done");
 
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   const autoMarker = received.length;
   socket.send(
     JSON.stringify({
@@ -3351,8 +2455,8 @@ try {
   assert.match(timeoutResult.output, /denied/);
   await waitFor("chat.done");
 
-  // Presets and per-role narrowing: a trusted preset makes shell auto, but a
-  // read-only role policy still denies its workers' shell.
+  // Presets and per-agent policy narrowing: a trusted preset makes shell auto,
+  // but an agent with a read-only policy still has shell denied.
   socket.send(
     JSON.stringify({
       type: "settings.update",
@@ -3368,47 +2472,35 @@ try {
 
   socket.send(
     JSON.stringify({
-      type: "bots.update",
-      requestId: "role-policy",
-      botId: roleId,
+      type: "bots.create",
+      requestId: "readonly-agent",
+      name: "Read Only",
       policy: "read-only",
     }),
   );
-  const roleUpdated = await waitFor("bot.updated");
-  assert.equal(roleUpdated.bot.policy, "read-only");
+  const readOnlyBot = await waitFor("bot.created");
+  assert.equal(readOnlyBot.bot.policy, "read-only");
 
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   const roleMarker = received.length;
   socket.send(
     JSON.stringify({
       type: "chat.send",
-      botId,
-      text: `spawn: ${roleId} :: run: uname -a`,
+      botId: readOnlyBot.bot.id,
+      text: "run: uname -a",
     }),
   );
-  const roleTaskEvent = await waitForSince(
+  const readOnlyResult = await waitForSince(
     roleMarker,
-    (item) =>
-      item.type === "task.upserted" &&
-      item.task.roleId === roleId &&
-      item.task.parentId === null,
+    (item) => item.type === "tool.result",
   );
-  const roleTask = roleTaskEvent.task;
-  const roleTaskDone = await waitForTaskWhere(
-    (task) => task.id === roleTask.id && task.status === "done",
+  assert.equal(readOnlyResult.ok, false);
+  assert.match(
+    readOnlyResult.output,
+    /Blocked by the approvals policy/,
+    "a read-only agent policy should deny shell even under a trusted preset",
   );
-  assert.ok(roleTaskDone.result, "the worker should finish");
-  const roleMessages = await fetchMessages(roleTask.threadId);
-  assert.ok(
-    roleMessages.some((message) =>
-      (message.toolCalls ?? []).some(
-        (call) =>
-          call.name === "shell" &&
-          /Blocked by the approvals policy/.test(call.output),
-      ),
-    ),
-    "a read-only role policy should deny shell even under a trusted preset",
-  );
+  await waitForSince(roleMarker, (item) => item.type === "chat.done");
 
   // Egress: an allowlist denies navigation to unlisted domains.
   socket.send(
@@ -3427,7 +2519,7 @@ try {
   );
   const egressUpdated = await waitFor("providers.updated");
   assert.equal(egressUpdated.policy.egress.mode, "deny");
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
 
   socket.send(
     JSON.stringify({
@@ -3452,7 +2544,7 @@ try {
   assert.deepEqual(pushedPolicy?.allow, ["example.com"]);
   await waitFor("chat.done");
 
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   socket.send(
     JSON.stringify({
       type: "chat.send",
@@ -3490,7 +2582,7 @@ try {
 
   // Harness robustness: list_dir, shell output spill, the browser's
   // press/select/wait_for actions, and the duplicate-failure stop.
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   socket.send(
     JSON.stringify({ type: "chat.send", botId, text: "harness:list" }),
   );
@@ -3501,7 +2593,7 @@ try {
   assert.ok(codeToolInstalls > 0, "list_dir should install the helper");
   await waitFor("chat.done");
 
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   socket.send(
     JSON.stringify({ type: "chat.send", botId, text: "harness:spill" }),
   );
@@ -3515,7 +2607,7 @@ try {
   assert.ok(spillWrites > 0, "the spill file should be written in the guest");
   await waitFor("chat.done");
 
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   socket.send(
     JSON.stringify({ type: "chat.send", botId, text: "harness:press" }),
   );
@@ -3527,7 +2619,7 @@ try {
   assert.equal(pressAction.key, "Enter");
   await waitFor("chat.done");
 
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   socket.send(
     JSON.stringify({ type: "chat.send", botId, text: "harness:select" }),
   );
@@ -3539,7 +2631,7 @@ try {
   assert.equal(selectAction.option, "price");
   await waitFor("chat.done");
 
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   socket.send(
     JSON.stringify({ type: "chat.send", botId, text: "harness:wait_for" }),
   );
@@ -3550,7 +2642,7 @@ try {
   assert.equal(waitForAction.timeoutMs, 2000);
   await waitFor("chat.done");
 
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   socket.send(
     JSON.stringify({ type: "chat.send", botId, text: "harness:upload" }),
   );
@@ -3567,7 +2659,7 @@ try {
 
   // File writes carry before/after metadata so the app can render the
   // changed-files card under the final answer.
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   socket.send(
     JSON.stringify({ type: "chat.send", botId, text: "harness:write" }),
   );
@@ -3585,7 +2677,7 @@ try {
   assert.equal(writeCall?.changes?.[0]?.deletions, 0);
   assert.match(writeCall?.changes?.[0]?.diff ?? "", /^\+alpha$/m);
 
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   socket.send(
     JSON.stringify({ type: "chat.send", botId, text: "harness:edit" }),
   );
@@ -3600,7 +2692,7 @@ try {
 
   // A model stuck on one failing call is stopped after three identical
   // failures instead of looping until the step cap.
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   const repeatMarker = received.length;
   socket.send(
     JSON.stringify({ type: "chat.send", botId, text: "repeat-fail: go" }),
@@ -3621,7 +2713,7 @@ try {
 
   // A byte-identical repeat of the same call is collapsed in the working
   // history instead of being sent to the model twice.
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   socket.send(
     JSON.stringify({ type: "chat.send", botId, text: "repeat-ok: go" }),
   );
@@ -3640,7 +2732,7 @@ try {
 
   // The plan tool persists a working plan on the thread, and the plan is
   // injected into the next turn so it survives the conversation growing.
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   socket.send(JSON.stringify({ type: "chat.send", botId, text: "plan: test" }));
   const planResult = await waitFor("tool.result");
   assert.equal(planResult.ok, true);
@@ -3652,7 +2744,7 @@ try {
   assert.equal(planThread.thread.plan[1].status, "in_progress");
   await waitFor("chat.done");
 
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   socket.send(JSON.stringify({ type: "chat.send", botId, text: "plan check" }));
   await waitFor("chat.done");
   const planRequest = [...modelRequests]
@@ -3665,8 +2757,16 @@ try {
   );
 
   // File and command output is screened for injected instructions; annotate
-  // mode keeps the content but warns the model.
-  await waitForLeadQuiet();
+  // mode keeps the content but warns the model. (Jev was turned off by an
+  // earlier settings test; turn it back on.)
+  socket.send(
+    JSON.stringify({
+      type: "settings.update",
+      settings: { decision: { enabled: true } },
+    }),
+  );
+  await waitFor("providers.updated");
+  await waitForThreadQuiet();
   socket.send(
     JSON.stringify({
       type: "chat.send",
@@ -3686,7 +2786,7 @@ try {
 
   // A provider that emits raw tool-call markup as text gets one nudge and a
   // retry instead of finalizing broken markup.
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   socket.send(
     JSON.stringify({ type: "chat.send", botId, text: "markup: go" }),
   );
@@ -3739,7 +2839,7 @@ try {
   const steerSetting = await waitFor("providers.updated");
   assert.equal(steerSetting.chatBusyBehavior, "steer");
 
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   socket.send(
     JSON.stringify({ type: "chat.send", botId, text: "run: uname -a" }),
   );
@@ -3799,7 +2899,7 @@ try {
     "the queued message should persist exactly once when its turn runs",
   );
 
-  await waitForLeadQuiet();
+  await waitForThreadQuiet();
   socket.send(
     JSON.stringify({ type: "chat.send", botId, text: "run: uname -a" }),
   );
@@ -3850,8 +2950,8 @@ try {
   );
 
   // Clear: the transcript is archived in place, the title resets, and the
-  // thread keeps its identity so tasks and workers still report here.
-  await waitForLeadQuiet();
+  // thread keeps its identity.
+  await waitForThreadQuiet();
   const beforeClear = await fetchMessages(threadId);
   assert.ok(beforeClear.length > 0, "expected a transcript before clearing");
   const clearMarker = received.length;
@@ -3974,7 +3074,7 @@ try {
       type: "bots.create",
       requestId: "bot-workspace-1",
       name: "Repo Worker",
-      computer: "mac",
+      computers: ["mac"],
       workspaceId: sample.id,
     }),
   );
@@ -4141,52 +3241,6 @@ try {
   );
   await waitForSince(trustDeniedMarker, (item) => item.type === "chat.done");
 
-  // A worker inherits its caller's workspace.
-  socket.send(
-    JSON.stringify({
-      type: "bots.update",
-      requestId: "lead-workspace-1",
-      botId,
-      workspaceId: sample.id,
-    }),
-  );
-  await waitFor("bot.updated");
-  socket.send(
-    JSON.stringify({
-      type: "chat.send",
-      botId,
-      text: "create-worker: Repo Helper :: edits the registered repo",
-    }),
-  );
-  const repoWorkerApproval = await waitFor("approval.request");
-  assert.equal(repoWorkerApproval.name, "create_worker");
-  socket.send(
-    JSON.stringify({
-      type: "approval.respond",
-      requestId: repoWorkerApproval.requestId,
-      decision: "approve",
-    }),
-  );
-  const repoWorker = await waitForWhere(
-    (item) =>
-      item.type === "bot.created" && item.bot.name === "Repo Helper",
-  );
-  assert.equal(
-    repoWorker.bot.workspaceId,
-    sample.id,
-    "a worker should inherit the caller's workspace",
-  );
-  socket.send(
-    JSON.stringify({
-      type: "bots.update",
-      requestId: "lead-workspace-2",
-      botId,
-      workspaceId: null,
-    }),
-  );
-  await waitFor("bot.updated");
-  await waitForLeadQuiet();
-
   // Access modes (ADR-023): system_info describes the running daemon, full
   // reach reads outside the project, and home reach stays inside the home
   // folder.
@@ -4218,7 +3272,7 @@ try {
       type: "bots.create",
       requestId: "bot-full-1",
       name: "Full Access",
-      computer: "mac",
+      computers: ["mac"],
       access: "full",
     }),
   );
@@ -4249,7 +3303,7 @@ try {
       type: "bots.create",
       requestId: "bot-home-1",
       name: "Home Access",
-      computer: "mac",
+      computers: ["mac"],
       access: "home",
     }),
   );
@@ -4303,7 +3357,7 @@ try {
   );
 
   console.log(
-    `SMOKE OK — text chat, single thread per bot, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), dual-computer routing (per-call computer argument, microVM default, Mac opt-in, unavailable computer rejected), workspace registry (scan roots, marker detection, node_modules skipped, add/ignore/remove, shell and file tools rooted in the project, escape rejected, trusted commands with deny precedence, worker inheritance), access modes (full reach outside home, home confinement, system_info self-report), permissions report, agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, lead delegation (spawn_worker, task grant, in-grant tools without re-approval, out-of-grant escalation and denial, task result + evidence + usage, lead notification), dynamic team building (create_worker, immediate delegation to the new worker, duplicate-name reuse), projects (lead creates a persistent manager, list_projects routing, ask_project request on the project thread, worker sessions in the project computer with their own browser, project survives and is reused), per-task computers (own sandbox id, concurrency cap and queueing, destroyed on settle), memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-role narrowing, egress allowlist), Jev routing (conversation runs without tools, a named project gets the routing hint), harness robustness (list_dir, shell output spill, shell background, browser press/select/wait_for/snapshot/tabs/upload/downloads, duplicate-failure stop, raw-markup retry, changed-file metadata), context discipline (unchanged reads and identical results collapse), working plan (update_plan persists and is injected), output screening (injected instructions in shell output are annotated), busy-turn delivery (queue waits for the stop, steer redirects the running turn, persisted default), chat clear (transcript archived in place, title reset, fresh turn on the same thread)`,
+    `SMOKE OK — one agent per thread, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), workspace registry (scan roots, marker detection, node_modules skipped, add/ignore/remove, shell and file tools rooted in the project, escape rejected, trusted commands with deny precedence), access modes (full reach outside home, home confinement, system_info self-report), permissions report, agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-agent policy narrowing, egress allowlist), harness robustness (list_dir, shell output spill, shell background, browser press/select/wait_for/snapshot/tabs/upload/downloads, duplicate-failure stop, raw-markup retry, changed-file metadata), context discipline (unchanged reads and identical results collapse), working plan (update_plan persists and is injected), output screening (injected instructions in shell output are annotated), busy-turn delivery (queue waits for the stop, steer redirects the running turn, persisted default), chat clear (transcript archived in place, title reset, fresh turn on the same thread)`,
   );
 } finally {
   socket?.close();

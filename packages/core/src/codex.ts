@@ -17,6 +17,7 @@ import { createInterface } from "node:readline";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { CodexInfo } from "@openbot/protocol";
+import { primaryComputer } from "@openbot/protocol";
 import type {
   Message,
   ServerMessage,
@@ -289,7 +290,7 @@ export async function runCodexTurn(
     return;
   }
 
-  if (bot.computer === "mac") {
+  if (primaryComputer(bot) === "mac") {
     emit({
       type: "chat.error",
       runId,

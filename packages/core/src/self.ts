@@ -16,9 +16,9 @@ export interface SelfCheck {
 
 /**
  * What the daemon knows about itself: where it runs from, where its data and
- * app live, how it was launched, and which checks the project defines. The
- * lead gets a compact version in its prompt and every agent can ask for the
- * full picture with the system_info tool.
+ * app live, how it was launched, and which checks the project defines. Each
+ * agent gets a compact version in its prompt and can ask for the full picture
+ * with the system_info tool.
  */
 export interface SelfInfo {
   runMode: "dev" | "packaged";
@@ -171,7 +171,7 @@ export function collectSelfInfo(input: {
   };
 }
 
-/** A compact note for the lead's prompt; the full detail is the tool. */
+/** A compact note for an agent's prompt; the full detail is the tool. */
 export function renderSelfNote(info: SelfInfo): string {
   if (info.runMode !== "dev" || !info.repoRoot) {
     return (

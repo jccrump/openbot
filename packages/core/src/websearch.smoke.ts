@@ -282,7 +282,7 @@ check("runWebSearch returns null text when the provider is empty", async () => {
 check("web_search is registered and offered on both computers", async () => {
   assert.ok(findTool("web_search"), "the tool should be registered");
   for (const computer of ["firecracker", "mac"] as const) {
-    const names = toolDefinitions([computer]).map(
+    const names = toolDefinitions(computer).map(
       (definition) => definition.name,
     );
     assert.ok(

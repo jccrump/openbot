@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { Bot, ComputerKind, Workspace } from "@openbot/protocol";
+import { botHasComputer, primaryComputer } from "@openbot/protocol";
 import type { SandboxBackend } from "@openbot/sandbox";
 import { ensureWorkspace, resolveWorkspacePath } from "./local-computer";
 import {
@@ -46,19 +47,16 @@ export interface FileServiceOptions {
 
 const DEFAULT_CAP = 500;
 
-function isMacBot(bot: Bot): boolean {
-  return bot.computer === "mac";
-}
-
 /**
- * Which computer a file request browses: the requested one when the agent has
- * it, otherwise the agent's primary (ADR-021).
+ * Which computer a file request browses. When the caller names one of the
+ * agent's computers it is honored; otherwise the agent's primary computer is
+ * used.
  */
 function computerFor(bot: Bot, requested?: ComputerKind | null): ComputerKind {
-  if (requested && bot.computers.includes(requested)) {
+  if (requested && botHasComputer(bot, requested)) {
     return requested;
   }
-  return isMacBot(bot) ? "mac" : "firecracker";
+  return primaryComputer(bot);
 }
 
 function scratchDir(options: FileServiceOptions, bot: Bot): string {
@@ -73,7 +71,7 @@ function workspaceFor(options: FileServiceOptions, bot: Bot): Workspace | null {
 }
 
 /** The Mac folder file tools are confined to: the project, the home folder, or all. */
-function macRoot(options: FileServiceOptions, bot: Bot): string {
+export function macRoot(options: FileServiceOptions, bot: Bot): string {
   const access = bot.access ?? "project";
   if (access === "full") {
     return "/";
@@ -99,7 +97,6 @@ function helperContext(
   return {
     botId: bot.id,
     computer,
-    computers: bot.computers,
     sandbox: options.sandbox,
     workspaceDir: macRoot(options, bot),
     ...(computer === "mac" ? {} : { guestCwd: guestRoot(options, bot) }),

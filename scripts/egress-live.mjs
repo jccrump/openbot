@@ -9,7 +9,7 @@ const require = createRequire(join(root, "packages/core/package.json"));
 const { WebSocket } = require("ws");
 
 const daemonPort = Number(process.env.OPENBOT_PORT ?? 4170);
-const leadName = process.env.EGRESS_LEAD ?? "Test Agent";
+const agentName = process.env.EGRESS_LEAD ?? "Test Agent";
 
 const socket = new WebSocket(`ws://127.0.0.1:${daemonPort}/ws`);
 const messages = [];
@@ -53,11 +53,11 @@ function waitFor(type, timeoutMs = 180_000) {
 await new Promise((resolvePromise) => socket.on("open", resolvePromise));
 socket.send(JSON.stringify({ type: "hello", client: "egress-live" }));
 const hello = await waitFor("hello");
-const lead = hello.bots.find((bot) => bot.name === leadName) ?? hello.bots[0];
-if (!lead) {
-  throw new Error("no lead bot found");
+const agent = hello.bots.find((bot) => bot.name === agentName) ?? hello.bots[0];
+if (!agent) {
+  throw new Error("no agent bot found");
 }
-console.log(`lead: ${lead.name} (${lead.id})`);
+console.log(`agent: ${agent.name} (${agent.id})`);
 
 const setPolicy = (policy) =>
   new Promise((resolvePromise) => {
@@ -66,7 +66,7 @@ const setPolicy = (policy) =>
   });
 
 const ask = async (text) => {
-  socket.send(JSON.stringify({ type: "chat.send", botId: lead.id, text }));
+  socket.send(JSON.stringify({ type: "chat.send", botId: agent.id, text }));
   const approval = await waitFor("approval.request");
   socket.send(
     JSON.stringify({

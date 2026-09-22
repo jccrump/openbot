@@ -12,7 +12,6 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { ComputerChoices } from "./ComputerChoices";
 import {
   AVATAR_COLORS,
-  botComputers,
   COMPUTER_LABEL,
   EFFORT_OPTIONS,
   hasVm,
@@ -26,7 +25,6 @@ export interface AgentSettingsPatch {
   computers: ComputerKind[];
   workspaceId: string | null;
   access: AccessMode;
-  delegates: boolean;
   policy: RolePolicy;
   model: ModelRef;
 }
@@ -55,10 +53,9 @@ export function AgentSettingsModal({
   const [name, setName] = useState("");
   const [role, setRole] = useState("");
   const [color, setColor] = useState(AVATAR_COLORS[0]!);
-  const [computers, setComputers] = useState<ComputerKind[]>(["firecracker"]);
+  const [computers, setComputers] = useState<ComputerKind[]>([]);
   const [workspaceId, setWorkspaceId] = useState("");
   const [access, setAccess] = useState<AccessMode>("project");
-  const [delegates, setDelegates] = useState(false);
   const [policy, setPolicy] = useState<RolePolicy>("inherit");
   const [effort, setEffort] = useState<ReasoningEffort | "">("");
   const [confirm, setConfirm] = useState<"reset" | "delete" | null>(null);
@@ -70,10 +67,9 @@ export function AgentSettingsModal({
     setName(bot.name);
     setRole(bot.role ?? "");
     setColor(bot.color ?? AVATAR_COLORS[0]!);
-    setComputers(botComputers(bot));
+    setComputers(bot.computers ?? ["firecracker"]);
     setWorkspaceId(bot.workspaceId ?? "");
     setAccess(bot.access ?? "project");
-    setDelegates(bot.delegates);
     setPolicy(bot.policy);
     setEffort(bot.model.effort ?? "");
     setConfirm(null);
@@ -98,18 +94,15 @@ export function AgentSettingsModal({
   }
 
   const powerOn = sandboxState === "running" || sandboxState === "booting";
-  const savedComputers = botComputers(bot);
-  const computersChanged =
-    computers.length !== savedComputers.length ||
-    computers.some((kind) => !savedComputers.includes(kind));
+  const savedComputers: ComputerKind[] = bot.computers ?? ["firecracker"];
   const changed =
     name.trim() !== bot.name ||
     (role.trim() || null) !== (bot.role ?? null) ||
     color !== (bot.color ?? AVATAR_COLORS[0]!) ||
-    computersChanged ||
+    computers.length !== savedComputers.length ||
+    computers.some((item) => !savedComputers.includes(item)) ||
     (workspaceId || null) !== (bot.workspaceId ?? null) ||
     access !== (bot.access ?? "project") ||
-    delegates !== bot.delegates ||
     policy !== bot.policy ||
     (effort || null) !== (bot.model.effort ?? null);
 
@@ -128,7 +121,7 @@ export function AgentSettingsModal({
           <header className="modal-head">
             <div className="modal-head-title">
               <span className="avatar avatar-lg" style={{ background: color }} />
-              <h2>Worker settings</h2>
+              <h2>Agent settings</h2>
             </div>
             <button
               className="icon-button"
@@ -260,35 +253,11 @@ export function AgentSettingsModal({
               </p>
             </label>
 
-            <div className="field">
-              <span>Delegation</span>
-              <div className="agent-power-row">
-                <span>
-                  {delegates
-                    ? "Manages projects and spawns workers of its own"
-                    : "Works on tasks the lead assigns"}
-                </span>
-                <button
-                  role="switch"
-                  aria-checked={delegates}
-                  aria-label="Can delegate"
-                  className={`switch ${delegates ? "switch-on" : ""}`}
-                  onClick={() => setDelegates((value) => !value)}
-                >
-                  <span className="switch-knob" />
-                </button>
-              </div>
-              <p className="computer-warning">
-                Managers can only allocate tools and budget that fit inside the
-                grant the lead approved for their project.
-              </p>
-            </div>
-
             <label className="field">
               <span>Approvals policy</span>
               <select
                 value={policy}
-                aria-label="Role approvals policy"
+                aria-label="Agent approvals policy"
                 onChange={(event) =>
                   setPolicy(event.target.value as RolePolicy)
                 }
@@ -300,7 +269,7 @@ export function AgentSettingsModal({
                 <option value="locked">Locked down</option>
               </select>
               <p className="computer-warning">
-                A role's policy can only be stricter than the global one.
+                An agent's policy can only be stricter than the global one.
               </p>
             </label>
 
@@ -330,8 +299,8 @@ export function AgentSettingsModal({
               <div className="agent-modal-danger-copy">
                 <p className="agent-modal-danger-title">Danger zone</p>
                 <p className="agent-modal-danger-sub">
-                  Start fresh clears this role's tasks and reinstalls its
-                  computer. Delete removes the role entirely.
+                  Start fresh clears this agent's history and reinstalls its
+                  computer. Delete removes the agent entirely.
                 </p>
               </div>
               <div className="agent-modal-danger-actions">
@@ -345,7 +314,7 @@ export function AgentSettingsModal({
                   className="danger-button"
                   onClick={() => setConfirm("delete")}
                 >
-                  Delete role
+                  Delete agent
                 </button>
               </div>
             </div>
@@ -366,7 +335,6 @@ export function AgentSettingsModal({
                   computers,
                   workspaceId: workspaceId || null,
                   access,
-                  delegates,
                   policy,
                   model: {
                     provider: bot.model.provider,
@@ -403,8 +371,8 @@ export function AgentSettingsModal({
       <ConfirmDialog
         open={confirm === "delete"}
         title={`Delete ${bot.name}?`}
-        description={`This permanently removes ${bot.name}, its task history, and everything on its computer.`}
-        confirmLabel="Delete role"
+        description={`This permanently removes ${bot.name}, its history, and everything on its computer.`}
+        confirmLabel="Delete agent"
         onConfirm={() => {
           setConfirm(null);
           onDelete();

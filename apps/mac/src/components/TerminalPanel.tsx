@@ -219,11 +219,7 @@ export function TerminalPanel({
     return (
       <div className="terminal-panel">
         <div className="terminal-empty">
-          <p>Terminal is available for Firecracker microVM computers.</p>
-          <p className="files-note">
-            This agent runs directly on your Mac. Use the shell tool in chat to
-            run commands with approval.
-          </p>
+          <p>Select an agent to open a terminal.</p>
         </div>
       </div>
     );

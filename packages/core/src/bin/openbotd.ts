@@ -29,9 +29,15 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const db = openDatabase(config.dataDir);
   const store = new Store(db);
-  store.ensureLeadBot(config.defaultModel);
+  store.ensureDefaultBot(config.defaultModel);
   store.migrateLegacyPrompts();
   store.seedProviders(config.providers);
+  const expiredApprovals = store.expirePendingApprovals();
+  if (expiredApprovals > 0) {
+    console.log(
+      `abandoned ${expiredApprovals} pending approval(s) from a previous run`,
+    );
+  }
   if (!store.getSetting("defaultModel")) {
     store.setSetting("defaultModel", JSON.stringify(config.defaultModel));
   }

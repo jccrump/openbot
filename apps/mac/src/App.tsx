@@ -1,5 +1,4 @@
 import {
-  Fragment,
   useEffect,
   useMemo,
   useRef,
@@ -13,12 +12,12 @@ import type {
   Message,
   ModelRef,
   ReasoningEffort,
-  Task,
   Thread,
   ToolArtifact,
   ToolCallRecord,
   Workspace,
 } from "@openbot/protocol";
+import { botComputers } from "@openbot/protocol";
 import { Settings } from "./Settings";
 import { AgentSettingsModal } from "./components/AgentSettingsModal";
 import { ApprovalsModal } from "./components/ApprovalsModal";
@@ -27,13 +26,11 @@ import { ConfirmDialog } from "./components/ConfirmDialog";
 import { FilesPanel } from "./components/FilesPanel";
 import { Markdown } from "./components/Markdown";
 import { MemoryModal } from "./components/MemoryModal";
-import { PanelResizer } from "./components/PanelResizer";
 import { TerminalPanel } from "./components/TerminalPanel";
 import { VncView, type VncState } from "./components/VncView";
 import {
   AVATAR_COLORS,
   avatarColor,
-  botComputers,
   EFFORT_OPTIONS,
   hasVm,
   isMacOnly,
@@ -47,7 +44,6 @@ import {
   type ModelOption,
   type PendingApproval,
   type PendingChallenge,
-  type SandboxState,
   type StreamingState,
   type ToolActivity,
 } from "./lib/useDaemon";
@@ -59,12 +55,9 @@ const STATUS_LABEL: Record<string, string> = {
   disconnected: "Daemon offline — run pnpm dev:daemon",
 };
 
-const SCREEN_PANEL_KEY = "openbot.screenPanel";
-const PANEL_SECTIONS_KEY = "openbot.panelSections";
-const PANEL_SIZES_KEY = "openbot.panelSizes";
+const PANEL_SECTIONS_KEY = "openbot.panelSections.v2";
 const SCREEN_POLL_MS = 1500;
 const SCREEN_OFF_POLL_MS = 8_000;
-const PANEL_SECTION_MIN_HEIGHT = 96;
 
 type PanelSection = "screen" | "files" | "terminal";
 
@@ -74,38 +67,15 @@ const PANEL_SECTIONS: Array<{ id: PanelSection; label: string }> = [
   { id: "files", label: "Files" },
 ];
 
-const DEFAULT_SECTION_GROWTH: Record<PanelSection, number> = {
-  screen: 1.4,
-  files: 1,
-  terminal: 1,
-};
-
 type PanelCollapsed = Record<PanelSection, boolean>;
-type PanelGrowth = Record<PanelSection, number>;
-
-const TASK_STATUS_LABEL: Record<Task["status"], string> = {
-  queued: "Queued",
-  running: "Running",
-  done: "Done",
-  failed: "Failed",
-  cancelled: "Cancelled",
-};
 
 type ScreenStatus = "loading" | "live" | "vm-off" | "error";
 
-function storedScreenPanelOpen(): boolean {
-  try {
-    return localStorage.getItem(SCREEN_PANEL_KEY) !== "closed";
-  } catch {
-    return true;
-  }
-}
-
 function storedPanelCollapsed(): PanelCollapsed {
   const collapsed: PanelCollapsed = {
-    screen: false,
-    files: false,
-    terminal: false,
+    screen: true,
+    files: true,
+    terminal: true,
   };
   try {
     const raw = localStorage.getItem(PANEL_SECTIONS_KEY);
@@ -121,24 +91,6 @@ function storedPanelCollapsed(): PanelCollapsed {
     }
   } catch {}
   return collapsed;
-}
-
-function storedPanelGrowth(): PanelGrowth {
-  const growth = { ...DEFAULT_SECTION_GROWTH };
-  try {
-    const raw = localStorage.getItem(PANEL_SIZES_KEY);
-    if (!raw) {
-      return growth;
-    }
-    const parsed = JSON.parse(raw) as Partial<Record<PanelSection, unknown>>;
-    for (const section of PANEL_SECTIONS) {
-      const value = parsed[section.id];
-      if (typeof value === "number" && Number.isFinite(value) && value > 0) {
-        growth[section.id] = value;
-      }
-    }
-  } catch {}
-  return growth;
 }
 
 interface ToolArguments {
@@ -158,17 +110,6 @@ interface ToolArguments {
   pixels?: number;
   x?: number;
   y?: number;
-  brief?: string;
-  roleId?: string;
-  grant?: {
-    tools?: string[];
-    budget?: {
-      wallClockMs?: number | null;
-      tokens?: number | null;
-      toolCalls?: number | null;
-    };
-  };
-  taskId?: string;
 }
 
 interface ToolLabel {
@@ -196,33 +137,6 @@ function toolLabel(name: string): ToolLabel {
     return { text: "Searched" };
   }
   return { text: "Called", code: name };
-}
-
-function formatGrantDetail(grant: ToolArguments["grant"]): string | null {
-  if (!grant) {
-    return null;
-  }
-  const parts: string[] = [];
-  if (grant.tools && grant.tools.length > 0) {
-    parts.push(`tools: ${grant.tools.join(", ")}`);
-  }
-  const budget = grant.budget;
-  if (budget) {
-    const limits: string[] = [];
-    if (budget.wallClockMs != null) {
-      limits.push(`${Math.round(budget.wallClockMs / 1000)}s`);
-    }
-    if (budget.toolCalls != null) {
-      limits.push(`${budget.toolCalls} calls`);
-    }
-    if (budget.tokens != null) {
-      limits.push(`${budget.tokens} tokens`);
-    }
-    if (limits.length > 0) {
-      parts.push(`budget: ${limits.join(", ")}`);
-    }
-  }
-  return parts.length > 0 ? parts.join(" · ") : null;
 }
 
 function parseToolArguments(raw: string): ToolArguments {
@@ -255,11 +169,6 @@ function formatArgValue(value: unknown): string {
 // else. Kept verbatim rather than prettified so it matches what the bot ran.
 function toolDetail(raw: string): string {
   const parsed = parseToolArguments(raw);
-  if (parsed.brief) {
-    const grant = formatGrantDetail(parsed.grant);
-    return grant ? `brief=${parsed.brief} · ${grant}` : `brief=${parsed.brief}`;
-  }
-  if (parsed.taskId) return parsed.taskId;
   if (parsed.command) return parsed.command;
   if (parsed.path) return parsed.path;
   if (parsed.goal) return parsed.goal;
@@ -382,39 +291,6 @@ function PanelSectionIcon({ section }: { section: PanelSection }) {
   return <TerminalTabIcon />;
 }
 
-function SectionChevronIcon() {
-  return (
-    <svg width="10" height="10" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-      <path
-        d="m3 4.5 3 3 3-3"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
-}
-
-function PanelCollapseIcon() {
-  return (
-    <svg
-      width="15"
-      height="15"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="m6 17 5-5-5-5" />
-      <path d="m13 17 5-5-5-5" />
-    </svg>
-  );
-}
-
 function PauseIcon() {
   return (
     <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
@@ -462,15 +338,39 @@ function CollapseIcon() {
 
 function GearIcon() {
   return (
-    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <path
-        d="M2 5.2h7M13.4 5.2H14M2 10.8h1M6 10.8h8"
-        stroke="currentColor"
-        strokeWidth="1.4"
-        strokeLinecap="round"
-      />
-      <circle cx="11.2" cy="5.2" r="1.7" stroke="currentColor" strokeWidth="1.4" />
-      <circle cx="4.6" cy="10.8" r="1.7" stroke="currentColor" strokeWidth="1.4" />
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
+      <circle cx="12" cy="12" r="3" />
+    </svg>
+  );
+}
+
+function DeleteAgentIcon() {
+  return (
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+      <circle cx="9" cy="7" r="4" />
+      <path d="m17 8 5 5M22 8l-5 5" />
     </svg>
   );
 }
@@ -539,19 +439,6 @@ function MicIcon() {
   );
 }
 
-function CloseIcon() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <path
-        d="m4 4 8 8M12 4l-8 8"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
-}
-
 function CopyIcon() {
   return (
     <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -568,16 +455,10 @@ function CopyIcon() {
 
 interface ThreadRow {
   id: string;
-  kind: "bot" | "task";
   name: string;
   selected: boolean;
   working: boolean;
   title: string;
-  // Nesting level: 0 is the lead, 1 a manager, 2 a worker. The list indents by
-  // this so the hierarchy reads without drawing connector lines.
-  depth: number;
-  hasChildren: boolean;
-  expanded: boolean;
 }
 
 // The transcript keeps itself pinned to the newest entry; `signal` is any
@@ -603,32 +484,6 @@ function Transcript({
   );
 }
 
-function taskThreadName(task: Task): string {
-  const title = task.title?.trim() ?? "";
-  const brief = (task.brief ?? "").replace(/\s+/g, " ").trim();
-  if (title && title.toLowerCase() !== "delegated task") {
-    return title;
-  }
-  if (brief) {
-    return `${brief.slice(0, 44)}${brief.length > 44 ? "…" : ""}`;
-  }
-  return "Task";
-}
-
-function threadRowForTask(task: Task, depth: number): ThreadRow {
-  return {
-    id: task.id,
-    kind: "task",
-    name: taskThreadName(task),
-    selected: false,
-    working: task.status === "queued" || task.status === "running",
-    title: task.brief || taskThreadName(task),
-    depth,
-    hasChildren: false,
-    expanded: false,
-  };
-}
-
 function pulseSeed(id: string): number {
   let hash = 0;
   for (let index = 0; index < id.length; index += 1) {
@@ -644,7 +499,6 @@ function ThreadList({
   onSearchChange,
   onToggleSearch,
   onSelect,
-  onToggle,
 }: {
   rows: ThreadRow[];
   query: string;
@@ -652,16 +506,15 @@ function ThreadList({
   onSearchChange: (value: string) => void;
   onToggleSearch: () => void;
   onSelect: (row: ThreadRow) => void;
-  onToggle: (row: ThreadRow) => void;
 }) {
   return (
     <section className="panel-threads">
       <div className="panel-threads-head">
-        <span className="panel-section-title">Threads</span>
+        <span className="panel-section-title">Agents</span>
         <button
           className="icon-button icon-mini"
-          title="Search threads"
-          aria-label="Search threads"
+          title="Search agents"
+          aria-label="Search agents"
           aria-pressed={searchOpen}
           onClick={onToggleSearch}
         >
@@ -675,8 +528,8 @@ function ThreadList({
             autoFocus
             value={query}
             onChange={(event) => onSearchChange(event.target.value)}
-            placeholder="Search threads"
-            aria-label="Search threads"
+            placeholder="Search agents"
+            aria-label="Search agents"
             spellCheck={false}
           />
         </label>
@@ -684,11 +537,10 @@ function ThreadList({
       <div className="agent-list panel-thread-list">
         {rows.map((row) => (
           <div
-            key={`${row.kind}-${row.id}`}
+            key={row.id}
             role="button"
             tabIndex={0}
             className={`thread-row ${row.selected ? "thread-row-selected" : ""}`}
-            style={{ paddingLeft: 8 + row.depth * 18 }}
             title={row.title}
             aria-label={row.name}
             onClick={() => onSelect(row)}
@@ -717,34 +569,13 @@ function ThreadList({
             <span className="agent-row-body">
               <span className="agent-row-name">{row.name}</span>
             </span>
-            {row.hasChildren ? (
-              <button
-                type="button"
-                className={`thread-disclosure${
-                  row.expanded ? " thread-disclosure-open" : ""
-                }`}
-                aria-expanded={row.expanded}
-                aria-label={
-                  row.expanded ? `Collapse ${row.name}` : `Expand ${row.name}`
-                }
-                title={row.expanded ? "Hide workers" : "Show workers"}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onToggle(row);
-                }}
-              >
-                <ChevronIcon />
-              </button>
-            ) : (
-              <span className="thread-disclosure-spacer" aria-hidden="true" />
-            )}
           </div>
         ))}
         {rows.length === 0 && (
           <p className="sidebar-empty">
             {query
-              ? "No threads match your search."
-              : "No threads yet — ask the lead to start one."}
+              ? "No agents match your search."
+              : "No agents yet — create one to start."}
           </p>
         )}
       </div>
@@ -774,7 +605,7 @@ function ThreadChat({
   onOpenScreen,
   onOpenApprovals,
   onOpenMemory,
-  screenOpen,
+  onDelete,
   messages,
   streaming,
   activity,
@@ -796,7 +627,7 @@ function ThreadChat({
   onOpenScreen: () => void;
   onOpenApprovals: () => void;
   onOpenMemory: () => void;
-  screenOpen: boolean;
+  onDelete: () => void;
   messages: Message[];
   streaming: StreamingState | null;
   activity: ToolActivity[];
@@ -850,21 +681,14 @@ function ThreadChat({
               <ClearIcon />
             </button>
           )}
-          {/* The panel carries its own collapse control, so the toggle only
-              appears while the computer view is closed. */}
-          {!screenOpen && (
+          {bot && (
             <button
               className="icon-button"
-              title="Show computer view"
-              aria-label="Show computer view"
-              onClick={() => {
-                onOpenScreen();
-                try {
-                  localStorage.setItem(SCREEN_PANEL_KEY, "open");
-                } catch {}
-              }}
+              title={`Delete ${botName}`}
+              aria-label={`Delete ${botName}`}
+              onClick={onDelete}
             >
-              <MonitorIcon />
+              <DeleteAgentIcon />
             </button>
           )}
         </div>
@@ -878,17 +702,11 @@ function ThreadChat({
                   style={{ background: bot?.color ?? avatarColor(bot?.id ?? "assistant") }}
                 />
                 <h1>{botName}</h1>
-                {bot?.kind === "project" ? (
-                  <p>
-                    {bot.role?.trim() || "Thread"} · when the lead routes work
-                    here, the request and the manager's report appear in this
-                    thread.
-                  </p>
-                ) : hasUsableProvider ? (
+                {hasUsableProvider ? (
                   <p>
                     {isMacOnly(bot)
-                      ? "Ask for what you need. The lead can run commands directly on this Mac or delegate to a team role."
-                      : "Ask for what you need. The lead can work on its own computer or delegate to a team role — workers run on their own computers and report back here."}
+                      ? "Ask for what you need. This agent runs commands directly on this Mac."
+                      : "Ask for what you need. This agent works on its own computer."}
                   </p>
                 ) : (
                   <>
@@ -1070,14 +888,6 @@ function ThreadChat({
                   >
                     <MemoryIcon />
                   </button>
-                  <button
-                    className="icon-button"
-                    title="Settings"
-                    aria-label="Settings"
-                    onClick={() => onOpenSettings()}
-                  >
-                    <GearIcon />
-                  </button>
                   <span
                     className={`status-dot status-${daemon.status}`}
                     title={STATUS_LABEL[daemon.status]}
@@ -1157,21 +967,10 @@ export default function App() {
   const [createOpen, setCreateOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
-  const [expandedThreads, setExpandedThreads] = useState<Set<string>>(
-    () => new Set(),
-  );
-  const [drawerThread, setDrawerThread] = useState<{
-    threadId: string;
-    row: ThreadRow;
-  } | null>(null);
-  const [drawerClosing, setDrawerClosing] = useState(false);
   const [settingsBotId, setSettingsBotId] = useState<string | null>(null);
-  const [watchTaskId, setWatchTaskId] = useState<string | null>(null);
-  const [screenOpen, setScreenOpen] = useState(storedScreenPanelOpen);
+  const [deleteOpen, setDeleteOpen] = useState(false);
   const [panelCollapsed, setPanelCollapsed] =
     useState<PanelCollapsed>(storedPanelCollapsed);
-  const [panelGrowth, setPanelGrowth] = useState<PanelGrowth>(storedPanelGrowth);
-  const panelStackRef = useRef<HTMLDivElement | null>(null);
   const [screenPlaying, setScreenPlaying] = useState(true);
   const [screenExpanded, setScreenExpanded] = useState(false);
   const [screenImageUrl, setScreenImageUrl] = useState<string | null>(null);
@@ -1180,7 +979,7 @@ export default function App() {
   const [screenVmState, setScreenVmState] = useState<string | null>(null);
   const [screenError, setScreenError] = useState<string | null>(null);
   const [vncState, setVncState] = useState<VncState>("idle");
-  const [filesComputer, setFilesComputer] = useState<ComputerKind>("firecracker");
+  const [panelComputer, setPanelComputer] = useState<ComputerKind | null>(null);
   const [windowActive, setWindowActive] = useState(
     () => !document.hidden && document.hasFocus(),
   );
@@ -1188,20 +987,27 @@ export default function App() {
   const bot =
     daemon.bots.find((item) => item.id === daemon.selectedBotId) ?? null;
   const botName = bot?.name ?? "Assistant";
-  // The computer panel follows the thread you have open: a manager's drawer
-  // shows the manager's machine rather than the main agent's.
-  const drawerBot =
-    drawerThread?.row.kind === "bot"
-      ? (daemon.bots.find((item) => item.id === drawerThread.row.id) ?? null)
-      : null;
-  const screenBot = drawerBot ?? bot;
+  const screenBot = bot;
   const screenBotName = screenBot?.name ?? "Assistant";
-  const screenBotComputers = botComputers(screenBot);
-  // The Files section can browse either computer; fall back to the primary
-  // when the remembered choice is not in the agent's set (ADR-021).
-  const filesTarget: ComputerKind = screenBotComputers.includes(filesComputer)
-    ? filesComputer
-    : (screenBotComputers[0] ?? "firecracker");
+  // The right-column panels are computer-scoped: tabs let the user switch
+  // which of the agent's computers they are browsing.
+  const availableComputers: ComputerKind[] = screenBot
+    ? botComputers(screenBot)
+    : ["firecracker"];
+  const activeComputer: ComputerKind =
+    panelComputer && availableComputers.includes(panelComputer)
+      ? panelComputer
+      : (availableComputers[0] ?? "firecracker");
+  const showScreen = activeComputer === "firecracker";
+  // The Files section browses the computer currently selected in the panels.
+  const filesTarget: ComputerKind = activeComputer;
+  // Screen is VM-only; when the local tab is active it disappears entirely.
+  const visibleSections = PANEL_SECTIONS.filter(
+    (section) => section.id !== "screen" || showScreen,
+  );
+  const anySectionOpen = visibleSections.some(
+    (section) => !panelCollapsed[section.id],
+  );
   const filesWorkspace = screenBot?.workspaceId
     ? (daemon.workspaces.find(
         (workspace) => workspace.id === screenBot.workspaceId,
@@ -1215,9 +1021,6 @@ export default function App() {
         : (screenBot?.access ?? "project") === "full"
           ? "Filesystem"
           : filesWorkspace?.name;
-  useEffect(() => {
-    setFilesComputer(hasVm(screenBot) ? "firecracker" : "mac");
-  }, [screenBot?.id]);
   const hasUsableProvider = daemon.providers.some(isProviderUsable);
   const hasProviderNeedingKey = daemon.providers.some(
     (provider) =>
@@ -1251,14 +1054,14 @@ export default function App() {
     ? `${DAEMON_HTTP_URL.replace(/^http/, "ws")}/bots/${encodeURIComponent(screenBot.id)}/vnc`
     : "";
   const terminalUrl = screenBot
-    ? `${DAEMON_HTTP_URL.replace(/^http/, "ws")}/bots/${encodeURIComponent(screenBot.id)}/terminal`
+    ? `${DAEMON_HTTP_URL.replace(/^http/, "ws")}/bots/${encodeURIComponent(screenBot.id)}/terminal?computer=${activeComputer}`
     : "";
-  const canStream = Boolean(screenBot) && hasVm(screenBot);
+  const canStream = Boolean(screenBot) && showScreen && hasVm(screenBot);
+  const canConnectTerminal = Boolean(screenBot);
   const vncLive = vncState === "live";
   const vncActive =
     canStream &&
     screenPlaying &&
-    screenOpen &&
     !panelCollapsed.screen &&
     screenStatus !== "vm-off";
 
@@ -1273,7 +1076,6 @@ export default function App() {
   };
 
   const openScreenTab = () => {
-    setScreenOpen(true);
     setPanelCollapsed((current) => {
       if (!current.screen) {
         return current;
@@ -1284,73 +1086,8 @@ export default function App() {
       } catch {}
       return next;
     });
-    try {
-      localStorage.setItem(SCREEN_PANEL_KEY, "open");
-    } catch {}
   };
 
-  const beginSectionResize = (index: number, startY: number) => {
-    const stack = panelStackRef.current;
-    const first = PANEL_SECTIONS[index];
-    const second = PANEL_SECTIONS[index + 1];
-    if (!stack || !first || !second) {
-      return;
-    }
-    if (panelCollapsed[first.id] || panelCollapsed[second.id]) {
-      return;
-    }
-    const stackHeight = stack.clientHeight;
-    if (stackHeight <= 0) {
-      return;
-    }
-    const startGrowth = { ...panelGrowth };
-    const visibleGrowth = PANEL_SECTIONS.reduce(
-      (sum, section) =>
-        panelCollapsed[section.id] ? sum : sum + startGrowth[section.id],
-      0,
-    );
-    if (visibleGrowth <= 0) {
-      return;
-    }
-    const pairGrowth = startGrowth[first.id] + startGrowth[second.id];
-    const firstHeight = (startGrowth[first.id] / visibleGrowth) * stackHeight;
-    const secondHeight = (startGrowth[second.id] / visibleGrowth) * stackHeight;
-    const pairHeight = firstHeight + secondHeight;
-    const minHeight = Math.min(PANEL_SECTION_MIN_HEIGHT, pairHeight / 2);
-    let latest = startGrowth;
-
-    const onMove = (event: MouseEvent) => {
-      const delta = event.clientY - startY;
-      const nextFirstHeight = Math.min(
-        Math.max(firstHeight + delta, minHeight),
-        pairHeight - minHeight,
-      );
-      const nextFirstGrowth = pairGrowth * (nextFirstHeight / pairHeight);
-      const next = { ...startGrowth };
-      next[first.id] = nextFirstGrowth;
-      next[second.id] = pairGrowth - nextFirstGrowth;
-      latest = next;
-      setPanelGrowth(next);
-    };
-    const stop = () => {
-      document.body.classList.remove("resizing-rows");
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", stop);
-      try {
-        localStorage.setItem(PANEL_SIZES_KEY, JSON.stringify(latest));
-      } catch {}
-    };
-    document.body.classList.add("resizing-rows");
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", stop);
-  };
-
-  const closePanel = () => {
-    setScreenOpen(false);
-    try {
-      localStorage.setItem(SCREEN_PANEL_KEY, "closed");
-    } catch {}
-  };
   const screenCaption = (() => {
     if (!screenBot) {
       return "No agent selected";
@@ -1406,10 +1143,10 @@ export default function App() {
   }, [screenExpanded]);
 
   useEffect(() => {
-    if (!screenOpen && screenExpanded) {
+    if ((panelCollapsed.screen || !showScreen) && screenExpanded) {
       setScreenExpanded(false);
     }
-  }, [screenOpen, screenExpanded]);
+  }, [panelCollapsed.screen, showScreen, screenExpanded]);
 
   const activeThreadId = daemon.activeThreadId;
   const activity = useMemo(
@@ -1447,206 +1184,31 @@ export default function App() {
     : null;
   const settingsStreaming =
     settingsThread !== null &&
-    daemon.streaming?.threadId === settingsThread.id;
+    daemon.streamingByThread[settingsThread.id] !== undefined;
 
-  const leadBot = daemon.bots.find((item) => item.kind === "lead") ?? null;
-  const roles = daemon.bots.filter((item) => item.kind === "role");
-  const projects = daemon.bots.filter((item) => item.kind === "project");
-  const roleName = (roleId: string): string =>
-    daemon.bots.find((item) => item.id === roleId)?.name ?? "Unknown role";
   const pendingApprovalCount = daemon.approvals.filter(
     (approval) => !approval.decision,
   ).length;
 
-  // The thread list is a tree: the lead branches to project managers, and each
-  // manager branches to the workers it is running. Standalone tasks hang
-  // directly off the lead.
-  const drawerRowId = drawerThread?.row.id ?? null;
+  // The thread rail is a flat list of agents: each agent is its own thread.
   const threadRows: ThreadRow[] = (() => {
-    const rows: ThreadRow[] = [];
     const q = search.trim().toLowerCase();
     const matches = (...parts: Array<string | null | undefined>) =>
       !q || parts.some((part) => (part ?? "").toLowerCase().includes(q));
-    const isActive = (task: Task) =>
-      task.status === "queued" || task.status === "running";
-    const byActivity = (a: Task, b: Task) => {
-      const byActive = Number(isActive(b)) - Number(isActive(a));
-      if (byActive !== 0) {
-        return byActive;
-      }
-      return (b.createdAt ?? "").localeCompare(a.createdAt ?? "");
-    };
-    const botRow = (
-      bot: Bot,
-      depth: number,
-      working: boolean,
-      hasChildren: boolean,
-      expanded: boolean,
-    ): ThreadRow => ({
-      id: bot.id,
-      kind: "bot",
-      name: bot.name,
-      selected: drawerRowId
-        ? bot.id === drawerRowId
-        : bot.id === daemon.selectedBotId,
-      working,
-      title: bot.role ?? bot.name,
-      depth,
-      hasChildren,
-      expanded,
-    });
-    const taskRow = (task: Task, depth: number): ThreadRow => ({
-      ...threadRowForTask(task, depth),
-      selected: task.id === drawerRowId,
-    });
-
-    // The main agent is not a thread: it lives in the chat itself, so the
-    // list starts at the managers it has spun up.
-    const managers = projects
-      .map((manager) => {
-        const projectTasks = daemon.tasks.filter(
-          (task) => task.projectId === manager.id,
-        );
-        const workers = projectTasks.sort(byActivity).slice(0, 6);
-        const selfMatch = matches(manager.name, manager.role);
-        const visibleWorkers =
-          q && !selfMatch
-            ? workers.filter((task) =>
-                matches(taskThreadName(task), task.title, task.brief),
-              )
-            : workers;
-        return {
-          manager,
-          workers: visibleWorkers,
-          visible: selfMatch || visibleWorkers.length > 0,
-          working: projectTasks.some(isActive),
-          expanded: q.length > 0 || expandedThreads.has(manager.id),
-        };
-      })
-      .filter((group) => group.visible);
-
-    const looseTasks = daemon.tasks
-      .filter((task) => !task.projectId)
-      .sort(byActivity)
-      .filter((task) =>
-        matches(taskThreadName(task), task.title, task.brief),
-      )
-      .slice(0, 8);
-
-    managers.forEach((group) => {
-      rows.push(
-        botRow(
-          group.manager,
-          0,
-          group.working,
-          group.workers.length > 0,
-          group.expanded,
-        ),
-      );
-      if (group.expanded) {
-        group.workers.forEach((task) => {
-          rows.push(taskRow(task, 1));
-        });
-      }
-    });
-
-    looseTasks.forEach((task) => {
-      rows.push(taskRow(task, 0));
-    });
-
-    return rows;
+    return daemon.bots
+      .filter((bot) => matches(bot.name, bot.role))
+      .map((bot) => ({
+        id: bot.id,
+        name: bot.name,
+        selected: bot.id === daemon.selectedBotId,
+        working: daemon.streamingByThread[threadByBot.get(bot.id)?.id ?? ""] !== undefined,
+        title: bot.role ?? bot.name,
+      }));
   })();
 
-  const toggleThread = (row: ThreadRow) => {
-    setExpandedThreads((current) => {
-      const next = new Set(current);
-      if (next.has(row.id)) {
-        next.delete(row.id);
-      } else {
-        next.add(row.id);
-      }
-      return next;
-    });
-  };
-
-  // Threads open in a drawer over the chat instead of taking it over, so the
-  // conversation behind it is never swapped out.
   const openThread = (row: ThreadRow) => {
-    const threadId =
-      row.kind === "task"
-        ? (daemon.tasks.find((task) => task.id === row.id)?.threadId ?? null)
-        : (daemon.threads.find((item) => item.botId === row.id)?.id ?? null);
-    if (!threadId) {
-      return;
-    }
-    setDrawerClosing(false);
-    setDrawerThread({ threadId, row });
-    daemon.openThreadPreview(threadId);
+    daemon.selectBot(row.id);
   };
-
-  // Closing plays the slide-out first; the drawer unmounts when it finishes.
-  const closeThread = () => {
-    setDrawerClosing(true);
-  };
-
-  const finishCloseThread = () => {
-    setDrawerThread(null);
-    setDrawerClosing(false);
-    daemon.closeThreadPreview();
-  };
-
-  useEffect(() => {
-    if (!drawerThread) {
-      return;
-    }
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        setDrawerClosing(true);
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [drawerThread]);
-
-  // Everything the drawer shows comes from the previewed thread, except when
-  // the drawer is showing the thread the chat is already on.
-  const drawerThreadId = drawerThread?.threadId ?? null;
-  const drawerRow = drawerThread?.row ?? null;
-  const drawerIsActive =
-    drawerThreadId !== null && drawerThreadId === daemon.activeThreadId;
-  const drawerMessages = drawerIsActive
-    ? daemon.messages
-    : daemon.previewMessages;
-  const drawerStreaming = drawerIsActive ? streaming : daemon.previewStreaming;
-  const drawerActivity = drawerThreadId
-    ? daemon.toolActivity.filter((item) => item.threadId === drawerThreadId)
-    : [];
-  const drawerApprovals = drawerThreadId
-    ? daemon.approvals.filter((item) => item.threadId === drawerThreadId)
-    : [];
-  const drawerChallenges = drawerThreadId
-    ? daemon.challenges.filter((item) => item.threadId === drawerThreadId)
-    : [];
-  const drawerTask =
-    drawerRow?.kind === "task"
-      ? (daemon.tasks.find((task) => task.id === drawerRow.id) ?? null)
-      : null;
-
-  useEffect(() => {
-    if (!drawerThread) {
-      return;
-    }
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        setDrawerThread(null);
-        daemon.closeThreadPreview();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [drawerThread, daemon]);
 
   useEffect(() => {
     setScreenImageUrl(null);
@@ -1655,6 +1217,7 @@ export default function App() {
     setScreenError(null);
     setScreenStatus("loading");
     setVncState("idle");
+    setPanelComputer(null);
   }, [screenBot?.id]);
 
   useEffect(() => {
@@ -1667,8 +1230,8 @@ export default function App() {
 
   useEffect(() => {
     if (
-      !screenOpen ||
       panelCollapsed.screen ||
+      !showScreen ||
       !screenPlaying ||
       !windowActive ||
       !screenBot ||
@@ -1747,19 +1310,20 @@ export default function App() {
         clearTimeout(timer);
       }
     };
-  }, [screenOpen, panelCollapsed.screen, screenPlaying, windowActive, screenBot, vncLive]);
+  }, [
+    panelCollapsed.screen,
+    showScreen,
+    screenPlaying,
+    windowActive,
+    screenBot,
+    vncLive,
+  ]);
 
   const scrollSignal = [
     daemon.messages.length,
     activity.length,
     approvals.length,
     streaming?.text.length ?? 0,
-  ].join(":");
-  const drawerScrollSignal = [
-    drawerMessages.length,
-    drawerActivity.length,
-    drawerApprovals.length,
-    drawerStreaming?.text.length ?? 0,
   ].join(":");
   const submit = () => {
     const text = draft.trim();
@@ -1769,19 +1333,6 @@ export default function App() {
     daemon.sendMessage(
       text,
       streaming ? daemon.chatBusyBehavior : undefined,
-    );
-    setDraft("");
-  };
-  const submitToDrawer = () => {
-    const text = draft.trim();
-    if (!text || !drawerThreadId || drawerRow?.kind !== "bot") {
-      return;
-    }
-    daemon.sendMessageToThread(
-      drawerThreadId,
-      drawerRow.id,
-      text,
-      drawerStreaming ? daemon.chatBusyBehavior : undefined,
     );
     setDraft("");
   };
@@ -1855,24 +1406,33 @@ export default function App() {
 
   return (
     <div className="shell">
-      <aside className="thread-rail">
-        <ThreadList
-          rows={threadRows}
-          query={search}
-          searchOpen={searchOpen}
-          onSearchChange={setSearch}
-          onToggleSearch={() =>
-            setSearchOpen((value) => {
-              if (value) {
-                setSearch("");
-              }
-              return !value;
-            })
-          }
-          onSelect={openThread}
-          onToggle={toggleThread}
-        />
-      </aside>
+      <div className="rail-column">
+        <aside className="thread-rail">
+          <ThreadList
+            rows={threadRows}
+            query={search}
+            searchOpen={searchOpen}
+            onSearchChange={setSearch}
+            onToggleSearch={() =>
+              setSearchOpen((value) => {
+                if (value) {
+                  setSearch("");
+                }
+                return !value;
+              })
+            }
+            onSelect={openThread}
+          />
+        </aside>
+        <button
+          className="shell-settings"
+          title="Settings"
+          aria-label="Settings"
+          onClick={() => setSettingsOpen(true)}
+        >
+          <GearIcon />
+        </button>
+      </div>
 
       <main className="chat">
         <header className="agent-badge">
@@ -1880,12 +1440,10 @@ export default function App() {
             className="agent-badge-avatar"
             style={{
               background:
-                leadBot?.color ?? avatarColor(leadBot?.id ?? "assistant"),
+                bot?.color ?? avatarColor(bot?.id ?? "assistant"),
             }}
           />
-          <span className="agent-badge-name">
-            {leadBot?.name ?? "Assistant"}
-          </span>
+          <span className="agent-badge-name">{botName}</span>
         </header>
 
         <ThreadChat
@@ -1902,7 +1460,7 @@ export default function App() {
           onOpenScreen={openScreenTab}
           onOpenApprovals={() => setApprovalsOpen(true)}
           onOpenMemory={() => setMemoryOpen(true)}
-          screenOpen={screenOpen}
+          onDelete={() => setDeleteOpen(true)}
           messages={daemon.messages}
           streaming={streaming}
           activity={activity}
@@ -1911,230 +1469,129 @@ export default function App() {
           onCancel={daemon.cancel}
           queuedMessageIds={daemon.queuedMessageIds}
         />
-
-        {drawerRow && (
-          <div className="drawer-layer">
-            <section
-              className={`thread-drawer${
-                drawerClosing ? " thread-drawer-closing" : ""
-              }`}
-              role="dialog"
-              aria-label={`${drawerRow.name} thread`}
-              onAnimationEnd={(event) => {
-                if (drawerClosing && event.target === event.currentTarget) {
-                  finishCloseThread();
-                }
-              }}
-            >
-              {drawerTask ? (
-                <TaskView
-                  task={drawerTask}
-                  roleNameFor={roleName}
-                  childTasks={daemon.tasks.filter(
-                    (task) => task.parentId === drawerTask.id,
-                  )}
-                  messages={drawerMessages}
-                  approvals={drawerApprovals}
-                  activity={drawerActivity}
-                  streaming={drawerStreaming}
-                  computerState={daemon.sandboxStates[drawerTask.id] ?? null}
-                  onCancel={daemon.cancelTask}
-                  onBack={closeThread}
-                  onWatch={setWatchTaskId}
-                  onSelectTask={(taskId) => {
-                    const task = daemon.tasks.find((item) => item.id === taskId);
-                    if (task) {
-                      openThread(threadRowForTask(task, 2));
-                    }
-                  }}
-                  onRespondApproval={daemon.respondToApproval}
-                />
-              ) : (
-                <>
-                  <div className="drawer-bar">
-                    <span className="drawer-grip" aria-hidden="true" />
-                    <span className="drawer-title">{drawerRow.name}</span>
-                    <button
-                      className="icon-button"
-                      title="Close thread"
-                      aria-label="Close thread"
-                      onClick={closeThread}
-                    >
-                      <CloseIcon />
-                    </button>
-                  </div>
-                  <ThreadChat
-                    daemon={daemon}
-                    bot={drawerBot}
-                    botName={drawerRow.name}
-                    draft={draft}
-                    onDraftChange={setDraft}
-                    onSubmit={submitToDrawer}
-                    scrollSignal={drawerScrollSignal}
-                    hasUsableProvider={hasUsableProvider}
-                    hasProviderNeedingKey={hasProviderNeedingKey}
-                    onOpenSettings={() => setSettingsOpen(true)}
-                    onOpenScreen={openScreenTab}
-                    onOpenApprovals={() => setApprovalsOpen(true)}
-                    onOpenMemory={() => setMemoryOpen(true)}
-                    screenOpen={screenOpen}
-                    messages={drawerMessages}
-                    streaming={drawerStreaming}
-                    activity={drawerActivity}
-                    approvals={drawerApprovals}
-                    challenges={drawerChallenges}
-                    onCancel={() => {
-                      if (drawerThreadId) {
-                        daemon.cancelThread(drawerThreadId);
-                      }
-                    }}
-                    queuedMessageIds={daemon.queuedMessageIds}
-                  />
-                </>
-              )}
-            </section>
-          </div>
-        )}
       </main>
 
-      <PanelResizer active={screenOpen} />
-      {screenOpen && (
-        <aside
-          className={`screen-panel ${
-            screenExpanded ? "screen-panel-expanded" : ""
-          }`}
-        >
-          {screenExpanded ? (
+      <aside
+        className={`panel-column${
+          screenExpanded ? " panel-column-expanded" : ""
+        }${anySectionOpen ? "" : " panel-column-empty"}`}
+      >
+        <header className="panel-column-bar" data-tauri-drag-region>
+          {availableComputers.length > 1 ? (
+            <div className="computer-tabs" role="tablist">
+              {availableComputers.map((computer) => (
+                <button
+                  key={computer}
+                  role="tab"
+                  aria-selected={computer === activeComputer}
+                  className={`computer-tab ${
+                    computer === activeComputer ? "computer-tab-active" : ""
+                  }`}
+                  onClick={() => setPanelComputer(computer)}
+                >
+                  {computer === "firecracker" ? "VM" : "Local"}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <span className="panel-column-title">
+              {activeComputer === "firecracker" ? "VM" : "Local"}
+            </span>
+          )}
+          <div className="panel-column-actions">
+            {visibleSections.map((section) => {
+              const open = !panelCollapsed[section.id];
+              return (
+                <button
+                  key={section.id}
+                  className="icon-button"
+                  title={section.label}
+                  aria-label={section.label}
+                  aria-pressed={open}
+                  onClick={() => togglePanelSection(section.id)}
+                >
+                  <PanelSectionIcon section={section.id} />
+                </button>
+              );
+            })}
+          </div>
+        </header>
+        {anySectionOpen &&
+          (screenExpanded ? (
             <section className="panel-section panel-section-screen">
               <div className="panel-section-body">{screenPane}</div>
             </section>
           ) : (
-            <div className="panel-stack" ref={panelStackRef}>
-              {PANEL_SECTIONS.map((section, index) => {
-                const collapsed = panelCollapsed[section.id];
-                const previous = PANEL_SECTIONS[index - 1];
-                const showResizer =
-                  index > 0 &&
-                  previous !== undefined &&
-                  !collapsed &&
-                  !panelCollapsed[previous.id];
-                return (
-                  <Fragment key={section.id}>
-                    {showResizer && (
-                      <div
-                        className="panel-section-resizer"
-                        role="separator"
-                        aria-orientation="horizontal"
-                        title="Drag to resize"
-                        onMouseDown={(event) => {
-                          event.preventDefault();
-                          beginSectionResize(index - 1, event.clientY);
-                        }}
-                      />
-                    )}
-                    <section
-                      className={`panel-section panel-section-${section.id}${
-                        collapsed ? " panel-section-collapsed" : ""
-                      }`}
-                      style={
-                        collapsed
-                          ? undefined
-                          : { flexGrow: panelGrowth[section.id] }
-                      }
-                    >
-                      <header className="panel-section-header">
-                        <button
-                          className="panel-section-toggle"
-                          aria-expanded={!collapsed}
-                          onClick={() => togglePanelSection(section.id)}
-                        >
-                          <span
-                            className={`panel-section-chevron${
-                              collapsed
-                                ? " panel-section-chevron-collapsed"
-                                : ""
-                            }`}
+            <div className="panel-stack">
+              {visibleSections
+                .filter((section) => !panelCollapsed[section.id])
+                .map((section) => (
+                  <section
+                    key={section.id}
+                    className={`panel-section panel-section-${section.id}`}
+                  >
+                    <header className="panel-section-header">
+                      <span className="panel-section-label">
+                        {section.label}
+                      </span>
+                      <span className="panel-section-actions">
+                        {section.id === "screen" && hasVm(screenBot) && (
+                          <button
+                            className="icon-button"
+                            title={
+                              screenPlaying
+                                ? "Pause live view"
+                                : "Resume live view"
+                            }
+                            aria-label={
+                              screenPlaying
+                                ? "Pause live view"
+                                : "Resume live view"
+                            }
+                            onClick={() =>
+                              setScreenPlaying((value) => !value)
+                            }
                           >
-                            <SectionChevronIcon />
-                          </span>
-                          <PanelSectionIcon section={section.id} />
-                          <span className="panel-section-label">
-                            {section.label}
-                          </span>
-                        </button>
-                        <span className="panel-section-actions">
-                          {section.id === "screen" && (
-                            <span className="screen-caption">
-                              <span className="screen-caption-status">
-                                {screenCaption}
-                              </span>
-                              {hasVm(screenBot) && (
-                                <button
-                                  className="icon-button"
-                                  title={
-                                    screenPlaying
-                                      ? "Pause live view"
-                                      : "Resume live view"
-                                  }
-                                  aria-label={
-                                    screenPlaying
-                                      ? "Pause live view"
-                                      : "Resume live view"
-                                  }
-                                  onClick={() =>
-                                    setScreenPlaying((value) => !value)
-                                  }
-                                >
-                                  {screenPlaying ? <PauseIcon /> : <PlayIcon />}
-                                </button>
-                              )}
+                            {screenPlaying ? <PauseIcon /> : <PlayIcon />}
+                          </button>
+                        )}
+                        {section.id === "screen" && (
+                          <span className="screen-caption">
+                            <span className="screen-caption-status">
+                              {screenCaption}
                             </span>
-                          )}
-                          {section.id === "screen" && (
-                            <button
-                              className="icon-button panel-collapse"
-                              title="Collapse panel"
-                              aria-label="Collapse panel"
-                              onClick={closePanel}
-                            >
-                              <PanelCollapseIcon />
-                            </button>
-                          )}
-                        </span>
-                      </header>
-                      <div className="panel-section-body" hidden={collapsed}>
-                        {section.id === "screen" && screenPane}
-                        {section.id === "files" && screenBot && (
-                          <FilesPanel
-                            botId={screenBot.id}
-                            computers={screenBotComputers}
-                            computer={filesTarget}
-                            {...(filesRootLabel
-                              ? { rootLabel: filesRootLabel }
-                              : {})}
-                            onComputerChange={setFilesComputer}
-                            active={!collapsed}
-                            listFiles={daemon.listFiles}
-                            readFile={daemon.readFile}
-                          />
+                          </span>
                         )}
-                        {section.id === "terminal" && screenBot && (
-                          <TerminalPanel
-                            botId={screenBot.id}
-                            canConnect={canStream}
-                            url={terminalUrl}
-                            active={!collapsed}
-                          />
-                        )}
-                      </div>
-                    </section>
-                  </Fragment>
-                );
-              })}
+                      </span>
+                    </header>
+                    <div className="panel-section-body">
+                      {section.id === "screen" && screenPane}
+                      {section.id === "files" && screenBot && (
+                        <FilesPanel
+                          botId={screenBot.id}
+                          computer={filesTarget}
+                          {...(filesRootLabel
+                            ? { rootLabel: filesRootLabel }
+                            : {})}
+                          active
+                          listFiles={daemon.listFiles}
+                          readFile={daemon.readFile}
+                        />
+                      )}
+                      {section.id === "terminal" && screenBot && (
+                        <TerminalPanel
+                          botId={screenBot.id}
+                          canConnect={canConnectTerminal}
+                          url={terminalUrl}
+                          active
+                        />
+                      )}
+                    </div>
+                  </section>
+                ))}
             </div>
-          )}
-        </aside>
-      )}
+          ))}
+      </aside>
 
       <ApprovalsModal
         open={approvalsOpen}
@@ -2164,18 +1621,6 @@ export default function App() {
         onLoadSoul={() => daemon.loadSoul()}
         onRevertSoul={daemon.revertSoul}
       />
-
-      {watchTaskId &&
-        (() => {
-          const watchTask =
-            daemon.tasks.find((task) => task.id === watchTaskId) ?? null;
-          return watchTask ? (
-            <TaskWatchOverlay
-              task={watchTask}
-              onClose={() => setWatchTaskId(null)}
-            />
-          ) : null;
-        })()}
 
       {daemon.error && (
         <div className="toast" role="alert">
@@ -2235,6 +1680,24 @@ export default function App() {
         }}
       />
 
+      <ConfirmDialog
+        open={deleteOpen && bot !== null}
+        title={bot ? `Delete ${bot.name}?` : "Delete agent?"}
+        description={
+          bot
+            ? `This permanently removes ${bot.name}, its history, and everything on its computer.`
+            : ""
+        }
+        confirmLabel="Delete agent"
+        onConfirm={() => {
+          if (bot) {
+            daemon.deleteBot(bot.id);
+          }
+          setDeleteOpen(false);
+        }}
+        onClose={() => setDeleteOpen(false)}
+      />
+
       <Settings
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
@@ -2255,10 +1718,6 @@ export default function App() {
         onUpdateSettings={daemon.updateSettings}
         onFetchModels={daemon.fetchModels}
         onTestDecision={daemon.testDecision}
-        roles={roles}
-        sandboxStates={daemon.sandboxStates}
-        onHireRole={() => setCreateOpen(true)}
-        onEditRole={(botId) => setSettingsBotId(botId)}
         bots={daemon.bots}
         workspaces={daemon.workspaces}
         workspaceRoots={daemon.workspaceRoots}
@@ -2622,7 +2081,7 @@ function WorkGroup({
   startedAt?: number;
   running: boolean;
   approvals?: PendingApproval[];
-  onRespondApproval?: (requestId: string, decision: "approve" | "deny") => void;
+  onRespondApproval?: (requestId: string, decision: "approve" | "deny", remember?: boolean) => void;
 }) {
   const pending = (approvals ?? []).filter((approval) => !approval.decision);
   // Collapsed by default, live or finished; the user opens it, or an
@@ -2960,7 +2419,7 @@ function ApprovalCard({
   onRespond,
 }: {
   approval: PendingApproval;
-  onRespond: (requestId: string, decision: "approve" | "deny") => void;
+  onRespond: (requestId: string, decision: "approve" | "deny", remember?: boolean) => void;
 }) {
   const detail = toolDetail(approval.arguments);
 
@@ -2990,6 +2449,13 @@ function ApprovalCard({
           onClick={() => onRespond(approval.requestId, "approve")}
         >
           Approve
+        </button>
+        <button
+          className="remember-button"
+          title={`Approve and stop asking for ${approval.name} (adds a policy rule; deny rules still win)`}
+          onClick={() => onRespond(approval.requestId, "approve", true)}
+        >
+          Always allow
         </button>
         <button
           className="deny-button"
@@ -3081,10 +2547,10 @@ function StreamingRow({ streaming }: { streaming: StreamingState }) {
   );
 }
 
-// A live turn. Conversation (Jev said "chat", or no work signal yet) stays a
-// plain loading bubble — three dots, then the streamed answer — so no
-// work-shaped chrome flashes before a reply. Real work shows the collapsed
-// working group with the streamed answer below it.
+// A live turn. A turn with no work signal yet stays a plain loading bubble —
+// three dots, then the streamed answer — so no work-shaped chrome flashes
+// before a reply. Real work shows the collapsed working group with the
+// streamed answer below it.
 function LiveAssistant({
   streaming,
   activity,
@@ -3095,7 +2561,7 @@ function LiveAssistant({
   streaming: StreamingState;
   activity: ToolActivity[];
   approvals: PendingApproval[];
-  onRespondApproval: (requestId: string, decision: "approve" | "deny") => void;
+  onRespondApproval: (requestId: string, decision: "approve" | "deny", remember?: boolean) => void;
   children?: ReactNode;
 }) {
   if (streaming.mode !== "work") {
@@ -3134,263 +2600,6 @@ function LiveAssistant({
   );
 }
 
-function budgetLabel(budget: Task["budget"]): string {
-  if (!budget) {
-    return "unlimited";
-  }
-  const parts: string[] = [];
-  if (budget.wallClockMs != null) {
-    parts.push(`${Math.round(budget.wallClockMs / 1000)}s`);
-  }
-  if (budget.toolCalls != null) {
-    parts.push(`${budget.toolCalls} calls`);
-  }
-  if (budget.tokens != null) {
-    parts.push(`${budget.tokens} tokens`);
-  }
-  return parts.join(", ") || "unlimited";
-}
-
-function usageLabel(usage: Task["usage"]): string {
-  if (!usage) {
-    return "—";
-  }
-  const seconds = Math.round(usage.wallClockMs / 1000);
-  const tokens = usage.inputTokens + usage.outputTokens;
-  return `${usage.toolCalls} calls, ${tokens} tokens, ${seconds}s`;
-}
-
-function TaskWatchOverlay({
-  task,
-  onClose,
-}: {
-  task: Task;
-  onClose: () => void;
-}) {
-  const [vncState, setVncState] = useState<VncState>("idle");
-  const vncUrl = `${DAEMON_HTTP_URL.replace(/^http/, "ws")}/tasks/${encodeURIComponent(task.id)}/vnc`;
-
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        event.stopPropagation();
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown, true);
-    return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [onClose]);
-
-  return (
-    <div className="watch-overlay" role="dialog" aria-label="Watch task">
-      <div className="watch-frame">
-        <div className="watch-bar">
-          <span className="task-dot task-dot-running" />
-          <span className="watch-title">{task.title}</span>
-          <span className="watch-status">
-            {vncState === "live"
-              ? "Live desktop"
-              : vncState === "connecting"
-                ? "Connecting…"
-                : vncState === "down"
-                  ? "Desktop stream unavailable"
-                  : "Starting…"}
-          </span>
-          <button className="ghost-button" onClick={onClose}>
-            Close
-          </button>
-        </div>
-        <div className="watch-view">
-          <VncView
-            url={vncUrl}
-            active
-            interactive
-            onState={setVncState}
-          />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function TaskView({
-  task,
-  roleNameFor,
-  childTasks,
-  messages,
-  approvals,
-  activity,
-  streaming,
-  computerState,
-  onCancel,
-  onBack,
-  onWatch,
-  onSelectTask,
-  onRespondApproval,
-}: {
-  task: Task;
-  roleNameFor: (roleId: string) => string;
-  childTasks: Task[];
-  messages: Message[];
-  approvals: PendingApproval[];
-  activity: ToolActivity[];
-  streaming: StreamingState | null;
-  computerState: SandboxState | null;
-  onCancel: (taskId: string) => void;
-  onBack: () => void;
-  onWatch: (taskId: string) => void;
-  onSelectTask: (taskId: string) => void;
-  onRespondApproval: (requestId: string, decision: "approve" | "deny") => void;
-}) {
-  const roleName = roleNameFor(task.roleId);
-  const running = task.status === "queued" || task.status === "running";
-  const canWatch =
-    running && (computerState === "running" || computerState === "booting");
-  const startedAt = task.startedAt
-    ? Date.parse(task.startedAt)
-    : Date.parse(task.createdAt);
-  const endedAt = task.endedAt ? Date.parse(task.endedAt) : Date.now();
-  const elapsed = formatElapsed(endedAt - startedAt);
-
-  return (
-    <>
-      <header className="chat-header" data-tauri-drag-region>
-        <div className="chat-title">
-          <span className={`task-dot task-dot-${task.status}`} />
-          <span className="chat-title-name">{task.title}</span>
-          <span className="chat-title-role">
-            {roleName} · {TASK_STATUS_LABEL[task.status]} · {elapsed}
-          </span>
-        </div>
-        <div className="chat-actions">
-          {canWatch && (
-            <button
-              className="ghost-button"
-              onClick={() => onWatch(task.id)}
-              title="Watch this task's computer"
-            >
-              Watch
-            </button>
-          )}
-          <button className="ghost-button" onClick={onBack}>
-            Back to lead
-          </button>
-          {running && (
-            <button
-              className="deny-button"
-              onClick={() => onCancel(task.id)}
-              title="Stop this worker"
-            >
-              Cancel task
-            </button>
-          )}
-        </div>
-      </header>
-
-      <div className="transcript">
-        <div className="transcript-inner">
-          <section className="task-summary">
-            <h2>Brief</h2>
-            <p className="task-brief">{task.brief}</p>
-            {task.result && (
-              <>
-                <h2>Result</h2>
-                <Markdown text={task.result} />
-              </>
-            )}
-            {task.error && (
-              <div className="entry-body entry-error">{task.error}</div>
-            )}
-            {task.evidence && (
-              <details className="task-evidence">
-                <summary>Evidence ledger</summary>
-                <pre>{task.evidence}</pre>
-              </details>
-            )}
-          </section>
-
-          <section className="task-meta">
-            <div className="task-meta-item">
-              <span className="task-meta-label">Computer</span>
-              <span>{computerState ?? "—"}</span>
-            </div>
-            <div className="task-meta-item">
-              <span className="task-meta-label">Tools</span>
-              <span>{task.grant?.tools.join(", ") || "none"}</span>
-            </div>
-            <div className="task-meta-item">
-              <span className="task-meta-label">Display</span>
-              <span>{task.grant?.display ?? "none"}</span>
-            </div>
-            <div className="task-meta-item">
-              <span className="task-meta-label">Budget</span>
-              <span>{budgetLabel(task.budget)}</span>
-            </div>
-            <div className="task-meta-item">
-              <span className="task-meta-label">Used</span>
-              <span>{usageLabel(task.usage)}</span>
-            </div>
-          </section>
-
-          {childTasks.length > 0 && (
-            <section className="task-children">
-              <h2>Workers</h2>
-              {childTasks.map((child) => (
-                <button
-                  key={child.id}
-                  className="task-child-row"
-                  onClick={() => onSelectTask(child.id)}
-                >
-                  <span className={`task-dot task-dot-${child.status}`} />
-                  <span className="task-child-title">{child.title}</span>
-                  <span className="task-child-meta">
-                    {roleNameFor(child.roleId)} ·{" "}
-                    {TASK_STATUS_LABEL[child.status]}
-                  </span>
-                </button>
-              ))}
-            </section>
-          )}
-
-          {approvals.map((approval) => (
-            <ApprovalCard
-              key={approval.requestId}
-              approval={approval}
-              onRespond={onRespondApproval}
-            />
-          ))}
-
-          {messages.length === 0 && !streaming && running && (
-            <p className="sidebar-empty">Waiting for the worker to start…</p>
-          )}
-
-          {groupTranscript(messages, streaming !== null).map((entry) =>
-            entry.kind === "turn" ? (
-              <TurnBubble key={entry.final.id} entry={entry} />
-            ) : (
-              <MessageBubble
-                key={entry.message.id}
-                message={entry.message}
-                live={entry.live}
-              />
-            ),
-          )}
-
-          {streaming && (
-            <LiveAssistant
-              streaming={streaming}
-              activity={activity}
-              approvals={approvals}
-              onRespondApproval={onRespondApproval}
-            />
-          )}
-        </div>
-      </div>
-    </>
-  );
-}
-
 function CreateAgentModal({
   open,
   onClose,
@@ -3411,7 +2620,7 @@ function CreateAgentModal({
   const [color, setColor] = useState(AVATAR_COLORS[0]!);
   const [modelValue, setModelValue] = useState("");
   const [effort, setEffort] = useState<ReasoningEffort | "">("");
-  const [computers, setComputers] = useState<ComputerKind[]>(["firecracker"]);
+  const [computer, setComputer] = useState<ComputerKind[]>(["firecracker"]);
   const [workspaceId, setWorkspaceId] = useState("");
   const [access, setAccess] = useState<AccessMode>("project");
   const [creating, setCreating] = useState(false);
@@ -3425,7 +2634,7 @@ function CreateAgentModal({
     setName("");
     setRole("");
     setColor(AVATAR_COLORS[0]!);
-    setComputers(["firecracker"]);
+    setComputer(["firecracker"]);
     setWorkspaceId("");
     setAccess("project");
     setCreating(false);
@@ -3475,7 +2684,7 @@ function CreateAgentModal({
         ...(provider && model
           ? { model: { provider, model, ...(effort ? { effort } : {}) } }
           : {}),
-        computers,
+        computers: computer,
         ...(workspaceId ? { workspaceId } : {}),
         access,
       });
@@ -3490,14 +2699,14 @@ function CreateAgentModal({
     <div
       className="modal-overlay"
       role="dialog"
-      aria-label="New role"
+      aria-label="New agent"
       onClick={onClose}
     >
       <div className="modal" onClick={(event) => event.stopPropagation()}>
         <header className="modal-head">
           <div className="modal-head-title">
             <span className="avatar avatar-lg" style={{ background: color }} />
-            <h2>Hire a role</h2>
+            <h2>New agent</h2>
           </div>
           <button
             className="icon-button"
@@ -3594,8 +2803,8 @@ function CreateAgentModal({
 
           <div className="field">
             <span>Computer</span>
-            <ComputerChoices value={computers} onChange={setComputers} />
-            {!computers.includes("firecracker") && (
+            <ComputerChoices value={computer} onChange={setComputer} />
+            {!computer.includes("firecracker") && (
               <p className="computer-warning">
                 Runs commands directly on this Mac. Local tools always require
                 your approval.
@@ -3631,7 +2840,7 @@ function CreateAgentModal({
             )}
           </label>
 
-          {computers.includes("mac") && (
+          {computer.includes("mac") && (
             <label className="field">
               <span>This Mac access</span>
               <select

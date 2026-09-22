@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { homedir } from "node:os";
 import {
   createReadStream,
   existsSync,
@@ -20,16 +21,19 @@ import {
 } from "@openbot/gateway";
 import {
   ClientMessageSchema,
+  botHasComputer,
+  primaryComputer,
   type Bot,
   type ChatBusyBehavior,
   type CompactionSettings,
+  type ComputerKind,
   type HarnessSettings,
   type Memory,
   type Message,
   type ModelRef,
+  type PolicyRule,
   type PolicySettings,
   type ServerMessage,
-  type Task,
   type Thread,
 } from "@openbot/protocol";
 import type { SandboxBackend } from "@openbot/sandbox";
@@ -57,11 +61,11 @@ import {
 } from "./harness";
 import {
   listComputerFiles,
+  macRoot,
   readComputerFile,
   type FileServiceOptions,
 } from "./files";
 import { MemoryService } from "./memory";
-import { Orchestrator } from "./orchestrator";
 import {
   normalizePolicy,
   parsePolicy,
@@ -123,7 +127,7 @@ export interface DaemonOptions {
   challenges: ChallengeBroker;
   presets: ProviderPreset[];
   workspaces: WorkspaceService;
-  /** Collected once at startup; system_info and the lead's [self] note use it. */
+  /** Collected once at startup; system_info and the agent's [self] note use it. */
   self: SelfInfo;
 }
 
@@ -221,6 +225,44 @@ export function createDaemon(options: DaemonOptions): Daemon {
 
   const readPolicySettings = (): PolicySettings =>
     parsePolicy(options.store.getSetting(POLICY_SETTING_KEY));
+
+  /**
+   * Remember an approved tool as an auto rule so it stops asking. Deny rules
+   * and more specific rules still win, since the strictest matched rule
+   * decides (ADR-018).
+   */
+  const rememberApprovedTool = (requestId: string): boolean => {
+    const record = options.store
+      .listPendingApprovals()
+      .find((approval) => approval.requestId === requestId);
+    if (!record) {
+      return false;
+    }
+    const policy = readPolicySettings();
+    const existing = policy.rules.some(
+      (rule) =>
+        rule.tool === record.tool &&
+        rule.match === "any" &&
+        rule.tier === "auto",
+    );
+    if (existing) {
+      return true;
+    }
+    const rule: PolicyRule = {
+      id: `remember-${record.tool}-${Math.random().toString(36).slice(2, 8)}`,
+      tool: record.tool,
+      scope: "*",
+      match: "any",
+      pattern: "",
+      tier: "auto",
+      note: "remembered after you approved it",
+    };
+    options.store.setSetting(
+      POLICY_SETTING_KEY,
+      serializePolicy({ ...policy, rules: [...policy.rules, rule] }),
+    );
+    return true;
+  };
 
   const readCompactionSettings = (): CompactionSettings => {
     const stored = options.store.getSetting(COMPACTION_SETTING_KEY);
@@ -342,88 +384,6 @@ export function createDaemon(options: DaemonOptions): Daemon {
 
   deps.requireApproval = readRequireApproval();
 
-  const leadBot = (): Bot | null =>
-    options.store.listBots().find((bot) => bot.kind === "lead") ?? null;
-
-  let leadRunActive = false;
-  const leadQueue: Array<{ text: string; contextNote: string }> = [];
-
-  const truncateNote = (value: string, max: number): string =>
-    value.length <= max ? value : `${value.slice(0, max)}\n[truncated]`;
-
-  const buildTaskNote = (task: Task): string => {
-    const store = options.store;
-    const roleName = store.getBot(task.roleId)?.name ?? "a teammate";
-    const lines = [
-      `[team task ${task.status}] "${task.title}" — ${roleName}`,
-      `Task id: ${task.id}`,
-    ];
-    if (task.error) {
-      lines.push(`Error: ${task.error}`);
-    }
-    if (task.result) {
-      lines.push(`Result:\n${truncateNote(task.result, 4000)}`);
-    }
-    if (task.evidence) {
-      lines.push(`Evidence ledger:\n${truncateNote(task.evidence, 4000)}`);
-    }
-    const active = store
-      .listTasks(50)
-      .filter(
-        (candidate) =>
-          candidate.id !== task.id &&
-          (candidate.status === "queued" || candidate.status === "running"),
-      );
-    if (active.length > 0) {
-      lines.push(
-        `Still running:\n${active
-          .map(
-            (candidate) =>
-              `- "${candidate.title}" (${store.getBot(candidate.roleId)?.name ?? "unknown role"})`,
-          )
-          .join("\n")}`,
-      );
-    }
-    return lines.join("\n\n");
-  };
-
-  const scheduleLeadTurn = (task: Task): void => {
-    reflector?.schedule();
-    if (!leadBot()) {
-      return;
-    }
-    leadQueue.push({
-      text:
-        "A team task just finished. Review the workboard context and report " +
-        "the outcome to the user in one concise message. If nothing needs the " +
-        "user's attention, say so briefly.",
-      contextNote: buildTaskNote(task),
-    });
-    drainLeadQueue();
-  };
-
-  const drainLeadQueue = (): void => {
-    if (leadRunActive) {
-      return;
-    }
-    const lead = leadBot();
-    if (!lead) {
-      leadQueue.length = 0;
-      return;
-    }
-    const next = leadQueue.shift();
-    if (!next) {
-      return;
-    }
-    startRun({
-      botId: lead.id,
-      threadId: options.store.getOrCreateThread(lead.id).id,
-      text: next.text,
-      contextNote: next.contextNote,
-      internal: true,
-    });
-  };
-
   const activeRunForThread = (threadId: string): RunHandle | null => {
     for (const run of runs.values()) {
       if (run.threadId === threadId) {
@@ -518,7 +478,6 @@ export function createDaemon(options: DaemonOptions): Daemon {
     model?: ModelRef;
     messageId?: string;
     skipUserMessage?: boolean;
-    internal?: boolean;
     contextNote?: string;
   }): void => {
     const runId = randomUUID();
@@ -532,15 +491,11 @@ export function createDaemon(options: DaemonOptions): Daemon {
       steering: [],
     };
     runs.set(runId, handle);
-    const isLead = input.botId === leadBot()?.id;
-    if (isLead) {
-      leadRunActive = true;
-    }
 
     const harness = readHarnessSettings();
-    const useCodex = !input.internal && harness.default === "codex";
+    const useCodex = harness.default === "codex";
     const run = useCodex ? runCodexTurn : runAgent;
-    handle.steerable = !input.internal && !useCodex;
+    handle.steerable = !useCodex;
     const task = run(
       deps,
       {
@@ -551,7 +506,6 @@ export function createDaemon(options: DaemonOptions): Daemon {
         model: input.model,
         messageId: input.messageId,
         skipUserMessage: input.skipUserMessage,
-        internal: input.internal,
         contextNote: input.contextNote,
         steering: {
           hasPending: () => handle.steering.length > 0,
@@ -571,10 +525,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
       .finally(() => {
         runs.delete(runId);
         pending.delete(task);
-        if (isLead) {
-          leadRunActive = false;
-          reflector.schedule();
-        }
+        reflector.schedule();
         // A steer that arrived after the last step never made it into the
         // turn; answer it with a fresh run so it is not left hanging.
         if (!controller.signal.aborted && handle.steering.length > 0) {
@@ -593,27 +544,14 @@ export function createDaemon(options: DaemonOptions): Daemon {
           clearThreadNow(input.threadId);
         }
         drainThreadQueue(input.threadId);
-        if (isLead) {
-          drainLeadQueue();
-        }
         maybeRestart();
       });
     pending.add(task);
   };
 
-  const orchestrator = new Orchestrator({
-    deps,
-    emit: broadcast,
-    onTaskSettled: (task) => {
-      scheduleLeadTurn(task);
-      maybeRestart();
-    },
-  });
-  deps.orchestrator = orchestrator;
-
   // --- Self-restart (ADR-024) ---------------------------------------------
   // The agent can ask the daemon to restart so its own code changes take
-  // effect. The restart waits for the current turn and running tasks, then
+  // effect. The restart waits for the current turn and running work, then
   // exits; a watcher, the app, or a detached re-exec brings it back. A guard
   // file refuses a restart loop.
   const RESTART_GUARD_FILE = join(options.config.dataDir, "restart-guard.json");
@@ -675,12 +613,6 @@ export function createDaemon(options: DaemonOptions): Daemon {
     if (runs.size > 0 || pending.size > 0) {
       return;
     }
-    const busy = orchestrator
-      .status()
-      .some((task) => task.status === "running" || task.status === "queued");
-    if (busy) {
-      return;
-    }
     const mode = restartPending;
     restartPending = null;
     if (restartTimer) {
@@ -731,8 +663,8 @@ export function createDaemon(options: DaemonOptions): Daemon {
     return {
       ok: true,
       message:
-        "Restart scheduled. This turn finishes first and running tasks " +
-        "settle, then " +
+        "Restart scheduled. This turn finishes first and running work " +
+        "settles, then " +
         (mode === "watch"
           ? "the dev watcher restarts the daemon."
           : mode === "exit"
@@ -797,22 +729,14 @@ export function createDaemon(options: DaemonOptions): Daemon {
   let sandboxPruned = false;
   // A delete that races a daemon or host restart can leave a multi-GB rootfs
   // behind. Once the host answers, remove every computer this daemon owns that
-  // is no longer a bot or an active task.
+  // is no longer a bot.
   const pruneSandboxOrphans = async () => {
     const sandbox = options.sandbox;
     if (!sandbox) {
       return;
     }
     try {
-      const keep = [
-        ...options.store.listBots().map((bot) => bot.id),
-        ...options.store
-          .listTasks()
-          .filter(
-            (task) => task.status === "queued" || task.status === "running",
-          )
-          .map((task) => task.id),
-      ];
+      const keep = options.store.listBots().map((bot) => bot.id);
       const { removed } = await sandbox.prune(keep);
       if (removed.length) {
         console.log(
@@ -860,15 +784,9 @@ export function createDaemon(options: DaemonOptions): Daemon {
       return;
     }
     const botScreenMatch = /^\/bots\/([^/]+)\/screen$/.exec(url.pathname);
-    const taskScreenMatch = /^\/tasks\/([^/]+)\/screen$/.exec(url.pathname);
-    if (
-      request.method === "GET" &&
-      (botScreenMatch !== null || taskScreenMatch !== null)
-    ) {
+    if (request.method === "GET" && botScreenMatch !== null) {
       const cors = screenCorsHeaders(request.headers.origin);
-      const id = decodeURIComponent(
-        (botScreenMatch ?? taskScreenMatch)?.[1] ?? "",
-      );
+      const id = decodeURIComponent(botScreenMatch[1] ?? "");
       const sendError = (status: number, payload: Record<string, unknown>) => {
         const body = JSON.stringify(payload);
         response.writeHead(status, {
@@ -878,21 +796,16 @@ export function createDaemon(options: DaemonOptions): Daemon {
         });
         response.end(body);
       };
-      if (botScreenMatch) {
-        const bot = options.store.getBot(id);
-        if (!bot) {
-          sendError(404, { error: `unknown bot: ${id}` });
-          return;
-        }
-        if (bot.computer === "mac") {
-          sendError(409, {
-            error: "screen capture is only available for microVM computers",
-            code: "mac",
-          });
-          return;
-        }
-      } else if (!options.store.getTask(id)) {
-        sendError(404, { error: `unknown task: ${id}` });
+      const bot = options.store.getBot(id);
+      if (!bot) {
+        sendError(404, { error: `unknown bot: ${id}` });
+        return;
+      }
+      if (!botHasComputer(bot, "firecracker")) {
+        sendError(409, {
+          error: "screen capture is only available for microVM computers",
+          code: "mac",
+        });
         return;
       }
       try {
@@ -1050,6 +963,136 @@ export function createDaemon(options: DaemonOptions): Daemon {
   const proxyTerminal = (botId: string, client: WebSocket) =>
     proxySandboxStream(botId, "terminal", client);
 
+  /**
+   * A local terminal for a This Mac agent: an interactive shell in the agent's
+   * project folder (its Mac root), streamed over the same newline-delimited
+   * JSON frame protocol the sandbox terminal uses. `expect` gives the shell a
+   * real PTY (so the user's prompt, colors, and job control behave like
+   * Terminal); it is part of the macOS base install.
+   */
+  const proxyLocalTerminal = (botId: string, client: WebSocket) => {
+    const bot = options.store.getBot(botId);
+    if (!bot) {
+      client.close(1011, "unknown bot");
+      return;
+    }
+    const root = macRoot(fileOptions, bot);
+    const cwd = existsSync(root) ? root : homedir();
+    const shell = process.env.SHELL || "/bin/zsh";
+    let child: ReturnType<typeof spawn> | null = null;
+    let closed = false;
+    let started = false;
+    const pendingInput: Buffer[] = [];
+
+    const sendFrame = (frame: Record<string, unknown>) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(`${JSON.stringify(frame)}\n`);
+      }
+    };
+
+    const shutdown = (code?: number, reason?: string) => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      if (child && child.exitCode === null) {
+        if (child.pid !== undefined) {
+          try {
+            process.kill(-child.pid, "SIGTERM");
+          } catch {
+            // no process group
+          }
+        }
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // already gone
+        }
+      }
+      try {
+        client.close(code, reason);
+      } catch {
+        // already closed
+      }
+    };
+
+    const start = (cols: number, rows: number) => {
+      if (started) {
+        return;
+      }
+      started = true;
+      const safeCols =
+        Number.isFinite(cols) && cols > 0 ? Math.floor(cols) : 80;
+      const safeRows =
+        Number.isFinite(rows) && rows > 0 ? Math.floor(rows) : 24;
+      const expectScript =
+        `set stty_init "rows ${safeRows} cols ${safeCols}"; ` +
+        `spawn -noecho {${shell}} -l; interact`;
+      child = spawn("/usr/bin/expect", ["-c", expectScript], {
+        cwd,
+        env: { ...process.env, TERM: "xterm-256color" },
+        stdio: ["pipe", "pipe", "pipe"],
+        detached: true,
+      });
+
+      const relay = (chunk: Buffer) => {
+        sendFrame({ type: "data", data: chunk.toString("base64") });
+      };
+      child.stdout?.on("data", relay);
+      child.stderr?.on("data", relay);
+      child.once("error", (error) => {
+        relay(
+          Buffer.from(
+            `\r\n[terminal error: ${(error as Error).message}]\r\n`,
+            "utf8",
+          ),
+        );
+        sendFrame({ type: "exit" });
+        shutdown(1011, "terminal failed");
+      });
+      child.once("close", () => {
+        sendFrame({ type: "exit" });
+        shutdown(1000);
+      });
+
+      for (const chunk of pendingInput.splice(0)) {
+        child.stdin?.write(chunk);
+      }
+    };
+
+    client.on("message", (raw) => {
+      for (const line of raw.toString().split("\n")) {
+        if (!line.trim()) {
+          continue;
+        }
+        let frame: {
+          type?: string;
+          data?: string;
+          cols?: number;
+          rows?: number;
+        };
+        try {
+          frame = JSON.parse(line) as typeof frame;
+        } catch {
+          continue;
+        }
+        if (frame.type === "open") {
+          start(frame.cols ?? 80, frame.rows ?? 24);
+        } else if (frame.type === "input" && typeof frame.data === "string") {
+          const chunk = Buffer.from(frame.data, "base64");
+          if (started) {
+            child?.stdin?.write(chunk);
+          } else {
+            pendingInput.push(chunk);
+          }
+        }
+        // `resize` is a no-op: the PTY size is fixed when the shell spawns.
+      }
+    });
+    client.on("close", () => shutdown());
+    client.on("error", () => shutdown());
+  };
+
   httpServer.on("upgrade", (request, socket, head) => {
     const url = new URL(request.url ?? "/", "http://localhost");
     if (url.pathname === "/ws") {
@@ -1080,8 +1123,19 @@ export function createDaemon(options: DaemonOptions): Daemon {
         reject(404, "Not Found");
         return;
       }
-      if (bot.computer === "mac") {
+      const requested = url.searchParams.get("computer");
+      const computer: ComputerKind =
+        requested === "mac" || requested === "firecracker"
+          ? requested
+          : primaryComputer(bot);
+      if (!botHasComputer(bot, computer)) {
         reject(409, "Conflict");
+        return;
+      }
+      if (computer === "mac") {
+        terminalWss.handleUpgrade(request, socket, head, (client) => {
+          proxyLocalTerminal(botId, client);
+        });
         return;
       }
       if (!sandboxAvailable || !options.sandbox) {
@@ -1095,29 +1149,22 @@ export function createDaemon(options: DaemonOptions): Daemon {
     }
 
     const botVncMatch = /^\/bots\/([^/]+)\/vnc$/.exec(url.pathname);
-    const taskVncMatch = /^\/tasks\/([^/]+)\/vnc$/.exec(url.pathname);
-    const vncMatch = botVncMatch ?? taskVncMatch;
-    if (!vncMatch) {
+    if (!botVncMatch) {
       socket.destroy();
       return;
     }
-    const vncId = decodeURIComponent(vncMatch[1] ?? "");
+    const vncId = decodeURIComponent(botVncMatch[1] ?? "");
     if (!originAllowed) {
       reject(403, "Forbidden");
       return;
     }
-    if (botVncMatch) {
-      const bot = options.store.getBot(vncId);
-      if (!bot) {
-        reject(404, "Not Found");
-        return;
-      }
-      if (bot.computer === "mac") {
-        reject(409, "Conflict");
-        return;
-      }
-    } else if (!options.store.getTask(vncId)) {
+    const bot = options.store.getBot(vncId);
+    if (!bot) {
       reject(404, "Not Found");
+      return;
+    }
+    if (!botHasComputer(bot, "firecracker")) {
+      reject(409, "Conflict");
       return;
     }
     if (!sandboxAvailable || !options.sandbox) {
@@ -1140,7 +1187,6 @@ export function createDaemon(options: DaemonOptions): Daemon {
       type: "hello",
       bots: options.store.listBots(),
       threads: options.store.listThreads(),
-      tasks: options.store.listTasks(),
       providers: options.registry.infos(),
       presets: options.presets,
       defaultModel: readDefaultModel(),
@@ -1178,11 +1224,9 @@ export function createDaemon(options: DaemonOptions): Daemon {
             role: message.role ?? null,
             avatar: message.avatar ?? null,
             color: message.color ?? null,
-            computer: message.computer ?? null,
             computers: message.computers,
             workspaceId: message.workspaceId ?? null,
             access: message.access,
-            delegates: message.delegates ?? false,
             policy: message.policy ?? "inherit",
           });
           broadcast({ type: "bot.created", requestId: message.requestId, bot });
@@ -1196,9 +1240,6 @@ export function createDaemon(options: DaemonOptions): Daemon {
             patch.avatar = message.avatar || null;
           }
           if (message.color !== undefined) patch.color = message.color || null;
-          if (message.computer !== undefined) {
-            patch.computer = message.computer;
-          }
           if (message.computers !== undefined) {
             patch.computers = message.computers;
           }
@@ -1207,9 +1248,6 @@ export function createDaemon(options: DaemonOptions): Daemon {
           }
           if (message.access !== undefined) {
             patch.access = message.access;
-          }
-          if (message.delegates !== undefined) {
-            patch.delegates = message.delegates;
           }
           if (message.policy !== undefined) {
             patch.policy = message.policy;
@@ -1235,7 +1273,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
             send({ type: "chat.error", message: `unknown bot: ${message.botId}` });
             return;
           }
-          if (bot.computer === "mac") {
+          if (!botHasComputer(bot, "firecracker")) {
             send({
               type: "chat.error",
               message: "this agent runs on This Mac and has no VM to power on or off",
@@ -1296,8 +1334,6 @@ export function createDaemon(options: DaemonOptions): Daemon {
             }
           }
           dropQueuedChats(message.botId);
-          orchestrator.cancelForRole(message.botId);
-          orchestrator.cancelForProject(message.botId);
           screenCache.delete(message.botId);
           screenInFlight.delete(message.botId);
           options.store.deleteBot(message.botId);
@@ -1332,8 +1368,6 @@ export function createDaemon(options: DaemonOptions): Daemon {
             }
           }
           dropQueuedChats(message.botId);
-          orchestrator.cancelForRole(message.botId);
-          orchestrator.cancelForProject(message.botId);
           screenCache.delete(message.botId);
           screenInFlight.delete(message.botId);
           options.store.resetBot(message.botId);
@@ -1349,7 +1383,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
             thread,
           });
           const sandbox = options.sandbox;
-          if (sandbox && bot.computer !== "mac") {
+          if (sandbox && botHasComputer(bot, "firecracker")) {
             void (async () => {
               try {
                 broadcast({
@@ -1490,7 +1524,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
         case "sandbox.status": {
           const sandbox = options.sandbox;
           const bot = options.store.getBot(message.botId);
-          if (!sandbox || !bot || bot.computer === "mac") {
+          if (!sandbox || !bot || !botHasComputer(bot, "firecracker")) {
             send({
               type: "sandbox.state",
               botId: message.botId,
@@ -1615,9 +1649,6 @@ export function createDaemon(options: DaemonOptions): Daemon {
         case "chat.cancel":
           runs.get(message.runId)?.controller.abort();
           return;
-        case "task.cancel":
-          orchestrator.cancel(message.taskId);
-          return;
         case "approvals.list": {
           send({
             type: "approvals.list",
@@ -1658,9 +1689,9 @@ export function createDaemon(options: DaemonOptions): Daemon {
           return;
         }
         case "soul.get": {
-          const botId = message.botId ?? leadBot()?.id;
+          const botId = message.botId ?? options.store.listBots()[0]?.id;
           if (!botId) {
-            send({ type: "chat.error", message: "no lead bot for the soul" });
+            send({ type: "chat.error", message: "no agent for the soul" });
             return;
           }
           send({
@@ -1672,9 +1703,9 @@ export function createDaemon(options: DaemonOptions): Daemon {
           return;
         }
         case "soul.revert": {
-          const botId = message.botId ?? leadBot()?.id;
+          const botId = message.botId ?? options.store.listBots()[0]?.id;
           if (!botId) {
-            send({ type: "chat.error", message: "no lead bot for the soul" });
+            send({ type: "chat.error", message: "no agent for the soul" });
             return;
           }
           const reverted = soul.revert(botId, message.versionId);
@@ -1691,6 +1722,11 @@ export function createDaemon(options: DaemonOptions): Daemon {
           return;
         }
         case "approval.respond":
+          if (message.remember && message.decision === "approve") {
+            if (rememberApprovedTool(message.requestId)) {
+              providersUpdated();
+            }
+          }
           options.approvals.resolve(message.requestId, message.decision);
           return;
         case "challenge.respond":
@@ -1943,7 +1979,6 @@ export function createDaemon(options: DaemonOptions): Daemon {
 
   return {
     async start() {
-      orchestrator.recover();
       reflector.start();
       await codex.refresh();
       await new Promise<void>((resolve, reject) => {
@@ -1965,7 +2000,6 @@ export function createDaemon(options: DaemonOptions): Daemon {
       clearInterval(sandboxTimer);
       clearInterval(codexTimer);
       reflector.stop();
-      await orchestrator.stop();
       for (const run of runs.values()) {
         run.controller.abort();
       }

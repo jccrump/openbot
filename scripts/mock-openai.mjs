@@ -276,12 +276,6 @@ const server = createServer((request, response) => {
       typeof last.content === "string" &&
       last.content.trim().startsWith("write:");
 
-    const wantsSpawn =
-      Array.isArray(parsed.tools) &&
-      last?.role === "user" &&
-      typeof last.content === "string" &&
-      last.content.trim().startsWith("spawn:");
-
     const wantsSlow =
       Array.isArray(parsed.tools) &&
       last?.role === "user" &&
@@ -305,24 +299,6 @@ const server = createServer((request, response) => {
       last?.role === "user" &&
       typeof last.content === "string" &&
       last.content.trim().startsWith("soul:");
-
-    const wantsCreateProject =
-      Array.isArray(parsed.tools) &&
-      last?.role === "user" &&
-      typeof last.content === "string" &&
-      last.content.trim().startsWith("create-project:");
-
-    const wantsListProjects =
-      Array.isArray(parsed.tools) &&
-      last?.role === "user" &&
-      typeof last.content === "string" &&
-      last.content.trim().startsWith("list-projects:");
-
-    const wantsAsk =
-      Array.isArray(parsed.tools) &&
-      last?.role === "user" &&
-      typeof last.content === "string" &&
-      last.content.trim().startsWith("ask:");
 
     const emitToolCall = (name, args) => {
       const split = Math.min(8, args.length);
@@ -432,36 +408,6 @@ const server = createServer((request, response) => {
       return;
     }
 
-    if (wantsCreateProject) {
-      const rest = last.content.trim().slice("create-project:".length).trim();
-      const separator = rest.indexOf("::");
-      const name = separator === -1 ? rest : rest.slice(0, separator).trim();
-      const scope = separator === -1 ? "" : rest.slice(separator + 2).trim();
-      emitToolCall(
-        "create_project",
-        JSON.stringify({ name, scope }),
-      );
-      return;
-    }
-
-    if (wantsListProjects) {
-      emitToolCall("list_projects", JSON.stringify({}));
-      return;
-    }
-
-    if (wantsAsk) {
-      const rest = last.content.trim().slice("ask:".length).trim();
-      const separator = rest.indexOf("::");
-      const projectId =
-        separator === -1 ? rest : rest.slice(0, separator).trim();
-      const request = separator === -1 ? "" : rest.slice(separator + 2).trim();
-      emitToolCall(
-        "ask_project",
-        JSON.stringify({ projectId, request }),
-      );
-      return;
-    }
-
     if (wantsSlow) {
       const seconds = Number(last.content.trim().slice(5).trim()) || 30;
       emitToolCall(
@@ -470,18 +416,6 @@ const server = createServer((request, response) => {
           command: `sleep ${seconds}`,
           timeoutSeconds: Math.min(300, seconds + 30),
         }),
-      );
-      return;
-    }
-
-    if (wantsSpawn) {
-      const rest = last.content.trim().slice(6).trim();
-      const separator = rest.indexOf("::");
-      const roleId = separator === -1 ? rest : rest.slice(0, separator).trim();
-      const brief = separator === -1 ? "" : rest.slice(separator + 2).trim();
-      emitToolCall(
-        "spawn_worker",
-        JSON.stringify({ roleId, brief, title: "Delegated task" }),
       );
       return;
     }

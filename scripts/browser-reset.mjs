@@ -70,7 +70,11 @@ if (matches.length > 1) {
 }
 
 const bot = matches[0];
-if (bot.computer === "mac") {
+const computers =
+  Array.isArray(bot.computers) && bot.computers.length > 0
+    ? bot.computers
+    : ["firecracker"];
+if (!computers.includes("firecracker")) {
   console.error("This Mac agents have no browser profile");
   process.exit(1);
 }

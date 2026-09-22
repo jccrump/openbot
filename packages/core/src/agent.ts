@@ -22,11 +22,10 @@ import type {
   PlanStep,
   PolicySettings,
   ServerMessage,
-  TaskBudget,
-  TaskGrant,
   ToolArtifact,
   ToolCallRecord,
 } from "@openbot/protocol";
+import { primaryComputer } from "@openbot/protocol";
 import type { SandboxBackend } from "@openbot/sandbox";
 import type { ApprovalBroker } from "./approvals";
 import type { ChallengeBroker } from "./challenges";
@@ -47,7 +46,6 @@ import {
   mergePolicies,
   rolePolicySettings,
 } from "./policy";
-import { decideRoute } from "./routing";
 import {
   GUARDRAIL_BLOCKED,
   GUARDRAIL_WARNING,
@@ -57,12 +55,9 @@ import {
 } from "./guardrail";
 import type { SoulService } from "./soul";
 import {
-  callComputer,
   findTool,
   isApprovalExemptTool,
-  isOrchestrationTool,
   toolDefinitions,
-  type OrchestratorHandle,
   type Tool,
   type ToolContext,
   type ToolImage,
@@ -96,11 +91,10 @@ export interface AgentDeps {
   dataDir: string;
   providerRecord: (id: string) => ProviderRecord | null;
   resolveProviderKey: (record: ProviderRecord) => string | undefined;
-  orchestrator?: OrchestratorHandle | null;
   memory?: MemoryService | null;
   soul?: SoulService | null;
   policy?: () => PolicySettings;
-  /** What the daemon knows about itself (system_info and the lead's [self] note). */
+  /** What the daemon knows about itself (system_info and the [self] note). */
   self?: SelfInfo;
   /** Schedule a daemon restart after the current work settles. */
   requestRestart?: () => { ok: boolean; message: string };
@@ -125,26 +119,8 @@ export interface AgentInput {
   skipUserMessage?: boolean;
   /** Mid-turn user messages to fold into the running conversation. */
   steering?: SteeringChannel;
-  /** Internal trigger (task event): do not persist the user message or retitle the thread. */
-  internal?: boolean;
   /** Extra system context injected for this turn only; never persisted. */
   contextNote?: string;
-  /** Memory scopes retrieved for this turn (defaults by bot kind). */
-  memoryScopes?: string[];
-  /** The project this task belongs to, when it does. */
-  projectId?: string | null;
-  /** Set when this run is a worker or manager task. */
-  taskId?: string;
-  /** Sandbox key for this run: a task computer when set, otherwise the bot's. */
-  computerId?: string;
-  /** Sandbox key for browser actions when it differs from the computer. */
-  browserId?: string;
-  /** Guest workspace directory for sessions inside a shared computer. */
-  guestCwd?: string;
-  /** Approved capabilities: tools in the grant skip per-action approval. */
-  grant?: TaskGrant | null;
-  /** Harness-enforced limits for the run. */
-  budget?: TaskBudget | null;
 }
 
 const PROVIDER_STEP_TIMEOUT_MS = 120_000;
@@ -166,7 +142,7 @@ const TRANSIENT_TOOL_ERROR =
 // text (DeepSeek's DSML) instead of a structured tool call. Detect it so the
 // turn can nudge once and retry instead of finalizing broken markup.
 const RAW_TOOL_MARKUP = /<[｜|]{1,2}\s*(DSML|tool_calls?|function_calls?)/i;
-const MAX_MARKUP_REVISIONS = 1;
+const MAX_MARKUP_REVISIONS = 2;
 // Provider failures worth retrying before the turn gives up. "terminated",
 // "other side closed", and "premature close" are undici's stream-cut errors.
 const TRANSIENT_PROVIDER_ERROR =
@@ -535,6 +511,19 @@ async function executeToolCall(
   const tool = findTool(call.name);
   if (!tool) {
     output = unknownToolMessage(call.name, availableTools);
+  } else if (!availableTools.includes(call.name)) {
+    // The model sometimes calls a tool it was not offered (for example a
+    // computer tool on a project-routed turn). The offered set is the
+    // contract, so refuse instead of running it.
+    output =
+      `The ${call.name} tool is not available for this turn. Use only the ` +
+      `tools you were offered: ${availableTools.join(", ") || "none"}.`;
+    console.info("tool.unavailable", {
+      runId: ids.runId,
+      botId: context.botId,
+      callId: call.id,
+      name: call.name,
+    });
   } else if (approval.tier === "deny") {
     output = `Blocked by the approvals policy: ${approval.reason}. Do not retry it.`;
     console.info("tool.blocked", {
@@ -567,8 +556,6 @@ async function executeToolCall(
             runId: ids.runId,
             threadId: ids.threadId,
             botId: context.botId,
-            taskId: context.taskId ?? null,
-            projectId: context.projectId ?? null,
             tool: call.name,
             arguments: call.arguments,
             tier: approval.tier,
@@ -751,7 +738,7 @@ export async function runAgent(
       ? requested
       : deps.store.getOrCreateThread(bot.id);
 
-  if (!input.internal && !input.skipUserMessage) {
+  if (!input.skipUserMessage) {
     deps.store.addMessage({
       id: input.messageId,
       threadId: thread.id,
@@ -845,16 +832,7 @@ export async function runAgent(
     }
   }
 
-  const computers = bot.computers;
-  const hasVm = computers.includes("firecracker");
-  const hasMac = computers.includes("mac");
-  // The microVM is the default target when the agent has both; This Mac is
-  // chosen per call with the computer argument (ADR-021).
-  const computer: ComputerKind = hasVm
-    ? "firecracker"
-    : hasMac
-      ? "mac"
-      : "firecracker";
+  const computer: ComputerKind = primaryComputer(bot);
   const local = computer === "mac";
   const decisionRuntime = deps.decision();
   const emitDecision = (notice: DecisionNotice): void => {
@@ -868,86 +846,9 @@ export async function runAgent(
       flagged: notice.flagged,
       latencyMs: notice.latencyMs,
       model: notice.model,
-      ...(notice.route ? { route: notice.route } : {}),
     });
   };
   const vision = modelSupportsImages(model.model);
-
-  // Jev pre-routing for lead user turns: conversation, direct work, an
-  // existing project, or a new project. The decision is a hint, and for
-  // confident conversation it drops tools for the turn; when Jev is off,
-  // unavailable, or unsure, the model decides as before.
-  let routeHint: string | null = null;
-  let routeChat = false;
-  if (
-    deps.decision &&
-    deps.orchestrator &&
-    bot.kind === "lead" &&
-    !input.internal &&
-    !input.taskId
-  ) {
-    const runtime = deps.decision();
-    if (runtime.client && runtime.settings.route) {
-      try {
-        const projects = deps.orchestrator.listProjects();
-        const decision = await decideRoute({
-          client: runtime.client,
-          message: input.text,
-          projects: projects.map((project) => ({
-            id: project.id,
-            name: project.name,
-            scope: project.scope,
-          })),
-          signal,
-        });
-        if (decision) {
-          console.info("route.decision", {
-            runId,
-            threadId: thread.id,
-            botId: bot.id,
-            target: decision.target,
-            needsWork: decision.needsWork,
-            confidence: decision.confidence,
-            latencyMs: decision.latencyMs,
-            model: decision.model,
-          });
-          emitDecision({
-            kind: "route",
-            summary: decision.summary,
-            flagged: false,
-            latencyMs: decision.latencyMs,
-            model: decision.model,
-            route: decision.target,
-          });
-          if (decision.target === "chat") {
-            routeChat = true;
-            routeHint =
-              "[routing] Jev routed this message as conversation: answer " +
-              "directly without tools.";
-          } else if (decision.target === "project" && decision.projectId) {
-            const project = projects.find(
-              (candidate) => candidate.id === decision.projectId,
-            );
-            routeHint =
-              `[routing] Jev routed this message to the project ` +
-              `"${project?.name ?? decision.projectId}" ` +
-              `(id: ${decision.projectId}). Send it with ask_project; do not ` +
-              "do the work yourself.";
-          } else if (decision.target === "new_project") {
-            routeHint =
-              "[routing] Jev found no existing project that covers this. " +
-              "Create one with create_project and route the request there.";
-          } else {
-            routeHint =
-              "[routing] Jev routed this message as direct work: handle it " +
-              "yourself with tools.";
-          }
-        }
-      } catch (error) {
-        console.warn(`routing decision failed: ${(error as Error).message}`);
-      }
-    }
-  }
 
   // Turn-scoped caches: a file re-read unchanged, or a tool returning a
   // byte-identical result, only burns context. Both are cleared when
@@ -963,18 +864,13 @@ export async function runAgent(
   const workspaceDir = workspace
     ? workspace.root
     : join(deps.dataDir, "workspaces", bot.id);
-  const guestCwd =
-    input.guestCwd ??
-    (workspace && hasVm ? workspaceGuestRoot(workspace) : undefined);
+  const guestCwd = workspace && !local ? workspaceGuestRoot(workspace) : undefined;
   const toolContext: ToolContext | null =
     local || deps.sandbox
       ? {
           botId: bot.id,
-          computerId: input.computerId,
-          browserId: input.browserId,
           guestCwd,
           computer,
-          computers,
           access: bot.access,
           self: deps.self,
           requestRestart: deps.requestRestart,
@@ -990,15 +886,11 @@ export async function runAgent(
             emit({
               type: "sandbox.state",
               botId: bot.id,
-              taskId: input.taskId,
               state,
             }),
-          orchestrator: deps.orchestrator ?? null,
-          taskId: input.taskId,
-          projectId: input.projectId ?? null,
           memory: deps.memory ?? null,
           soul: deps.soul ?? null,
-          memoryScope: bot.kind === "lead" ? "user" : bot.id,
+          memoryScope: bot.id,
           updatePlan: (plan: PlanStep[]) => {
             const updated = deps.store.setThreadPlan(thread.id, plan);
             if (updated) {
@@ -1008,13 +900,9 @@ export async function runAgent(
         }
       : null;
 
-  // Soul and memories are injected as a bounded system note: the lead gets
-  // the user-scope soul and memories, projects get their own scope plus the
-  // user's, and workers get the project slice their brief matches.
+  // Soul and memories are injected as a bounded system note: the agent gets
+  // the agent's own memories; every agent owns its own scope.
   const contextParts: string[] = [];
-  if (routeHint) {
-    contextParts.push(routeHint);
-  }
   if (input.contextNote) {
     contextParts.push(input.contextNote);
   }
@@ -1028,7 +916,7 @@ export async function runAgent(
           : ""),
     );
   }
-  if (hasMac && bot.access !== "project") {
+  if (local && bot.access !== "project") {
     contextParts.push(
       bot.access === "home"
         ? "[access] This Mac access is Home: file tools and shell reach " +
@@ -1040,20 +928,10 @@ export async function runAgent(
             "project's trust patterns allow it.",
     );
   }
-  if (bot.kind === "lead" && deps.self) {
+  if (deps.self) {
     contextParts.push(renderSelfNote(deps.self));
   }
-  if (computers.length > 1) {
-    contextParts.push(
-      "[computers] You have two computers. Tools that act on a computer take " +
-        "a \"computer\" argument: \"firecracker\" is the isolated Linux " +
-        "microVM and the default, and \"mac\" is the user's Mac, where file " +
-        "tools are confined to your workspace folder and every action is " +
-        "approval-gated. The browser and desktop tools only work on the " +
-        "microVM.",
-    );
-  }
-  if (deps.soul && bot.kind === "lead") {
+  if (deps.soul) {
     try {
       const soul = deps.soul.current(bot.id);
       contextParts.push(`[soul]\n${soul.summary}`);
@@ -1062,11 +940,9 @@ export async function runAgent(
     }
   }
   if (deps.memory) {
-    const scopes =
-      input.memoryScopes ?? (bot.kind === "lead" ? ["user"] : [bot.id]);
     try {
       const hits = await deps.memory.recall(input.text, {
-        scopes,
+        scopes: [bot.id],
         limit: 6,
       });
       if (hits.length > 0) {
@@ -1096,17 +972,16 @@ export async function runAgent(
     );
   }
   const turnContext = contextParts.filter(Boolean).join("\n\n");
-  const definitions: ToolDefinition[] = toolContext && !routeChat
-    ? toolDefinitions(computers, {
+  const definitions: ToolDefinition[] = toolContext
+    ? toolDefinitions(computer, {
         browse: Boolean(
           decisionRuntime.client && decisionRuntime.settings.browse,
         ),
-        delegate: bot.kind === "lead" || bot.kind === "project" || bot.delegates,
       })
     : [];
-  const globalApproval = deps.requireApproval || hasMac;
-  const grantedTools = new Set(input.grant?.tools ?? []);
-  const isManagerRun = Boolean(input.taskId);
+  // Local tool calls are handled per call in the policy (they ask while
+  // approvals are on unless a mac-scoped rule allows them), so having a Mac
+  // computer is not itself a reason to ask.
   const basePolicy = deps.policy?.() ?? DEFAULT_POLICY;
   // A workspace's trusted command patterns auto-approve shell calls for
   // agents working in that project; a global deny or ask rule still wins
@@ -1140,11 +1015,11 @@ export async function runAgent(
   }
   // A hard shell egress policy is enforced on the VM's network interface for
   // the whole turn, so commands cannot reach hosts the browser would refuse.
-  if (toolContext && hasVm && deps.sandbox) {
+  if (toolContext && !local && deps.sandbox) {
     const egress = policySettings.egress;
     try {
       await deps.sandbox.setNetworkPolicy(
-        input.computerId ?? bot.id,
+        bot.id,
         egress && egress.mode === "deny"
           ? { mode: "deny", allow: egress.allow }
           : null,
@@ -1154,36 +1029,17 @@ export async function runAgent(
     }
   }
   // The approvals policy decides auto/ask/deny per call. Rules can scope
-  // themselves to microVM or This Mac; grants pre-approve ask-tier tools but
-  // never widen a deny; local-Mac tools ask unless a mac-scoped rule allows
-  // them (ADR-010, ADR-016).
+  // themselves to microVM or This Mac; local-Mac tools ask unless a mac-scoped
+  // rule allows them (ADR-010, ADR-018).
   const evaluateToolApproval = (
     call: ToolCall,
   ): { tier: ApprovalTier; reason: string } => {
+    // A tool the turn did not offer never runs, so it never needs a card.
+    if (findTool(call.name) && !availableToolNames.includes(call.name)) {
+      return { tier: "auto", reason: "the tool is not available for this turn" };
+    }
     if (isApprovalExemptTool(call.name)) {
       return { tier: "auto", reason: "no approval needed" };
-    }
-    if (isOrchestrationTool(call.name)) {
-      // A manager's grant already authorized its children; the lead's spawn
-      // is how the user authorizes a project, so it follows the default tier.
-      if (isManagerRun) {
-        return { tier: "auto", reason: "covered by the task grant" };
-      }
-      const tier =
-        policySettings.defaultTier === "inherit"
-          ? globalApproval
-            ? "ask"
-            : "auto"
-          : policySettings.defaultTier;
-      return {
-        tier,
-        reason:
-          tier === "auto"
-            ? "approvals are off by default"
-            : tier === "deny"
-              ? "the default tier denies new work"
-              : "approvals are on by default",
-      };
     }
     let args: Record<string, unknown> = {};
     if (call.arguments.trim()) {
@@ -1193,49 +1049,14 @@ export async function runAgent(
         args = {};
       }
     }
-    // Policy follows the computer the call targets, so a local action still
-    // always asks even when the agent's default is the microVM (ADR-021).
-    const callTarget = callComputer(computers, computer, args);
     return evaluatePolicy({
       policy: policySettings,
       requireApproval: deps.requireApproval,
       tool: call.name,
       args,
-      computer: callTarget,
-      granted: Boolean(input.grant && grantedTools.has(call.name)),
-      local: callTarget === "mac",
+      computer,
+      local,
     });
-  };
-
-  const budget = input.budget ?? null;
-  const budgetStartedAt = Date.now();
-  const budgetIssue = (): string | null => {
-    if (!budget) {
-      return null;
-    }
-    if (
-      budget.toolCalls !== null &&
-      budget.toolCalls !== undefined &&
-      records.length >= budget.toolCalls
-    ) {
-      return `tool-call budget exhausted (${budget.toolCalls})`;
-    }
-    if (
-      budget.wallClockMs !== null &&
-      budget.wallClockMs !== undefined &&
-      Date.now() - budgetStartedAt >= budget.wallClockMs
-    ) {
-      return `time budget exhausted (${Math.round(budget.wallClockMs / 1000)}s)`;
-    }
-    if (
-      budget.tokens !== null &&
-      budget.tokens !== undefined &&
-      turnUsage &&
-      turnUsage.inputTokens + turnUsage.outputTokens >= budget.tokens
-    ) {
-      return `token budget exhausted (${budget.tokens})`;
-    }
-    return null;
   };
 
   const buildTurnHistory = (): ChatMessage[] => {
@@ -1246,11 +1067,6 @@ export async function runAgent(
     );
     if (turnContext) {
       turnHistory.unshift({ role: "system", content: turnContext });
-    }
-    if (input.internal) {
-      // Internal turns are not persisted as user messages, but the model still
-      // needs the trigger instruction as the final user turn.
-      turnHistory.push({ role: "user", content: input.text });
     }
     return turnHistory;
   };
@@ -1322,16 +1138,6 @@ export async function runAgent(
 
   try {
     for (let step = 0; ; step += 1) {
-      const stepBudgetIssue = budgetIssue();
-      if (stepBudgetIssue) {
-        emit({
-          type: "chat.error",
-          runId,
-          threadId: thread.id,
-          message: `Task stopped: ${stepBudgetIssue}. Partial results are preserved in this task.`,
-        });
-        return;
-      }
       if (step >= MAX_TOOL_STEPS) {
         const message = persistAssistant(
           assistantMessageId,
@@ -1471,13 +1277,40 @@ export async function runAgent(
 
       if (pendingCalls.length === 0) {
         // Raw markup as text means the provider failed to turn the tool call
-        // into a structured call; discard it and nudge once.
-        if (
-          RAW_TOOL_MARKUP.test(finalText) &&
-          markupRevisions < MAX_MARKUP_REVISIONS
-        ) {
-          markupRevisions += 1;
-          console.warn("assistant emitted raw tool-call markup; retrying");
+        // into a structured call; discard it and nudge. A provider that keeps
+        // doing it gets a clean apology instead of leaking the markup to the
+        // user as the answer.
+        if (RAW_TOOL_MARKUP.test(finalText)) {
+          if (markupRevisions < MAX_MARKUP_REVISIONS) {
+            markupRevisions += 1;
+            console.warn("assistant emitted raw tool-call markup; retrying");
+            emit({
+              type: "chat.delta",
+              runId,
+              threadId: thread.id,
+              messageId: assistantMessageId,
+              text: "",
+              reset: true,
+            });
+            working.push({ role: "assistant", content: finalText });
+            working.push({
+              role: "user",
+              content:
+                "[system] Your last reply contained raw tool-call markup as " +
+                "text, so nothing ran. Do not write tool syntax as text. Call " +
+                "the tool through the tool interface with valid JSON " +
+                "arguments and continue the task.",
+            });
+            content = contentBeforeStep;
+            finalText = "";
+            continue;
+          }
+          console.warn(
+            "assistant kept emitting raw tool-call markup; replacing it",
+          );
+          finalText =
+            "I hit a provider glitch: the model sent a tool call as plain " +
+            "text, so nothing ran. Ask me to try that again.";
           emit({
             type: "chat.delta",
             runId,
@@ -1486,17 +1319,13 @@ export async function runAgent(
             text: "",
             reset: true,
           });
-          working.push({ role: "assistant", content: finalText });
-          working.push({
-            role: "user",
-            content:
-              "[system] Your last reply contained raw tool-call markup as " +
-              "text, so nothing ran. Call the tool through the tool interface " +
-              "with valid JSON arguments and continue the task.",
+          emit({
+            type: "chat.delta",
+            runId,
+            threadId: thread.id,
+            messageId: assistantMessageId,
+            text: finalText,
           });
-          content = contentBeforeStep;
-          finalText = "";
-          continue;
         }
         if (input.steering?.hasPending()) {
           // The draft is no longer the final answer: flush it as a step
@@ -1709,16 +1538,6 @@ export async function runAgent(
 
       let repeatedFailure: string | null = null;
       for (const call of pendingCalls) {
-        const callBudgetIssue = budgetIssue();
-        if (callBudgetIssue) {
-          emit({
-            type: "chat.error",
-            runId,
-            threadId: thread.id,
-            message: `Task stopped: ${callBudgetIssue}. Partial results are preserved in this task.`,
-          });
-          return;
-        }
         if (!toolContext) {
           const record: ToolCallRecord = {
             id: call.id,

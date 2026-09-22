@@ -24,7 +24,6 @@ import type {
   RolePolicy,
   ServerMessage,
   SoulVersion,
-  Task,
   Thread,
   ToolArtifact,
   Workspace,
@@ -40,10 +39,10 @@ export interface StreamingState {
   text: string;
   reasoning: string;
   startedAt: number;
-  // A live turn starts "pending": Jev may say it is conversation ("chat"), in
-  // which case the UI stays a simple loading bubble; reasoning or a tool call
-  // means real work, and only then does the working group appear.
-  mode: "pending" | "chat" | "work";
+  // A live turn starts "pending": the UI stays a simple loading bubble until
+  // reasoning or a tool call means real work, and only then does the working
+  // group appear.
+  mode: "pending" | "work";
 }
 
 export interface ToolActivity {
@@ -100,8 +99,6 @@ export interface CreateBotInput {
   avatar?: string;
   color?: string;
   model?: ModelRef;
-  /** @deprecated use computers. */
-  computer?: ComputerKind;
   computers?: ComputerKind[];
   workspaceId?: string;
   access?: AccessMode;
@@ -203,10 +200,8 @@ export function useDaemon() {
 
   const [status, setStatus] = useState<DaemonStatus>(client.status);
   const [bots, setBots] = useState<Bot[]>([]);
-  const [tasks, setTasks] = useState<Task[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [selectedBotId, setSelectedBotId] = useState<string | null>(null);
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [presets, setPresets] = useState<ProviderPreset[]>([]);
   const [defaultModel, setDefaultModel] = useState<ModelRef | null>(null);
@@ -268,16 +263,12 @@ export function useDaemon() {
   const outageRef = useRef(false);
   const botsRef = useRef<Bot[]>(bots);
   botsRef.current = bots;
-  const tasksRef = useRef<Task[]>(tasks);
-  tasksRef.current = tasks;
   const threadsRef = useRef<Thread[]>(threads);
   threadsRef.current = threads;
   const providersRef = useRef<ProviderInfo[]>(providers);
   providersRef.current = providers;
   const selectedBotIdRef = useRef<string | null>(selectedBotId);
   selectedBotIdRef.current = selectedBotId;
-  const selectedTaskIdRef = useRef<string | null>(selectedTaskId);
-  selectedTaskIdRef.current = selectedTaskId;
   const modelRequests = useRef(
     new Map<string, (result: FetchModelsResult) => void>(),
   );
@@ -305,7 +296,6 @@ export function useDaemon() {
       providerList?: ProviderInfo[],
     ) => {
       setSelectedBotId(botId);
-      setSelectedTaskId(null);
       try {
         localStorage.setItem(SELECTED_BOT_KEY, botId);
       } catch {}
@@ -367,11 +357,6 @@ export function useDaemon() {
             schedule();
             return;
           }
-          if (tasksRef.current.some((task) => task.threadId === threadId)) {
-            // Worker streams belong to the workboard; the task row is the
-            // source of truth, so a quiet worker never raises a global error.
-            return;
-          }
           setStreamingByThread((current) => {
             if (!current[threadId]) {
               return current;
@@ -412,7 +397,6 @@ export function useDaemon() {
           clearInFlight();
           setError(null);
           setBots(message.bots);
-          setTasks(message.tasks ?? []);
           setThreads(message.threads);
           setProviders(message.providers);
           setPresets(message.presets);
@@ -437,12 +421,7 @@ export function useDaemon() {
             (stored && message.bots.some((bot) => bot.id === stored)
               ? stored
               : null);
-          // The chat always belongs to the main agent; every other thread is
-          // opened in the drawer instead.
-          const lead =
-            message.bots.find((item) => item.kind === "lead") ?? null;
           const bot =
-            lead ??
             (preferred
               ? message.bots.find((item) => item.id === preferred)
               : null) ??
@@ -527,17 +506,6 @@ export function useDaemon() {
               current.filter((item) => !removedThreadIds.has(item.threadId)),
             );
           }
-          setTasks((current) =>
-            current.filter((task) => task.roleId !== message.botId),
-          );
-          const selectedTask = tasksRef.current.find(
-            (task) => task.id === selectedTaskIdRef.current,
-          );
-          if (selectedTask && selectedTask.roleId === message.botId) {
-            setSelectedTaskId(null);
-            setActiveThreadId(null);
-            setMessages([]);
-          }
           if (selectedBotIdRef.current === message.botId) {
             const next = remainingBots[0] ?? null;
             if (next) {
@@ -580,15 +548,6 @@ export function useDaemon() {
           setApprovals((current) =>
             current.filter((item) => !replacedThreadIds.has(item.threadId)),
           );
-          setTasks((current) =>
-            current.filter((task) => task.roleId !== message.botId),
-          );
-          const selectedResetTask = tasksRef.current.find(
-            (task) => task.id === selectedTaskIdRef.current,
-          );
-          if (selectedResetTask && selectedResetTask.roleId === message.botId) {
-            setSelectedTaskId(null);
-          }
           if (selectedBotIdRef.current === message.botId) {
             setActiveThreadId(message.thread.id);
             setMessages([]);
@@ -793,7 +752,7 @@ export function useDaemon() {
               [message.threadId]: {
                 ...entry,
                 // Reasoning is not a work signal: chat models think too. The
-                // turn stays simple unless Jev says work or a tool runs.
+                // turn stays simple unless a tool runs.
                 reasoning: entry.reasoning + message.text,
               },
             };
@@ -816,29 +775,10 @@ export function useDaemon() {
           });
           break;
         }
-        case "chat.decision": {
-          // Route decisions tell the live UI whether the turn is conversation
-          // or work. The other kinds stay backend telemetry.
-          if (message.kind !== "route" || !message.route) {
-            break;
-          }
-          const mode = message.route === "chat" ? "chat" : "work";
-          setStreamingByThread((current) => {
-            const entry = current[message.threadId];
-            if (
-              !entry ||
-              entry.messageId !== message.messageId ||
-              entry.mode === mode
-            ) {
-              return current;
-            }
-            return {
-              ...current,
-              [message.threadId]: { ...entry, mode },
-            };
-          });
+        case "chat.decision":
+          // Audit, browse, and guardrail decisions are backend telemetry; the
+          // live UI only needs to know when a tool runs (handled below).
           break;
-        }
         case "tool.start": {
           setStreamingByThread((current) => {
             const entry = current[message.threadId];
@@ -953,24 +893,10 @@ export function useDaemon() {
           ]);
           break;
         }
-        case "task.upserted": {
-          setTasks((current) => {
-            const index = current.findIndex(
-              (task) => task.id === message.task.id,
-            );
-            if (index === -1) {
-              return [message.task, ...current];
-            }
-            const next = [...current];
-            next[index] = message.task;
-            return next;
-          });
-          break;
-        }
         case "sandbox.state": {
           setSandboxStates((current) => ({
             ...current,
-            [message.taskId ?? message.botId]: message.state,
+            [message.botId]: message.state,
           }));
           break;
         }
@@ -1185,8 +1111,17 @@ export function useDaemon() {
   );
 
   const respondToApproval = useCallback(
-    (requestId: string, decision: "approve" | "deny") => {
-      client.send({ type: "approval.respond", requestId, decision });
+    (
+      requestId: string,
+      decision: "approve" | "deny",
+      remember = false,
+    ) => {
+      client.send({
+        type: "approval.respond",
+        requestId,
+        decision,
+        ...(remember ? { remember: true } : {}),
+      });
       setApprovals((current) =>
         current.map((approval) =>
           approval.requestId === requestId
@@ -1221,29 +1156,6 @@ export function useDaemon() {
       activateBot(botId, threadsRef.current);
     },
     [activateBot],
-  );
-
-  const selectTask = useCallback(
-    (taskId: string) => {
-      const task = tasksRef.current.find((item) => item.id === taskId) ?? null;
-      if (!task) {
-        return;
-      }
-      setSelectedTaskId(taskId);
-      setActiveThreadId(task.threadId ?? null);
-      setMessages([]);
-      if (task.threadId) {
-        client.send({ type: "thread.messages", threadId: task.threadId });
-      }
-    },
-    [client],
-  );
-
-  const cancelTask = useCallback(
-    (taskId: string) => {
-      client.send({ type: "task.cancel", taskId });
-    },
-    [client],
   );
 
   const loadApprovals = useCallback(
@@ -1315,11 +1227,9 @@ export function useDaemon() {
         role?: string | null;
         avatar?: string | null;
         color?: string | null;
-        computer?: ComputerKind;
         computers?: ComputerKind[];
         workspaceId?: string | null;
         access?: AccessMode;
-        delegates?: boolean;
         policy?: RolePolicy;
         model?: ModelRef;
       },
@@ -1683,12 +1593,8 @@ export function useDaemon() {
   return {
     status,
     bots,
-    tasks,
     threads,
     selectedBotId,
-    selectedTaskId,
-    selectTask,
-    cancelTask,
     memories,
     soul,
     soulVersions,
@@ -1726,6 +1632,7 @@ export function useDaemon() {
     activeThreadId,
     messages,
     streaming,
+    streamingByThread,
     previewThreadId,
     previewMessages,
     previewStreaming,

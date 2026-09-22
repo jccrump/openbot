@@ -12,8 +12,6 @@ export interface ApprovalRequestInput {
   runId?: string | null;
   threadId?: string | null;
   botId?: string | null;
-  taskId?: string | null;
-  projectId?: string | null;
   tool: string;
   arguments: string;
   tier: ApprovalTier;

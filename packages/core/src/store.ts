@@ -6,7 +6,6 @@ import type {
   ApprovalRecord,
   ApprovalTier,
   Bot,
-  BotKind,
   CompactionMeta,
   ComputerKind,
   Memory,
@@ -20,12 +19,6 @@ import type {
   RolePolicy,
   SoulContent,
   SoulVersion,
-  Task,
-  TaskBudget,
-  TaskDisplay,
-  TaskGrant,
-  TaskStatus,
-  TaskUsage,
   Thread,
   TokenUsage,
   ToolCallRecord,
@@ -33,11 +26,6 @@ import type {
 } from "@openbot/protocol";
 
 export const DEFAULT_BOT_NAME = "Assistant";
-/** The lead orchestrates work on either side, so it gets both computers. */
-const LEAD_PRIMARY: ComputerKind = "firecracker";
-const LEAD_COMPUTERS: ComputerKind[] = [LEAD_PRIMARY, "mac"];
-/** The lead runs on the user's own machine with full reach (ADR-023). */
-const LEAD_ACCESS: AccessMode = "full";
 export const DEFAULT_THREAD_TITLE = "New chat";
 export const DEFAULT_SYSTEM_PROMPT =
   "You are OpenBot, an agent with your own computer. Your computer is a " +
@@ -83,33 +71,6 @@ export const DEFAULT_SYSTEM_PROMPT =
   "Commands and file changes run with the user's approval; explain what a " +
   "risky or destructive command will do before running it. Be concise and " +
   "direct, use markdown when it helps readability, and skip filler.";
-
-export const DEFAULT_LEAD_SYSTEM_PROMPT =
-  "You are the lead: the user's primary assistant and the one voice they talk " +
-  "to. You own this conversation, the user's high-level context, and the " +
-  "team's memory. You can act directly on your own computer with the shell, " +
-  "file, browser, desktop, and web_search tools, and you route work to the " +
-  "team. " +
-  "Projects are persistent managers that own a topic end to end — their " +
-  "computer, files, and detailed context — so the user can come back to that " +
-  "topic later. When the user asks for work that belongs to a project, check " +
-  "list_projects first: if a project matches, send the request with " +
-  "ask_project; if none matches, create_project and then ask_project. Never " +
-  "do a project's work yourself: route it and let the manager report back. " +
-  "Use spawn_worker directly only for one-off work that does not belong to a " +
-  "project. When no existing role fits the work, create_worker adds a " +
-  "persistent teammate and then you delegate to it; check list_roles first " +
-  "and reuse the roles the team already has. Write each request so the " +
-  "manager can act without this " +
-  "conversation: what the user wants, constraints, and the deliverable. " +
-  "Delegate when work is long, parallel, or risky so you stay responsive; do " +
-  "quick lookups and direct answers yourself. Never wait for work with sleep " +
-  "or polling loops: end your turn and you will be woken when a task " +
-  "finishes. When you report back, ground " +
-  "every fact in the evidence returned to you, keep each claim bound to its " +
-  "exact source, and separate verified facts from inference and unknowns. Use " +
-  "list_roles to see worker roles, worker_status to check on work, and " +
-  "cancel_worker to stop a task. Be concise, direct, and practical.";
 
 const LEGACY_SYSTEM_PROMPTS = [
   // The default before web_search was added to the tool list.
@@ -297,7 +258,6 @@ interface BotRow {
   model: string;
   effort?: string | null;
   created_at: string;
-  kind?: string | null;
   role?: string | null;
   avatar?: string | null;
   color?: string | null;
@@ -305,7 +265,6 @@ interface BotRow {
   computers?: string | null;
   workspace_id?: string | null;
   access?: string | null;
-  delegates?: number | null;
   policy?: string | null;
 }
 
@@ -318,29 +277,6 @@ interface WorkspaceRow {
   settings: string | null;
   created_at: string;
   last_seen_at: string;
-}
-
-interface TaskRow {
-  id: string;
-  lead_id: string;
-  role_id: string;
-  project_id?: string | null;
-  thread_id: string | null;
-  parent_id: string | null;
-  depth: number;
-  title: string;
-  brief: string;
-  status: string;
-  display: string;
-  grant: string | null;
-  budget: string | null;
-  usage: string | null;
-  result: string | null;
-  evidence: string | null;
-  error: string | null;
-  created_at: string;
-  started_at: string | null;
-  ended_at: string | null;
 }
 
 interface ThreadRow {
@@ -397,8 +333,6 @@ interface ApprovalRow {
   run_id: string | null;
   thread_id: string | null;
   bot_id: string | null;
-  task_id: string | null;
-  project_id: string | null;
   tool: string;
   arguments: string;
   tier: string;
@@ -416,8 +350,6 @@ function toApproval(row: ApprovalRow): ApprovalRecord {
     runId: row.run_id ?? null,
     threadId: row.thread_id ?? null,
     botId: row.bot_id ?? null,
-    taskId: row.task_id ?? null,
-    projectId: row.project_id ?? null,
     tool: row.tool,
     arguments: row.arguments,
     tier: row.tier as ApprovalTier,
@@ -587,48 +519,46 @@ function toEffort(value: string | null | undefined): ReasoningEffort | undefined
     : undefined;
 }
 
-/**
- * Normalize a computer capability set: valid kinds only, order preserved,
- * duplicates dropped. A missing value takes the fallback; an explicit empty
- * array means a chat-only agent and stays empty (ADR-021).
- */
-export function normalizeComputers(
-  value: unknown,
-  fallback: ComputerKind[] = ["firecracker"],
-): ComputerKind[] {
-  if (!Array.isArray(value)) {
-    return fallback;
-  }
-  const seen = new Set<ComputerKind>();
-  for (const item of value) {
-    if (item === "firecracker" || item === "mac") {
-      seen.add(item);
-    }
-  }
-  return [...seen];
-}
-
-function computersFor(row: BotRow): ComputerKind[] {
-  if (row.computers) {
-    try {
-      const parsed: unknown = JSON.parse(row.computers);
-      if (Array.isArray(parsed)) {
-        return normalizeComputers(parsed, []);
-      }
-    } catch {
-      // fall through to the legacy single-computer column
-    }
-  }
-  return normalizeComputers(row.computer ? [row.computer] : null);
-}
-
 function toAccess(value: string | null | undefined): AccessMode {
   return value === "home" || value === "full" ? value : "project";
 }
 
+function parseComputers(value: string | null | undefined): ComputerKind[] {
+  if (!value) {
+    return [];
+  }
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (Array.isArray(parsed)) {
+      return parsed.filter(
+        (item): item is ComputerKind => item === "mac" || item === "firecracker",
+      );
+    }
+  } catch {
+    // fall through
+  }
+  return [];
+}
+
+function serializeComputers(computers: ComputerKind[] | null | undefined): string {
+  return JSON.stringify(
+    (computers ?? []).filter(
+      (item) => item === "mac" || item === "firecracker",
+    ),
+  );
+}
+
+function toComputers(row: BotRow): ComputerKind[] {
+  const parsed = parseComputers(row.computers);
+  if (parsed.length > 0) {
+    return parsed;
+  }
+  // Legacy rows stored a single computer column.
+  return row.computer === "mac" ? ["mac"] : ["firecracker"];
+}
+
 function toBot(row: BotRow): Bot {
   const effort = toEffort(row.effort);
-  const computers = computersFor(row);
   return {
     id: row.id,
     name: row.name,
@@ -639,20 +569,12 @@ function toBot(row: BotRow): Bot {
       ...(effort ? { effort } : {}),
     },
     createdAt: row.created_at,
-    kind:
-      row.kind === "lead"
-        ? "lead"
-        : row.kind === "project"
-          ? "project"
-          : "role",
     role: row.role ?? null,
     avatar: row.avatar ?? null,
     color: row.color ?? null,
-    computer: computers[0] ?? null,
-    computers,
+    computers: toComputers(row),
     workspaceId: row.workspace_id ?? null,
     access: toAccess(row.access),
-    delegates: (row.delegates ?? 0) !== 0,
     policy: (row.policy as RolePolicy) ?? "inherit",
   };
 }
@@ -692,41 +614,6 @@ function toWorkspace(row: WorkspaceRow): Workspace {
     autoApprove,
     createdAt: row.created_at,
     lastSeenAt: row.last_seen_at,
-  };
-}
-
-function toTask(row: TaskRow): Task {
-  const parseJson = <T>(value: string | null): T | null => {
-    if (!value) {
-      return null;
-    }
-    try {
-      return JSON.parse(value) as T;
-    } catch {
-      return null;
-    }
-  };
-  return {
-    id: row.id,
-    leadId: row.lead_id,
-    roleId: row.role_id,
-    projectId: row.project_id ?? null,
-    threadId: row.thread_id ?? null,
-    parentId: row.parent_id ?? null,
-    depth: row.depth ?? 0,
-    title: row.title,
-    brief: row.brief,
-    status: row.status as TaskStatus,
-    display: row.display as TaskDisplay,
-    grant: parseJson<TaskGrant>(row.grant),
-    budget: parseJson<TaskBudget>(row.budget),
-    usage: parseJson<TaskUsage>(row.usage),
-    result: row.result ?? null,
-    evidence: row.evidence ?? null,
-    error: row.error ?? null,
-    createdAt: row.created_at,
-    startedAt: row.started_at ?? null,
-    endedAt: row.ended_at ?? null,
   };
 }
 
@@ -824,60 +711,24 @@ function toMessage(row: MessageRow): Message {
 export class Store {
   constructor(private readonly db: DatabaseSync) {}
 
-  ensureLeadBot(defaultModel: ModelRef): Bot {
+  /** Seed a single default agent when the install has no bots yet. */
+  ensureDefaultBot(defaultModel: ModelRef): Bot {
     const bots = this.listBots();
-    const existing = bots.find((bot) => bot.kind === "lead");
+    const existing = bots[0] ?? null;
     if (existing) {
-      // Keep the lead's routing contract current across releases without
-      // touching a prompt the user genuinely customized.
-      if (
-        existing.systemPrompt.startsWith("You are the lead:") ||
-        isDefaultSystemPrompt(existing)
-      ) {
+      if (isDefaultSystemPrompt(existing)) {
         this.db
           .prepare("UPDATE bots SET system_prompt = ? WHERE id = ?")
-          .run(DEFAULT_LEAD_SYSTEM_PROMPT, existing.id);
-      }
-      // The lead orchestrates work on either side of the fence, so its
-      // capability set stays open (ADR-021), and it runs on the user's own
-      // machine with full reach (ADR-023).
-      if (!LEAD_COMPUTERS.every((kind) => existing.computers.includes(kind))) {
-        this.db
-          .prepare("UPDATE bots SET computers = ?, computer = ? WHERE id = ?")
-          .run(JSON.stringify(LEAD_COMPUTERS), LEAD_PRIMARY, existing.id);
-      }
-      if (existing.access !== LEAD_ACCESS) {
-        this.db
-          .prepare("UPDATE bots SET access = ? WHERE id = ?")
-          .run(LEAD_ACCESS, existing.id);
+          .run(DEFAULT_SYSTEM_PROMPT, existing.id);
       }
       return this.getBot(existing.id)!;
     }
-    const candidate = bots[0];
-    if (candidate) {
-      const systemPrompt = isDefaultSystemPrompt(candidate)
-        ? DEFAULT_LEAD_SYSTEM_PROMPT
-        : candidate.systemPrompt;
-      this.db
-        .prepare(
-          "UPDATE bots SET kind = 'lead', system_prompt = ?, computers = ?, computer = ?, access = ? WHERE id = ?",
-        )
-        .run(
-          systemPrompt,
-          JSON.stringify(LEAD_COMPUTERS),
-          LEAD_PRIMARY,
-          LEAD_ACCESS,
-          candidate.id,
-        );
-      return this.getBot(candidate.id)!;
-    }
     return this.createBot({
       name: DEFAULT_BOT_NAME,
-      systemPrompt: DEFAULT_LEAD_SYSTEM_PROMPT,
+      systemPrompt: DEFAULT_SYSTEM_PROMPT,
       model: defaultModel,
-      kind: "lead",
-      computers: LEAD_COMPUTERS,
-      access: LEAD_ACCESS,
+      computers: ["firecracker"],
+      access: "project",
     });
   }
 
@@ -903,43 +754,36 @@ export class Store {
     name: string;
     systemPrompt: string;
     model: ModelRef;
-    kind?: BotKind;
     role?: string | null;
     avatar?: string | null;
     color?: string | null;
     computer?: string | null;
-    computers?: ComputerKind[];
+    computers?: ComputerKind[] | null;
     workspaceId?: string | null;
     access?: AccessMode;
-    delegates?: boolean;
     policy?: RolePolicy;
   }): Bot {
     const computers: ComputerKind[] =
-      input.computers !== undefined
-        ? normalizeComputers(input.computers, [])
-        : input.computer
-          ? normalizeComputers([input.computer], ["firecracker"])
-          : ["firecracker"];
+      (input.computers ?? []).length > 0
+        ? (input.computers as ComputerKind[])
+        : (input.computer === "mac" ? ["mac"] : ["firecracker"]);
     const bot: Bot = {
       id: randomUUID(),
       name: input.name,
       systemPrompt: input.systemPrompt,
       model: input.model,
       createdAt: new Date().toISOString(),
-      kind: input.kind ?? "role",
       role: input.role ?? null,
       avatar: input.avatar ?? null,
       color: input.color ?? null,
-      computer: computers[0] ?? null,
       computers,
       workspaceId: input.workspaceId ?? null,
       access: input.access ?? "project",
-      delegates: input.delegates ?? false,
       policy: input.policy ?? "inherit",
     };
     this.db
       .prepare(
-        "INSERT INTO bots (id, name, system_prompt, provider, model, effort, created_at, kind, role, avatar, color, computer, computers, workspace_id, access, delegates, policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO bots (id, name, system_prompt, provider, model, effort, created_at, role, avatar, color, computer, computers, workspace_id, access, policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         bot.id,
@@ -949,15 +793,13 @@ export class Store {
         bot.model.model,
         bot.model.effort ?? null,
         bot.createdAt,
-        bot.kind,
         bot.role ?? null,
         bot.avatar ?? null,
         bot.color ?? null,
-        bot.computer ?? null,
-        JSON.stringify(bot.computers),
+        computers.includes("firecracker") ? "firecracker" : "mac",
+        serializeComputers(computers),
         bot.workspaceId ?? null,
         bot.access,
-        bot.delegates ? 1 : 0,
         bot.policy,
       );
     return bot;
@@ -971,10 +813,9 @@ export class Store {
       avatar?: string | null;
       color?: string | null;
       computer?: string | null;
-      computers?: ComputerKind[];
+      computers?: ComputerKind[] | null;
       workspaceId?: string | null;
       access?: AccessMode;
-      delegates?: boolean;
       policy?: RolePolicy;
       model?: ModelRef;
     },
@@ -988,24 +829,24 @@ export class Store {
     if (patch.role !== undefined) fields.push(["role", patch.role]);
     if (patch.avatar !== undefined) fields.push(["avatar", patch.avatar]);
     if (patch.color !== undefined) fields.push(["color", patch.color]);
-    if (patch.computers !== undefined || patch.computer !== undefined) {
-      const computers =
-        patch.computers !== undefined
-          ? normalizeComputers(patch.computers, [])
-          : patch.computer
-            ? normalizeComputers([patch.computer], ["firecracker"])
-            : ["firecracker"];
-      fields.push(["computers", JSON.stringify(computers)]);
-      fields.push(["computer", computers[0] ?? null]);
+    if (patch.computers !== undefined) {
+      const computers: ComputerKind[] =
+        (patch.computers ?? []).length > 0
+          ? (patch.computers as ComputerKind[])
+          : ["firecracker"];
+      fields.push(["computer", computers.includes("firecracker") ? "firecracker" : "mac"]);
+      fields.push(["computers", serializeComputers(computers)]);
+    } else if (patch.computer !== undefined) {
+      const computers: ComputerKind[] =
+        patch.computer === "mac" ? ["mac"] : ["firecracker"];
+      fields.push(["computer", patch.computer === "mac" ? "mac" : "firecracker"]);
+      fields.push(["computers", serializeComputers(computers)]);
     }
     if (patch.workspaceId !== undefined) {
       fields.push(["workspace_id", patch.workspaceId]);
     }
     if (patch.access !== undefined) {
       fields.push(["access", patch.access]);
-    }
-    if (patch.delegates !== undefined) {
-      fields.push(["delegates", patch.delegates ? 1 : 0]);
     }
     if (patch.policy !== undefined) {
       fields.push(["policy", patch.policy]);
@@ -1029,7 +870,6 @@ export class Store {
     }
     this.db.exec("BEGIN");
     try {
-      this.db.prepare("DELETE FROM tasks WHERE project_id = ?").run(id);
       this.deleteThreadsForBot(id);
       this.db.prepare("DELETE FROM bots WHERE id = ?").run(id);
       this.db.exec("COMMIT");
@@ -1164,8 +1004,6 @@ export class Store {
     }
     this.db.exec("BEGIN");
     try {
-      this.db.prepare("DELETE FROM tasks WHERE role_id = ?").run(id);
-      this.db.prepare("DELETE FROM tasks WHERE project_id = ?").run(id);
       this.deleteThreadsForBot(id);
       this.db.exec("COMMIT");
     } catch (error) {
@@ -1402,198 +1240,6 @@ export class Store {
         `UPDATE messages SET folded_at = ? WHERE thread_id = ? AND id IN (${placeholders})`,
       )
       .run(foldedAt, threadId, ...ids);
-  }
-
-  createTask(input: {
-    leadId: string;
-    roleId: string;
-    title: string;
-    brief: string;
-    projectId?: string | null;
-    threadId?: string | null;
-    parentId?: string | null;
-    depth?: number;
-    display?: TaskDisplay;
-    grant?: TaskGrant | null;
-    budget?: TaskBudget | null;
-  }): Task {
-    const thread = input.threadId
-      ? (this.getThread(input.threadId) ??
-        this.createThread(input.roleId, input.title))
-      : this.createThread(input.roleId, input.title);
-    const task: Task = {
-      id: randomUUID(),
-      leadId: input.leadId,
-      roleId: input.roleId,
-      projectId: input.projectId ?? null,
-      threadId: thread.id,
-      parentId: input.parentId ?? null,
-      depth: input.depth ?? 0,
-      title: input.title,
-      brief: input.brief,
-      status: "queued",
-      display: input.display ?? "none",
-      grant: input.grant ?? null,
-      budget: input.budget ?? null,
-      usage: null,
-      result: null,
-      evidence: null,
-      error: null,
-      createdAt: new Date().toISOString(),
-      startedAt: null,
-      endedAt: null,
-    };
-    this.db
-      .prepare(
-        "INSERT INTO tasks (id, lead_id, role_id, project_id, thread_id, parent_id, depth, title, brief, status, display, grant, budget, usage, result, evidence, error, created_at, started_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      )
-      .run(
-        task.id,
-        task.leadId,
-        task.roleId,
-        task.projectId ?? null,
-        task.threadId,
-        task.parentId,
-        task.depth,
-        task.title,
-        task.brief,
-        task.status,
-        task.display,
-        task.grant ? JSON.stringify(task.grant) : null,
-        task.budget ? JSON.stringify(task.budget) : null,
-        task.usage ? JSON.stringify(task.usage) : null,
-        task.result,
-        task.evidence,
-        task.error,
-        task.createdAt,
-        task.startedAt,
-        task.endedAt,
-      );
-    return task;
-  }
-
-  updateTask(
-    id: string,
-    patch: {
-      status?: TaskStatus;
-      result?: string | null;
-      evidence?: string | null;
-      error?: string | null;
-      usage?: TaskUsage | null;
-      startedAt?: string | null;
-      endedAt?: string | null;
-    },
-  ): Task | null {
-    if (!this.getTask(id)) {
-      return null;
-    }
-    const fields: Array<[string, string | null]> = [];
-    if (patch.status !== undefined) fields.push(["status", patch.status]);
-    if (patch.result !== undefined) fields.push(["result", patch.result]);
-    if (patch.evidence !== undefined) fields.push(["evidence", patch.evidence]);
-    if (patch.error !== undefined) fields.push(["error", patch.error]);
-    if (patch.usage !== undefined)
-      fields.push(["usage", patch.usage ? JSON.stringify(patch.usage) : null]);
-    if (patch.startedAt !== undefined)
-      fields.push(["started_at", patch.startedAt]);
-    if (patch.endedAt !== undefined) fields.push(["ended_at", patch.endedAt]);
-    for (const [column, value] of fields) {
-      this.db
-        .prepare(`UPDATE tasks SET ${column} = ? WHERE id = ?`)
-        .run(value, id);
-    }
-    return this.getTask(id);
-  }
-
-  getTask(id: string): Task | null {
-    const row = this.db
-      .prepare("SELECT * FROM tasks WHERE id = ?")
-      .get(id) as unknown as TaskRow | undefined;
-    return row ? toTask(row) : null;
-  }
-
-  listTasks(limit = 100): Task[] {
-    const rows = this.db
-      .prepare("SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?")
-      .all(limit) as unknown as TaskRow[];
-    return rows.map(toTask);
-  }
-
-  listTasksForRole(roleId: string): Task[] {
-    const rows = this.db
-      .prepare("SELECT * FROM tasks WHERE role_id = ? ORDER BY created_at DESC")
-      .all(roleId) as unknown as TaskRow[];
-    return rows.map(toTask);
-  }
-
-  activeTaskForRole(roleId: string): Task | null {
-    const row = this.db
-      .prepare(
-        "SELECT * FROM tasks WHERE role_id = ? AND status IN ('queued', 'running') ORDER BY created_at ASC LIMIT 1",
-      )
-      .get(roleId) as unknown as TaskRow | undefined;
-    return row ? toTask(row) : null;
-  }
-
-  listChildTasks(parentId: string): Task[] {
-    const rows = this.db
-      .prepare(
-        "SELECT * FROM tasks WHERE parent_id = ? ORDER BY created_at ASC",
-      )
-      .all(parentId) as unknown as TaskRow[];
-    return rows.map(toTask);
-  }
-
-  countActiveChildren(parentId: string): number {
-    const row = this.db
-      .prepare(
-        "SELECT COUNT(*) AS count FROM tasks WHERE parent_id = ? AND status IN ('queued', 'running')",
-      )
-      .get(parentId) as unknown as { count: number } | undefined;
-    return row?.count ?? 0;
-  }
-
-  nextQueuedTaskForRole(roleId: string): Task | null {
-    const row = this.db
-      .prepare(
-        "SELECT * FROM tasks WHERE role_id = ? AND status = 'queued' ORDER BY created_at ASC LIMIT 1",
-      )
-      .get(roleId) as unknown as TaskRow | undefined;
-    return row ? toTask(row) : null;
-  }
-
-  nextQueuedTask(): Task | null {
-    const row = this.db
-      .prepare(
-        "SELECT * FROM tasks WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1",
-      )
-      .get() as unknown as TaskRow | undefined;
-    return row ? toTask(row) : null;
-  }
-
-  listQueuedTasks(): Task[] {
-    const rows = this.db
-      .prepare(
-        "SELECT * FROM tasks WHERE status = 'queued' ORDER BY created_at ASC",
-      )
-      .all() as unknown as TaskRow[];
-    return rows.map(toTask);
-  }
-
-  listTasksForProject(projectId: string): Task[] {
-    const rows = this.db
-      .prepare("SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC")
-      .all(projectId) as unknown as TaskRow[];
-    return rows.map(toTask);
-  }
-
-  activeRequestForProject(projectId: string): Task | null {
-    const row = this.db
-      .prepare(
-        "SELECT * FROM tasks WHERE project_id = ? AND role_id = project_id AND status IN ('queued', 'running') ORDER BY created_at ASC LIMIT 1",
-      )
-      .get(projectId) as unknown as TaskRow | undefined;
-    return row ? toTask(row) : null;
   }
 
   listProviders(): ProviderRecord[] {
@@ -1993,8 +1639,6 @@ export class Store {
     runId?: string | null;
     threadId?: string | null;
     botId?: string | null;
-    taskId?: string | null;
-    projectId?: string | null;
     tool: string;
     arguments: string;
     tier: string;
@@ -2006,8 +1650,6 @@ export class Store {
       runId: input.runId ?? null,
       threadId: input.threadId ?? null,
       botId: input.botId ?? null,
-      taskId: input.taskId ?? null,
-      projectId: input.projectId ?? null,
       tool: input.tool,
       arguments: input.arguments,
       tier: input.tier as ApprovalTier,
@@ -2019,7 +1661,7 @@ export class Store {
     };
     this.db
       .prepare(
-        "INSERT INTO approvals (id, request_id, run_id, thread_id, bot_id, task_id, project_id, tool, arguments, tier, reason, decision, decided_by, requested_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO approvals (id, request_id, run_id, thread_id, bot_id, tool, arguments, tier, reason, decision, decided_by, requested_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         record.id,
@@ -2027,8 +1669,6 @@ export class Store {
         record.runId,
         record.threadId,
         record.botId,
-        record.taskId,
-        record.projectId,
         record.tool,
         record.arguments,
         record.tier,
@@ -2076,6 +1716,20 @@ export class Store {
       )
       .all() as unknown as ApprovalRow[];
     return rows.map(toApproval);
+  }
+
+  /**
+   * A restart abandons the runs that were waiting on a card, so their pending
+   * approvals can never be answered; mark them aborted instead of leaving a
+   * stale pending count in the inbox.
+   */
+  expirePendingApprovals(): number {
+    const result = this.db
+      .prepare(
+        "UPDATE approvals SET decision = 'abort', decided_by = 'abort', decided_at = ? WHERE decision IS NULL",
+      )
+      .run(new Date().toISOString());
+    return Number(result.changes);
   }
 
   private uniqueProviderId(base: string): string {

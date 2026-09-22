@@ -1,4 +1,5 @@
-import type { Bot, ComputerKind, ReasoningEffort } from "@openbot/protocol";
+import type { Bot, ReasoningEffort } from "@openbot/protocol";
+import { botHasComputer } from "@openbot/protocol";
 import type { SandboxState } from "./useDaemon";
 
 export const AVATAR_COLORS = [
@@ -40,36 +41,24 @@ export const COMPUTER_LABEL: Record<SandboxState, string> = {
 };
 
 /**
- * The computers an agent may act on (ADR-021), tolerating bots from before the
- * capability set existed: a missing list falls back to the legacy single kind.
+ * Whether an agent can act on the microVM or the user's Mac. An agent has a
+ * computer capability set; a missing value means the microVM only.
  */
-export function botComputers(
-  bot: Pick<Bot, "computers" | "computer"> | null | undefined,
-): ComputerKind[] {
-  if (!bot) {
-    return [];
-  }
-  if (bot.computers && bot.computers.length > 0) {
-    return bot.computers;
-  }
-  return bot.computer === "mac" ? ["mac"] : ["firecracker"];
-}
-
 export function hasVm(
-  bot: Pick<Bot, "computers" | "computer"> | null | undefined,
+  bot: Pick<Bot, "computers"> | null | undefined,
 ): boolean {
-  return botComputers(bot).includes("firecracker");
+  return !bot || botHasComputer(bot, "firecracker");
 }
 
 export function hasMac(
-  bot: Pick<Bot, "computers" | "computer"> | null | undefined,
+  bot: Pick<Bot, "computers"> | null | undefined,
 ): boolean {
-  return botComputers(bot).includes("mac");
+  return bot ? botHasComputer(bot, "mac") : false;
 }
 
-/** This Mac only: no microVM, so screen and terminal have nothing to attach to. */
+/** This Mac only: no microVM, so screen and the VM terminal have nothing to attach to. */
 export function isMacOnly(
-  bot: Pick<Bot, "computers" | "computer"> | null | undefined,
+  bot: Pick<Bot, "computers"> | null | undefined,
 ): boolean {
   return hasMac(bot) && !hasVm(bot);
 }

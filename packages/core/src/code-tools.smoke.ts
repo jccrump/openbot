@@ -476,7 +476,7 @@ const fileOptions = {
   sandbox: null,
   getBot: (botId: string): Bot | null =>
     botId === "code-tools-smoke"
-      ? ({ id: botId, computer: "mac" } as Bot)
+      ? ({ id: botId, computers: ["mac"] } as Bot)
       : null,
 };
 

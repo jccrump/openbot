@@ -14,7 +14,6 @@ export interface DecisionSettings {
   apiKeyEnv: string | null;
   audit: boolean;
   browse: boolean;
-  route: boolean;
   guardrail: DecisionGuardrailMode;
   timeoutMs: number;
 }
@@ -25,12 +24,11 @@ export interface DecisionRuntime {
 }
 
 export interface DecisionNotice {
-  kind: "audit" | "browse" | "route" | "guardrail";
+  kind: "audit" | "browse" | "guardrail";
   summary: string;
   flagged: boolean;
   latencyMs: number | null;
   model: string | null;
-  route?: "chat" | "direct" | "project" | "new_project";
 }
 
 export const DEFAULT_DECISION_SETTINGS: DecisionSettings = {
@@ -41,7 +39,6 @@ export const DEFAULT_DECISION_SETTINGS: DecisionSettings = {
   apiKeyEnv: "TYPESAFE_API_KEY",
   audit: true,
   browse: true,
-  route: true,
   guardrail: "annotate",
   timeoutMs: 3_000,
 };
@@ -80,7 +77,6 @@ export function normalizeDecisionSettings(
           : base.apiKeyEnv,
     audit: typeof source.audit === "boolean" ? source.audit : base.audit,
     browse: typeof source.browse === "boolean" ? source.browse : base.browse,
-    route: typeof source.route === "boolean" ? source.route : base.route,
     guardrail: isGuardrailMode(source.guardrail)
       ? source.guardrail
       : base.guardrail,
@@ -152,7 +148,6 @@ export function decisionInfo(
     apiKeyEnv: settings.apiKeyEnv,
     audit: settings.audit,
     browse: settings.browse,
-    route: settings.route,
     guardrail: settings.guardrail,
     timeoutMs: settings.timeoutMs,
   };

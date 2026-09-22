@@ -213,38 +213,6 @@ body {
   background: var(--row-selected);
 }
 
-.thread-disclosure {
-  width: 14px;
-  height: 14px;
-  margin-left: 4px;
-  flex-shrink: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-  transform: rotate(-90deg);
-  transition: transform 120ms ease, color 120ms ease;
-}
-
-.thread-disclosure:hover {
-  color: var(--text);
-}
-
-.thread-disclosure-open {
-  transform: rotate(0deg);
-}
-
-.thread-disclosure-spacer {
-  width: 14px;
-  margin-left: 4px;
-  flex-shrink: 0;
-}
-
 .thread-dot {
   width: 8px;
   height: 8px;
@@ -512,42 +480,6 @@ body {
   align-items: center;
   gap: 6px;
   flex-shrink: 0;
-}
-
-.panel-resizer {
-  flex: 0 0 6px;
-  position: relative;
-  cursor: col-resize;
-  z-index: 5;
-}
-
-.panel-resizer::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 2px;
-  right: 2px;
-  background: transparent;
-  transition: background 120ms ease;
-}
-
-.panel-resizer:hover::after,
-body.resizing .panel-resizer::after {
-  background: var(--hairline);
-}
-
-.panel-resizer-hidden {
-  display: none;
-}
-
-body.resizing {
-  user-select: none;
-  cursor: col-resize;
-}
-
-body.resizing .screen-panel * {
-  pointer-events: none !important;
 }
 
 .model-pill {
@@ -1659,6 +1591,22 @@ body.resizing .screen-panel * {
   cursor: pointer;
 }
 
+.remember-button {
+  height: 30px;
+  padding: 0 14px;
+  border-radius: 999px;
+  border: 0.5px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.remember-button:hover {
+  background: var(--hover);
+}
+
 .approval-resolved {
   background: var(--bubble);
   border-color: transparent;
@@ -1719,27 +1667,53 @@ body.resizing .screen-panel * {
   color: var(--text-secondary);
 }
 
-/* Screen panel */
+/* The computer column: a single stack of panels on the right. Its bar holds
+   the computer switcher on the left and the panel toggles on the right. */
 
-.screen-panel {
-  width: var(--screen-width, 40%);
-  min-width: 260px;
-  max-width: 700px;
-  flex-shrink: 1;
+.panel-column {
+  flex: 0 0 400px;
+  max-width: 46%;
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 14px;
-  overflow: hidden;
-  background: var(--bg-chat);
-  border: 1px solid var(--border);
-  border-radius: 14px;
+  min-height: 0;
+  z-index: 12;
+}
+
+/* With every panel collapsed the column keeps just its bar, so the computer
+   switcher and the panel toggles stay reachable. */
+.panel-column-empty {
+  flex: 0 0 auto;
+  max-width: none;
+}
+
+.panel-column-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.panel-column-title {
+  padding: 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.panel-column-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 
 .panel-stack {
   display: flex;
   flex-direction: column;
-  flex: 1;
+  gap: 10px;
+  flex: 1 1 auto;
   min-height: 0;
 }
 
@@ -1749,10 +1723,47 @@ body.resizing .screen-panel * {
   flex: 1 1 0;
   min-height: 0;
   overflow: hidden;
+  padding: 10px 12px;
+  background: var(--bg-chat);
+  border: 1px solid var(--border);
+  border-radius: 14px;
 }
 
-.panel-section-collapsed {
+.panel-section-screen {
+  flex: 1 1 auto;
+}
+
+.computer-tabs {
+  display: flex;
+  gap: 4px;
   flex: 0 0 auto;
+  padding: 4px;
+  background: var(--bg-chat);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+  pointer-events: auto;
+}
+
+.computer-tab {
+  padding: 4px 12px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.computer-tab:hover {
+  color: var(--text);
+}
+
+.computer-tab-active {
+  background: var(--hover);
+  color: var(--text);
 }
 
 .panel-section-header {
@@ -1819,41 +1830,6 @@ body.resizing .screen-panel * {
   display: none;
 }
 
-.panel-section-resizer {
-  position: relative;
-  flex: 0 0 10px;
-  cursor: row-resize;
-}
-
-.panel-section-resizer::after {
-  content: "";
-  position: absolute;
-  left: 4px;
-  right: 4px;
-  top: 4px;
-  height: 1px;
-  background: transparent;
-  transition: background 120ms ease;
-}
-
-.panel-section-resizer:hover::after,
-body.resizing-rows .panel-section-resizer::after {
-  background: var(--hairline);
-}
-
-body.resizing-rows {
-  user-select: none;
-  cursor: row-resize;
-}
-
-body.resizing-rows .screen-panel * {
-  pointer-events: none !important;
-}
-
-.panel-collapse {
-  flex-shrink: 0;
-}
-
 /* Files */
 
 .files-panel {
@@ -1880,34 +1856,6 @@ body.resizing-rows .screen-panel * {
 .files-toolbar .icon-button:disabled {
   opacity: 0.35;
   cursor: default;
-}
-
-.files-computer-switch {
-  display: flex;
-  align-items: center;
-  flex-shrink: 0;
-  border: 0.5px solid var(--border);
-  border-radius: 8px;
-  overflow: hidden;
-}
-
-.files-computer-option {
-  padding: 2px 7px;
-  border: 0;
-  background: transparent;
-  color: var(--text-muted);
-  font-family: inherit;
-  font-size: 11px;
-  cursor: pointer;
-}
-
-.files-computer-option:hover {
-  background: var(--hover);
-}
-
-.files-computer-option-active {
-  background: var(--hover);
-  color: var(--text);
 }
 
 .files-breadcrumb {
@@ -2215,28 +2163,33 @@ body.resizing-rows .screen-panel * {
   overflow: hidden;
 }
 
-/* The expanded screen is the panel itself: it breaks out of the layout and
+/* The expanded screen is the column itself: it breaks out of the layout and
    covers the window. */
-.screen-panel-expanded {
+.panel-column-expanded {
   position: fixed;
   inset: 10px;
   z-index: 26;
   width: auto;
-  min-width: 0;
   max-width: none;
-  border-radius: 14px;
+  padding: 10px;
+  background: var(--bg-chat);
   border: 1px solid var(--border);
+  border-radius: 14px;
   overflow: hidden;
+}
+
+.panel-column-expanded .panel-section {
+  flex: 1 1 auto;
 }
 
 /* The frame lives inside .screen-view, so the whole chain has to stretch for
    the canvas to get a real height (a 0-height frame scales the canvas to 0). */
-.screen-panel-expanded .screen-view {
+.panel-column-expanded .screen-view {
   flex: 1;
   min-height: 0;
 }
 
-.screen-panel-expanded .screen-frame {
+.panel-column-expanded .screen-frame {
   flex: 1;
   aspect-ratio: auto;
   min-height: 0;
@@ -2372,12 +2325,41 @@ body.resizing-rows .screen-panel * {
   flex-shrink: 0;
 }
 
+/* The left column holds the agent rail and pins Settings to the bottom-left
+   corner of the window. */
+.rail-column {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+}
+
+.shell-settings {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  margin-top: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-chat);
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0;
+}
+
+.shell-settings:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
 /* The thread rail floats left of the chat and grows with its list. */
 .thread-rail {
   flex: 0 1 auto;
   width: 232px;
   min-width: 168px;
-  align-self: flex-start;
   max-height: 100%;
   min-height: 0;
   display: flex;
@@ -3122,62 +3104,6 @@ body.resizing-rows .screen-panel * {
   padding: 0 14px 12px;
 }
 
-/* Team roster in Settings: color dot, name, model, computer. */
-.team-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  padding: 10px 14px;
-  border: none;
-  border-bottom: 0.5px solid var(--hairline);
-  background: none;
-  color: inherit;
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-}
-
-.team-row:last-child {
-  border-bottom: none;
-}
-
-.team-row:hover {
-  background: var(--hover);
-}
-
-.team-row .avatar {
-  flex-shrink: 0;
-}
-
-.team-row-body {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  min-width: 0;
-  flex: 1;
-}
-
-.team-row-name {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text);
-}
-
-.team-row-sub {
-  font-size: 12px;
-  color: var(--text-muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.team-row-state {
-  flex-shrink: 0;
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
 .settings-card .field-note {
   padding: 10px 14px 12px;
   margin: 0;
@@ -3596,425 +3522,6 @@ body.resizing-rows .screen-panel * {
   line-height: 1;
   cursor: pointer;
   padding: 0;
-}
-
-/* Lead, team, and work */
-
-.lead-row {
-  margin-bottom: 2px;
-}
-
-.lead-badge {
-  flex: none;
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--text-muted);
-  background: var(--badge-bg);
-  border-radius: 999px;
-  padding: 2px 7px;
-}
-
-.task-count {
-  flex: none;
-  min-width: 17px;
-  height: 17px;
-  padding: 0 5px;
-  border-radius: 999px;
-  background: var(--accent);
-  color: var(--accent-contrast);
-  font-size: 10px;
-  font-weight: 600;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.task-dot {
-  flex: none;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--text-muted);
-}
-
-.task-dot-running {
-  background: var(--accent);
-  animation: task-pulse 1.4s ease-in-out infinite;
-}
-
-.task-dot-queued {
-  background: var(--amber);
-}
-
-.task-dot-done {
-  background: var(--green);
-}
-
-.task-dot-failed {
-  background: var(--red);
-}
-
-.task-dot-cancelled {
-  background: var(--text-muted);
-}
-
-@keyframes task-pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.35;
-  }
-}
-
-.workboard {
-  border-bottom: 1px solid var(--hairline);
-  padding: 8px 16px 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  max-height: 200px;
-  overflow-y: auto;
-}
-
-.workboard-row {
-  display: flex;
-  gap: 8px;
-  overflow-x: auto;
-  padding-bottom: 8px;
-}
-
-.task-chip {
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  border: 1px solid var(--border);
-  background: var(--bg-elevated);
-  border-radius: 999px;
-  padding: 5px 11px;
-  font: inherit;
-  font-size: 12px;
-  color: var(--text);
-  cursor: pointer;
-}
-
-.task-chip:hover {
-  background: var(--hover);
-}
-
-.task-chip-title {
-  font-weight: 500;
-  max-width: 220px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.task-chip-meta {
-  color: var(--text-muted);
-  white-space: nowrap;
-}
-
-.workboard-approvals {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding-bottom: 8px;
-}
-
-.ghost-button {
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--text);
-  border-radius: 8px;
-  padding: 5px 11px;
-  font: inherit;
-  font-size: 12.5px;
-  cursor: pointer;
-}
-
-.ghost-button:hover {
-  background: var(--hover);
-}
-
-.task-summary {
-  width: 100%;
-  border: 1px solid var(--hairline);
-  background: var(--bg-detail);
-  border-radius: 12px;
-  padding: 14px 16px;
-  margin-bottom: 18px;
-}
-
-.task-summary h2 {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--text-muted);
-  margin: 0 0 6px;
-}
-
-.task-summary h2:not(:first-child) {
-  margin-top: 16px;
-}
-
-.task-brief {
-  white-space: pre-wrap;
-  margin: 0;
-  font-size: 13.5px;
-  line-height: 1.5;
-}
-
-.task-evidence {
-  margin-top: 14px;
-}
-
-.task-evidence summary {
-  cursor: pointer;
-  color: var(--text-secondary);
-  font-size: 13px;
-}
-
-.task-evidence pre {
-  margin-top: 8px;
-  padding: 10px 12px;
-  border-radius: 8px;
-  background: var(--bg-elevated);
-  font-size: 11.5px;
-  line-height: 1.5;
-  overflow-x: auto;
-  white-space: pre-wrap;
-  color: var(--text-secondary);
-}
-
-.task-meta {
-  width: 100%;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px 24px;
-  margin-bottom: 18px;
-  padding: 0 2px;
-}
-
-.task-meta-item {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  font-size: 12.5px;
-  color: var(--text);
-}
-
-.task-meta-label {
-  font-size: 10.5px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--text-muted);
-}
-
-.task-children {
-  width: 100%;
-  margin-bottom: 18px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.task-children h2 {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--text-muted);
-  margin: 0 0 2px;
-}
-
-.task-child-row {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 8px 12px;
-  border: 1px solid var(--hairline);
-  background: var(--bg-detail);
-  border-radius: 10px;
-  font: inherit;
-  font-size: 13px;
-  color: var(--text);
-  cursor: pointer;
-  text-align: left;
-}
-
-.task-child-row:hover {
-  background: var(--hover);
-}
-
-.task-child-title {
-  font-weight: 500;
-}
-
-.task-child-meta {
-  margin-left: auto;
-  color: var(--text-muted);
-  font-size: 12px;
-  white-space: nowrap;
-}
-
-/* Task watch overlay */
-
-.watch-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 40;
-  background: rgba(0, 0, 0, 0.55);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 32px;
-}
-
-.watch-frame {
-  width: min(1100px, 92vw);
-  height: min(760px, 88vh);
-  background: var(--bg-chat);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  box-shadow: var(--shadow-toast);
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-
-.watch-bar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--hairline);
-}
-
-.watch-title {
-  font-size: 13.5px;
-  font-weight: 600;
-  letter-spacing: -0.15px;
-}
-
-.watch-status {
-  margin-left: auto;
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
-.watch-view {
-  position: relative;
-  flex: 1;
-  min-height: 0;
-  overflow: hidden;
-  background: var(--screen-bg);
-}
-
-/* Thread drawer: a frosted page that slides up over the chat. It is not a
-   modal — the chat behind it is neither dimmed nor blocked, so clicking a
-   thread never takes the conversation away. */
-.drawer-layer {
-  position: absolute;
-  inset: 0;
-  /* Reach past the shell's bottom padding so the drawer sits flush with the
-     window edge instead of floating above a gap. */
-  bottom: -10px;
-  z-index: 30;
-  display: flex;
-  flex-direction: column;
-  justify-content: flex-end;
-  pointer-events: none;
-}
-
-.thread-drawer {
-  pointer-events: auto;
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  height: min(88%, 940px);
-  border-radius: 18px 18px 0 0;
-  border: 1px solid var(--border);
-  border-bottom: none;
-  background: var(--bg-chat);
-  overflow: hidden;
-  animation: drawer-in 0.24s cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.drawer-bar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 9px 12px;
-  border-bottom: 0.5px solid var(--hairline);
-  flex-shrink: 0;
-}
-
-.drawer-grip {
-  width: 34px;
-  height: 4px;
-  border-radius: 9999px;
-  background: var(--border);
-  flex-shrink: 0;
-}
-
-.drawer-title {
-  flex: 1;
-  min-width: 0;
-  font-size: 13px;
-  font-weight: 600;
-  letter-spacing: -0.15px;
-  color: var(--text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* The drawer bar carries the controls, so the floating cluster would only
-   overlap it. */
-.thread-drawer .chat-float-actions {
-  display: none;
-}
-
-.thread-drawer .transcript {
-  padding-top: 14px;
-}
-
-@keyframes drawer-in {
-  from {
-    transform: translateY(102%);
-  }
-  to {
-    transform: translateY(0);
-  }
-}
-
-.thread-drawer-closing {
-  animation: drawer-out 0.2s cubic-bezier(0.4, 0, 1, 1) forwards;
-}
-
-@keyframes drawer-out {
-  from {
-    transform: translateY(0);
-  }
-  to {
-    transform: translateY(102%);
-  }
-}
-
-/* Keep a hair of duration so the slide-out still fires its animationend (the
-   drawer unmounts on that event). */
-@media (prefers-reduced-motion: reduce) {
-  .thread-drawer,
-  .thread-drawer-closing {
-    animation-duration: 0.01s;
-  }
 }
 
 /* The chat belongs to the main agent, which is not one of the threads: a slim

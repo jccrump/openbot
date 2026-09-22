@@ -105,20 +105,16 @@ function formatDate(mtime: number | null): string {
 
 export function FilesPanel({
   botId,
-  computers,
   computer,
   rootLabel: rootLabelProp,
-  onComputerChange,
   active,
   listFiles,
   readFile,
 }: {
   botId: string;
-  computers: ComputerKind[];
   computer: ComputerKind;
   /** Shown for the root crumb; defaults to "Workspace" on This Mac. */
   rootLabel?: string;
-  onComputerChange: (computer: ComputerKind) => void;
   active: boolean;
   listFiles: (
     botId: string,
@@ -294,30 +290,6 @@ export function FilesPanel({
   return (
     <div className="files-panel">
       <div className="files-toolbar">
-        {computers.length > 1 && (
-          <div
-            className="files-computer-switch"
-            role="group"
-            aria-label="Computer"
-          >
-            <button
-              className={`files-computer-option ${
-                computer === "firecracker" ? "files-computer-option-active" : ""
-              }`}
-              onClick={() => onComputerChange("firecracker")}
-            >
-              microVM
-            </button>
-            <button
-              className={`files-computer-option ${
-                computer === "mac" ? "files-computer-option-active" : ""
-              }`}
-              onClick={() => onComputerChange("mac")}
-            >
-              This Mac
-            </button>
-          </div>
-        )}
         <button
           className="icon-button"
           title="Up one folder"

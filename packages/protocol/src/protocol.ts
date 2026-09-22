@@ -26,7 +26,6 @@ import {
   RolePolicySchema,
   ProviderPresetSchema,
   SoulVersionSchema,
-  TaskSchema,
   ThreadSchema,
   ToolArtifactSchema,
   WorkspaceSchema,
@@ -53,12 +52,9 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     avatar: z.string().optional(),
     color: z.string().optional(),
     model: ModelRefSchema.optional(),
-    /** @deprecated use computers. */
-    computer: ComputerKindSchema.optional(),
     computers: z.array(ComputerKindSchema).optional(),
     workspaceId: z.string().optional(),
     access: AccessModeSchema.optional(),
-    delegates: z.boolean().optional(),
     policy: RolePolicySchema.optional(),
   }),
   z.object({
@@ -69,12 +65,9 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     role: z.string().nullable().optional(),
     avatar: z.string().nullable().optional(),
     color: z.string().nullable().optional(),
-    /** @deprecated use computers. */
-    computer: ComputerKindSchema.optional(),
     computers: z.array(ComputerKindSchema).optional(),
     workspaceId: z.string().nullable().optional(),
     access: AccessModeSchema.optional(),
-    delegates: z.boolean().optional(),
     policy: RolePolicySchema.optional(),
     model: ModelRefSchema.optional(),
   }),
@@ -163,10 +156,6 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     runId: z.string(),
   }),
   z.object({
-    type: z.literal("task.cancel"),
-    taskId: z.string(),
-  }),
-  z.object({
     type: z.literal("thread.list"),
   }),
   z.object({
@@ -183,6 +172,8 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("approval.respond"),
     requestId: z.string(),
     decision: z.enum(["approve", "deny"]),
+    /** Approve and auto-approve this tool from now on (adds a policy rule). */
+    remember: z.boolean().optional(),
   }),
   z.object({
     type: z.literal("challenge.respond"),
@@ -278,7 +269,6 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("hello"),
     bots: z.array(BotSchema),
     threads: z.array(ThreadSchema),
-    tasks: z.array(TaskSchema).optional(),
     providers: z.array(ProviderInfoSchema),
     presets: z.array(ProviderPresetSchema),
     defaultModel: ModelRefSchema,
@@ -393,14 +383,11 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     runId: z.string(),
     threadId: z.string(),
     messageId: z.string(),
-    kind: z.enum(["audit", "browse", "route", "guardrail"]),
+    kind: z.enum(["audit", "browse", "guardrail"]),
     summary: z.string(),
     flagged: z.boolean(),
     latencyMs: z.number().nullable(),
     model: z.string().nullable(),
-    // Set for route decisions so the app can tell conversation from work
-    // without parsing the summary.
-    route: z.enum(["chat", "direct", "project", "new_project"]).optional(),
   }),
   z.object({
     type: z.literal("chat.compaction"),
@@ -491,7 +478,6 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("sandbox.state"),
     botId: z.string(),
-    taskId: z.string().optional(),
     state: z.enum(["stopped", "booting", "running", "error"]),
   }),
   z.object({
@@ -513,10 +499,6 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     size: z.number(),
     truncated: z.boolean(),
     error: z.string().nullable(),
-  }),
-  z.object({
-    type: z.literal("task.upserted"),
-    task: TaskSchema,
   }),
   z.object({
     type: z.literal("approvals.list"),

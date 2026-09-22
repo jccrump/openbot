@@ -346,7 +346,7 @@ async function evaluateExercise(input) {
     requestId,
     name: `Polyglot ${exerciseId}`,
     model: { provider: "eval-provider", model: options.model },
-    computer: options.computer === "vm" ? "firecracker" : "mac",
+    computers: [options.computer === "vm" ? "firecracker" : "mac"],
   });
   const created = await client.waitFor(
     (message) =>

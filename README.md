@@ -6,8 +6,7 @@ real browser, and show you its screen, with every action gated behind an
 approval you control. Bring any model: DeepSeek, OpenAI, OpenRouter, Groq, xAI,
 Google, Mistral, or a local model through Ollama or LM Studio. An optional Jev
 decision model (TypeSafe System One) verifies answers, drives multi-page
-browsing, screens untrusted page text, and routes each request to conversation,
-direct work, or the right project in a few hundred milliseconds. The
+browsing, and screens untrusted page text in a few hundred milliseconds. The
 built-in OpenBot harness is the primary path; an optional, experimental Codex
 harness can bring your ChatGPT subscription or drive non-OpenAI models through
 the local responses bridge.
@@ -103,11 +102,10 @@ the key out of the database entirely. See `.env.example` for the headless path.
 TypeSafe's Jev is a "System One" model that returns typed decisions instead of
 text. OpenBot uses it to verify browser-backed answers in a few hundred
 milliseconds, drive the multi-page `browse` tool, and screen untrusted page
-text for prompt injection, and decides whether each request is conversation,
-direct work, an existing project, or a new one. Get an early-access key, then
+text for prompt injection. Get an early-access key, then
 either set `TYPESAFE_API_KEY` in `.env` (the daemon enables Jev automatically)
 or open **Settings → Decision model**, paste the key, and turn it on. The
-per-call timeout and the route / audit / browse / guardrail toggles live in the
+per-call timeout and the audit / browse / guardrail toggles live in the
 same section.
 Every Jev path falls back to the configured model when it is off,
 unauthenticated, borderline, or unreachable.
@@ -121,7 +119,8 @@ avatar, and color, pick a model, and choose its computer:
   filesystem, plus a persistent per-agent browser profile presented in the same
   live desktop. Requires the sandbox below.
 - **This Mac** — commands run directly on your Mac as your user, restricted to
-  the agent's workspace for file tools, and always approval-gated.
+  the agent's workspace for file tools, and approval-gated while approvals are
+  on.
 
 ### Set up the sandbox (bot computers)
 
@@ -160,9 +159,9 @@ captured screenshot as fallback), **Files** (browse the agent's computer and
 preview text or image files; on This Mac it is confined to the agent's
 workspace), and **Terminal** (an interactive shell in the agent's microVM with
 a real PTY, so `vim`, `top`, and REPLs work). The thread rail on the left lists
-project managers and their workers, each manager expandable to show its
-workers. A toggle in Settings turns the approval gate off for trusted work
-(local-Mac tools always ask).
+your agents, one thread each. A toggle in Settings turns the approval gate off
+for trusted work; local-Mac tools follow the same switch, and deny rules still
+win.
 
 OpenBot keeps the live desktop connection warm while its window is unfocused,
 but holds framebuffer update requests and disables input until the window is
@@ -221,8 +220,8 @@ when the Codex CLI is on `PATH`.
   computer — breadcrumbs, sizes and dates, and a text or image preview — using
   the same workspace confinement as the file tools on This Mac. Terminal is an
   interactive PTY-backed shell in the microVM, with resize, reconnect, and a
-  session that survives tab switches. A thread rail on the left lists project
-  managers and their workers, with a disclosure control per manager.
+  session that survives tab switches. A thread rail on the left lists your
+  agents, one thread each.
 - **Agents**: create with name/role/avatar/color/model/computer, single thread
   per agent, and a centered **agent settings** modal from the gear button on
   each sidebar row. The modal edits the name, role, icon, and color, switches
@@ -254,33 +253,32 @@ when the Codex CLI is on `PATH`.
   a HAR network trace at `/var/lib/fc/vms/<id>/network.har` (host endpoint
   `GET /vms/<id>/network`) for auditing or offline grading.
 - **Local-Mac computers**: shell as your user and file tools confined to the
-  agent's workspace, always approval-gated.
+  agent's workspace, approval-gated while approvals are on.
 - **Workspaces**: a local project registry. The daemon scans conventional dev
   folders (or ones you add in **Settings → Workspaces**) for project markers,
   registers each repo once, and lets you assign it to an agent. An agent with a
   workspace roots its file tools and shell in that project folder — on the
-  microVM the same project maps to `/root/projects/<name>` — the lead can list
-  and route to workspaces, and workers inherit their manager's. Each workspace
+  microVM the same project maps to `/root/projects/<name>`. Each workspace
   can carry trusted shell command patterns (for example `^pnpm typecheck$`) so
   routine commands in a repo you trust skip the approval card — deny rules and
   ask rules still win, and file writes keep asking. Discovery only proposes:
   nothing is reachable until you register it.
 - **Access modes**: a This Mac agent's reach is a per-agent setting — project
-  folder only, the whole home folder, or full filesystem access. The lead runs
-  with full access on your machine; managers default to their project; workers
-  inherit their manager's. Approvals stay the guardrail: local actions always
-  ask unless the project trusts the command.
+  folder only, the whole home folder, or full filesystem access. While approvals
+  are on, local actions ask unless the project trusts the command or a policy
+  rule allows them; with approvals off they follow the same global switch.
 - **Self-knowledge**: the daemon knows how it is installed and where it runs
   (dev checkout or packaged app, source and app paths, version, git revision,
-  data directory, launch command, check commands), tells the lead in its prompt,
-  and answers any agent through the `system_info` tool — so an agent asked to
-  work on OpenBot can find its own source and explain how to restart it.
+  data directory, launch command, check commands), tells each agent in its
+  prompt, and answers any agent through the `system_info` tool — so an agent
+  asked to work on OpenBot can find its own source and explain how to restart
+  it.
 - **Permission onboarding**: **Settings → Access** probes the folders macOS
   gates (Documents, Desktop, Downloads, Full Disk Access), shows granted /
   denied / not-found, and deep-links the matching System Settings privacy pane.
   A probe can raise the first-time prompt; nothing is checked until you ask.
 - **Self-restart**: an agent can call `restart_daemon` after changing the
-  daemon's own code. The current turn and running tasks settle first, then the
+  daemon's own code. The current turn settles first, then the
   watcher, the app, or a detached re-exec brings the daemon back; a guard
   refuses more than three restarts in ten minutes.
 - **Host-side web search**: a `web_search` tool queries the live web through
@@ -290,7 +288,9 @@ when the Codex CLI is on `PATH`.
   `EXA_API_KEY`/`PARALLEL_API_KEY` are optional and
   `OPENBOT_WEBSEARCH_PROVIDER` forces the provider.
 - **Approvals** for every tool call, with approve/deny cards and denied actions
-  reported back to the model.
+  reported back to the model. **Always allow** on a card remembers that tool as
+  a policy rule so it stops asking (deny rules still win), and per-project
+  trusted command patterns cover shell commands in a repo you trust.
 - **Live shared browser desktop** through Xvfb, Openbox, x11vnc, and noVNC.
   Each agent's desktop has a generated wallpaper, a taskbar with Files
   (Thunar), Browser (Chromium), and Terminal launchers, and an open terminal;
@@ -332,13 +332,11 @@ when the Codex CLI is on `PATH`.
   support, and honest unknowns; failed drafts go back to the same agent for
   more research or revision instead of reaching chat as confident guesses.
 - **Jev decision model (optional, early access)**: TypeSafe's System One model
-  returns typed decisions instead of text. When enabled, each request is
-  routed in ~100–500 ms to conversation (no tools), direct work, an existing
-  project, or a new one; browser-backed answers are audited (with the model
-  verifier as fallback); the `browse` tool follows links and stops when
-  evidence is sufficient under one approval; and untrusted page text is
-  screened for prompt injection in annotate or block mode. Configure it in
-  **Settings → Decision model** or with `TYPESAFE_API_KEY`.
+  returns typed decisions instead of text. When enabled, browser-backed answers
+  are audited (with the model verifier as fallback); the `browse` tool follows
+  links and stops when evidence is sufficient under one approval; and untrusted
+  page text is screened for prompt injection in annotate or block mode.
+  Configure it in **Settings → Decision model** or with `TYPESAFE_API_KEY`.
 - **Themes**: light, dark, and follow-system, persisted per machine.
 - **Offline development** with the mock model and mock sandbox, plus
   `pnpm typecheck` and an end-to-end `pnpm smoke`.
@@ -352,12 +350,12 @@ when the Codex CLI is on `PATH`.
 
 Be honest with yourself about the following before filing issues:
 
-- **The lead/worker runtime is young.** The lead, persistent project managers,
-  worker sessions, on-demand team building (ADR-019), task grants, memory, and
-  the soul are implemented (see ADR-015/016/017/019 in
-  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)), but this is an early alpha:
-  routines are not built, and the runtime has only been exercised by the smoke
-  test, the evals, and hand testing.
+- **Memory and soul are new and unproven.** Each agent keeps a versioned soul
+  and a SQLite memory store that a background reflection pass updates on its
+  own; the Memory panel lets you inspect, delete, and revert. Retrieval quality
+  depends on the embedding provider (with none configured it falls back to
+  hashed, keyword-ish embeddings), there is no memory editor, and contradiction
+  review is not implemented.
 
 - **Image upgrades preserve the supported durable paths, not arbitrary system
   mutations.** Files under `/root`, `/home`, `/srv`, and the workspace
@@ -384,8 +382,8 @@ Be honest with yourself about the following before filing issues:
 - **Jev is optional and sends data to TypeSafe when enabled.** Page text,
   answer drafts, and tool observations leave your machine for the decision
   model. The key is stored like provider keys (SQLite `0600` or an environment
-  variable), and every path — routing included — falls back to the configured
-  model when Jev is off, unauthenticated, borderline, or erroring.
+  variable), and every path — audit, browse, guardrail — falls back to the
+  configured model when Jev is off, unauthenticated, borderline, or erroring.
 - **The browser and desktop tools only work on the microVM computer.** On This
   Mac they return a clear error.
 - **Shell egress enforcement is allowlist-only.** A `deny` egress policy is
@@ -403,15 +401,12 @@ Be honest with yourself about the following before filing issues:
 - **No multi-user support.** The daemon binds `127.0.0.1` and trusts the local
   user; there is no auth layer.
 - **No mobile app.** Mac-first; mobile is a later thin client.
-- **No group chats, mentions, or handoffs.** The lead routes work to
-  persistent project managers and they delegate to worker sessions, but agents
-  cannot talk to each other and project memory is not shared across projects.
-- **Memory and soul are new and unproven.** The lead keeps a versioned soul
-  and a SQLite memory store that a background reflection pass updates on its
-  own; the Memory panel lets you inspect, delete, and revert. Retrieval
-  quality depends on the embedding provider (with none configured it falls
-  back to hashed, keyword-ish embeddings), there is no memory editor, and
-  contradiction review is not implemented.
+- **No group chats, mentions, or handoffs.** Agents are independent: each owns
+  one thread and one computer, and agents cannot talk to each other or share
+  memory.
+- **Memory and soul are new and unproven.** Each agent keeps a versioned soul
+  and a memory store updated by a background reflection pass; see the note
+  above.
 - **The approvals policy engine is new.** Per-tool tiers, argument rules,
   persisted decisions, timeouts, and an inbox exist (see ADR-018), but rule
   authoring is a small regex editor, there are no policy presets, and the
@@ -425,20 +420,17 @@ Be honest with yourself about the following before filing issues:
 
 ## Roadmap
 
-1. **Routines** — a lead-owned scheduled spawn: record a trajectory,
-   parameterize it, schedule it or trigger on events; the lead watches each run
-   and summarizes the outcome.
-2. **Memory polish** — an embeddings setting in the UI, a real embedding
+1. **Memory polish** — an embeddings setting in the UI, a real embedding
    provider, contradiction review, and richer memory editing.
-3. **Policy polish** — presets, per-role policies, and egress allowlists tied
+2. **Policy polish** — presets, per-agent policies, and egress allowlists tied
    into the same engine.
-5. **Codex SDK provider** — ChatGPT sign-in inside the daemon with
+3. **Codex SDK provider** — ChatGPT sign-in inside the daemon with
    `@openai/codex-sdk`, mapping its stream into the OpenBot protocol.
-6. **Snapshots and restore** for microVMs, plus pause/resume.
-7. **Per-bot egress allowlists** and a real base image with Node, Python, and
+4. **Snapshots and restore** for microVMs, plus pause/resume.
+5. **Per-bot egress allowlists** and a real base image with Node, Python, and
    Chrome/Playwright.
-8. **macOS Keychain** for provider keys.
-9. **Mobile thin client** over Tailscale or a Cloudflare Tunnel.
+6. **macOS Keychain** for provider keys.
+7. **Mobile thin client** over Tailscale or a Cloudflare Tunnel.
 
 The detailed design, protocol, data model, and decision log live in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Research notes on how production
@@ -469,8 +461,8 @@ Layout:
 
 ### Working on OpenBot with OpenBot
 
-The lead already runs with full access on your machine, so it can work in this
-repo directly. The registry is what gives it the project's context and trust:
+Any agent can work in this repo directly when it has a local computer. The
+registry is what gives it the project's context and trust:
 
 1. **Settings → Workspaces** → **Scan now**: `open-bot` shows up under your dev
    root (add a scan root if it does not), or add the folder by path.
@@ -478,10 +470,10 @@ repo directly. The registry is what gives it the project's context and trust:
    `^pnpm (typecheck|smoke|code-tools:smoke|websearch:smoke)$` and
    `^git (status|diff|log)$` so routine commands skip the approval card. Deny
    rules still win and file writes keep asking.
-3. Ask the lead to work on it, or hire a dedicated **This Mac** agent with the
+3. Ask an agent to work on it, or create a dedicated **This Mac** agent with the
    `open-bot` project folder and `project` access to keep it contained.
 
-The lead can call `system_info` to see exactly where the daemon, app, and data
+Any agent can call `system_info` to see exactly where the daemon, app, and data
 live before it changes anything.
 
 If the daemon runs with `tsx watch` (`pnpm dev:daemon`), an edit under
@@ -518,11 +510,13 @@ isolated microVMs, API keys live in the data directory (`0600` inside a `0700`
 directory) or your environment, and commands require approval by default. The
 sandbox is a real boundary: the model can only touch its own microVM. Local-Mac
 agents are the exception — they run as you, with a reach you choose per agent
-(project folder, home folder, or the whole filesystem), and always require
-approval unless the project's trust patterns allow a command. In a packaged app
-macOS TCC is the outer boundary; in a dev checkout the daemon inherits your
-terminal's permissions. There is no per-bot network policy yet, so treat
-microVMs as sharing one network with your Mac.
+(project folder, home folder, or the whole filesystem). With "ask before
+running commands" on, local tools ask unless you approved the tool with
+**Always allow** or the project trusts the command; with it off, local tools
+follow the same policy tiers as everything else and deny rules still win. In a
+packaged app macOS TCC is the outer boundary; in a dev checkout the daemon
+inherits your terminal's permissions. There is no per-bot network policy yet,
+so treat microVMs as sharing one network with your Mac.
 
 ## License
 

@@ -55,7 +55,7 @@ export function ApprovalsModal({
   policy: PolicySettings;
   requireApproval: boolean;
   onLoad: () => void;
-  onRespond: (requestId: string, decision: "approve" | "deny") => void;
+  onRespond: (requestId: string, decision: "approve" | "deny", remember?: boolean) => void;
   onSavePolicy: (input: {
     requireApproval: boolean;
     policy: PolicySettings;
@@ -183,6 +183,15 @@ export function ApprovalsModal({
                       onClick={() => onRespond(record.requestId, "approve")}
                     >
                       Approve
+                    </button>
+                    <button
+                      className="remember-button"
+                      title={`Approve and stop asking for ${record.tool}`}
+                      onClick={() =>
+                        onRespond(record.requestId, "approve", true)
+                      }
+                    >
+                      Always allow
                     </button>
                     <button
                       className="deny-button"
@@ -374,10 +383,12 @@ export function ApprovalsModal({
                   <option value="path">path</option>
                   <option value="domain">domain</option>
                   <option value="text">text</option>
+                  <option value="any">any call</option>
                 </select>
                 <input
                   value={rule.pattern}
-                  placeholder="regex"
+                  placeholder={rule.match === "any" ? "—" : "regex"}
+                  disabled={rule.match === "any"}
                   onChange={(event) =>
                     updateRule(rule.id, { pattern: event.target.value })
                   }

@@ -126,17 +126,8 @@ export class Reflector {
 
   private scopeBots(): Array<{ scope: string; bot: Bot }> {
     const bots = this.deps.store.listBots();
-    const scopes: Array<{ scope: string; bot: Bot }> = [];
-    const lead = bots.find((bot) => bot.kind === "lead");
-    if (lead) {
-      scopes.push({ scope: "user", bot: lead });
-    }
-    for (const bot of bots) {
-      if (bot.kind === "project") {
-        scopes.push({ scope: bot.id, bot });
-      }
-    }
-    return scopes;
+    // Every agent owns its own memory scope; there is no shared scope.
+    return bots.map((bot) => ({ scope: bot.id, bot }));
   }
 
   private async extractAll(): Promise<number> {
@@ -199,9 +190,6 @@ export class Reflector {
     const store = this.deps.store;
     let updated = false;
     for (const { scope, bot } of this.scopeBots()) {
-      if (scope !== "user") {
-        continue;
-      }
       const count = Number(store.getSetting(`memory.extractions.${scope}`) ?? "0");
       const applied = Number(store.getSetting(`soul.applied.${scope}`) ?? "0");
       if (count < applied + SOUL_EVERY) {

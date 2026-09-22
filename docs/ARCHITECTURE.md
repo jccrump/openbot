@@ -7,8 +7,6 @@ model. The built-in OpenBot harness (our loop + VM tools) is the primary path;
 the optional Codex harness can bring a ChatGPT subscription or drive non-OpenAI
 models through the local responses bridge.
 
-Single-user, Mac-first. Mobile is a later thin client.
-
 ## Status
 
 - **M0 (done):** monorepo, daemon, model gateway, SQLite persistence,
@@ -26,16 +24,14 @@ Single-user, Mac-first. Mobile is a later thin client.
   Responses-to-Chat-Completions bridge drives non-OpenAI models (verified end
   to end with a real DeepSeek key, including a tool call in the microVM). The
   ChatGPT subscription flow has not been verified end to end from the app.
-- **M4 (in progress):** the lead/worker runtime — one lead identity with soul
-  and memory, ephemeral workers per task, a workboard, and task grants. See
-  [Lead and workers](#lead-and-workers).
+- **M4 (done):** one agent per thread — every agent owns its own computer set
+  (the microVM, This Mac, or both), its own memory and soul, and nothing routes
+  work between agents. See [Agents](#agents).
 - **M5+ (planned):** routines, mobile.
 
-Subagent handoffs and group chats are not implemented yet. Today every agent is
-independent: it has exactly one thread, and nothing routes work between agents.
-The lead/worker model replaces that arrangement: the lead is the only chat
-surface, and workers are task instances with their own computers, not agents
-with their own conversations.
+Subagent handoffs and group chats are not implemented. Every agent is
+independent: it has exactly one thread and its own computer set, and nothing
+routes work between agents.
 
 ## System overview
 
@@ -93,15 +89,13 @@ docs/                      This document and screenshots
   development it also runs in a browser via `pnpm dev:app`.
 - Talks to the daemon exclusively over the WebSocket protocol. Reconnects
   automatically; the daemon can restart underneath it.
-- Surfaces today: the thread rail on the left (project managers and their
-  workers, each manager expandable); chat with streaming text, a three-dot
-  typing bubble while the model is thinking (reasoning deltas are received but
-  hidden by default), collapsible **Worked N actions** groups, tool cards with
-  output and screenshots, and inline approval cards; a thread drawer with the
-  task detail (grant, budget, usage, child workers, live transcript, cancel,
-  and a Watch overlay for the task's own desktop); the agent panel with Screen,
-  Files, and Terminal tabs and a draggable resizer; and the approvals, memory,
-  agent-settings, and Settings modals.
+- Surfaces today: the thread rail on the left (one entry per agent); chat with
+  streaming text, a three-dot typing bubble while the model is thinking
+  (reasoning deltas are received but hidden by default), collapsible
+  **Worked N actions** groups, tool cards with output and screenshots, and
+  inline approval cards; the agent panel with Screen, Files, and Terminal tabs
+  and a draggable resizer; and the approvals, memory, agent-settings, and
+  Settings modals.
 - **Agent panel.** The Screen tab is the live noVNC view with screenshot
   fallback and full-screen takeover; the VNC socket is only opened while that
   tab is active, so the desktop is never streamed in the background. The Files
@@ -131,11 +125,9 @@ docs/                      This document and screenshots
   VNC and manual takeover share the same display, so the model can keep
   working while the user watches, and either can take over.
 - Not present yet: approvals inbox, routines browser, memory browser, and
-  group chats. The sidebar restructure (lead pinned, team, work), the
-  workboard, and the task detail and watch views are described in
-  [Lead and workers](#lead-and-workers).
+  group chats. The thread rail is a flat list of agents.
 
-**Settings layout.** Four sections in a left nav with search:
+**Settings layout.** Seven sections in a left nav with search:
 
 - **General** — default model and the global "ask before running commands"
   toggle.
@@ -144,6 +136,10 @@ docs/                      This document and screenshots
   updates live.
 - **Providers** — list, enable/disable, add/edit/remove, presets, key fields,
   model list, and "Fetch models".
+- **Workspaces** — the local project registry: scan roots, discovered projects,
+  add/ignore/remove, and per-project trusted command patterns.
+- **Access** — probes the macOS-gated folders (Documents, Desktop, Downloads,
+  Full Disk Access) and deep-links the matching privacy pane.
 - **Harness** — pick the default harness (OpenBot or Codex). Codex is only
   selectable when the CLI is detected on `PATH`.
 - **Decision model** — the optional Jev (TypeSafe System One) integration:
@@ -173,9 +169,6 @@ is also the drag region.
   persist the user message, compact if needed, stream provider events, execute
   tool calls with approvals, persist the assistant message, emit protocol
   events. Abortable per run; completion-driven, with no fixed round limit.
-- `orchestrator.ts` — the lead/worker runtime: task creation and lifecycle,
-  worker dispatch through the role's computer, the lead inbox, and workboard
-  context assembly for lead turns (M4).
 - `browse.ts` — the Jev-driven browse loop: reads the current page and its
   links, asks the decision model which link to follow and whether the evidence
   is sufficient, and returns the collected pages.
@@ -200,7 +193,7 @@ first user message. Sidebar search filters agents by name/role — it does not
 search message text. Clearing a chat (`thread.clear`) is the fresh-start
 affordance without a second thread: the daemon aborts the active run, drops
 queued messages, folds every message, drops the working plan, resets the title,
-and stamps `clearedAt`. The thread, its tasks, and its memory stay; folded
+and stamps `clearedAt`. The thread and its memory stay; folded
 messages remain readable through `thread.messages` with `includeFolded`.
 
 ### Harnesses: the OpenBot loop (primary) and Codex (optional)
@@ -280,74 +273,23 @@ MCP tools default to requiring approval; the daemon and wrapper configure
 `default_tools_approval_mode = "approve"` and a long tool timeout because first
 boots and browser actions can take minutes.
 
-### Lead and workers
+### Agents
 
-The primary runtime is one **lead** with a team of ephemeral **workers**. The
-lead is a single durable identity: it owns the conversation, the soul, and the
-memory. Workers are task instances: they receive a brief, a role's tools and
-computer, a grant, and a budget, and they disappear when the task ends. The
-guiding rule is **one mind, many hands** — the lead's cognition is serialized
-(one lead run at a time), worker labor is parallel.
+The runtime is **one agent per thread**. Every agent is a durable identity: it
+owns its conversation, its soul, and its memory, and it has exactly one
+computer — a Firecracker microVM or This Mac — chosen when it is created.
 
-**The lead.**
-
-- Exactly one lead per install: a `bots` row with `kind = 'lead'`, seeded on
-  migration. Existing agents become roles (`kind = 'role'`).
-- One continuous thread. A lead turn begins from a user message or from the
-  inbox (a task finished, failed, or needs attention) and is processed one at a
-  time, so the lead never races itself.
-- With Jev enabled, each user message is **routed before the model runs**:
-  `needs_work` and `route` decisions (conversation, direct, an existing
-  project, or a new one) arrive in a few hundred milliseconds. A confident
-  conversation answer runs the turn without tools; a confident project answer
-  injects a `[routing]` hint naming the project, and the lead still writes the
-  request. Unsure or unavailable falls back to the model (ADR-014 amendment).
-- The lead's turn context includes a bounded **workboard block**: active tasks
-  with status and budget, completed tasks with result summaries and artifact
-  handles, and memory retrieved for the current conversation. Raw worker
-  transcripts never enter the lead's context.
-- The lead can act directly on its own computer — its home microVM with the
-  persistent browser profile and sign-ins — or delegate. Quick lookups stay
-  with the lead; long, parallel, or risky work becomes a task.
-
-**Workers.**
-
-- A `tasks` row is a worker instance: role, brief, status, display, grant,
-  budget, result, evidence, error, and a thread for its step transcript. Tasks
-  are not chat surfaces; the task detail view renders the thread.
-- Worker execution reuses the agent loop with the role's model, computer, and
-  tool set. Workers never write memory and never talk to the user directly;
-  they return a result with evidence (observation IDs and artifact handles).
-- Workers are **display-on-demand** (ADR-016): headless by default, a browser
-  view for browser work, and a lazily attached desktop stack only when a task
-  declares it. Only the lead keeps a persistent visible desktop.
-- Workers that belong to a project run as **sessions inside the project's
-  computer** (see below). A standalone task — one the lead spawns directly,
-  outside any project — gets its own microVM keyed by the task id, booted on
-  the first tool call and destroyed when it ends. The role's home VM is never
-  used for task work. On daemon restart, tasks that were queued or running are
-  failed and their ephemeral computers removed.
-
-**Projects and managers.** A project is a persistent agent (`bots.kind =
-'project'`) that the lead creates for a topic — "Buddy Weather" — with its own
-computer, one long-lived thread with the lead, and the project's detailed
-context. The lead keeps the high-level index (which projects exist and what
-they are for) and routes work: `list_projects` first, then `ask_project` when a
-project matches, or `create_project` and then `ask_project` when none does. A
-request is a task attached to the project that reuses the project's thread, so
-every request and report accumulates in the project's own history.
-
-Workers are **sessions inside the project's computer**, not machines of their
-own: shell and file tools run in the project VM with a per-session workspace
-(`/root/workspaces/<taskId>`), and each session gets its own browser keyed by
-the session id, so parallel workers do not fight over one page. Sessions are
-ephemeral — they end with the request and leave no computer behind. The project
-computer persists until the project is deleted; requests to one project run one
-at a time, while different projects run in parallel. Managers do not talk to
-the user and do not write user memory: the lead stays the only voice and the
-only writer of user memory. Envelopes still hold: a worker grant must be a
-subset of its request's grant, budgets must fit inside the parent's remaining
-budget, and depth is capped at request → worker.
+- An agent is a `bots` row with a name, role description, avatar, color, model,
+  and a single `computer` (`firecracker` or `mac`). The first agent is seeded
+  on a fresh install.
+- One continuous thread per agent (`getOrCreateThread`); there is no
+  new-chat affordance, and clearing the thread is the fresh-start path.
+- An agent acts directly on its own computer through the shell, file, browser,
+  desktop, and web_search tools. It can also assign itself a registered project
+  folder (workspace) and an access mode, so a This Mac agent can work inside a
+  real repo.
+- Memory and soul are per-agent: each agent owns a memory scope keyed by its id
+  and a versioned soul that a background reflection pass updates.
 
 ### Memory and soul
 
@@ -356,59 +298,28 @@ vector search over stored embeddings. The embedding client is any
 OpenAI-compatible `/embeddings` endpoint; with none configured, a deterministic
 hashed-embedding fallback keeps retrieval working offline. (`sqlite-vec` via
 `loadExtension` is the upgrade path if brute force ever matters at this scale.)
-Memories are typed (semantic, relational, procedural, episodic), scoped
-(`user` for the lead, the project bot id for a project), and carry evidence,
-confidence, importance, use counts, and status (`active` / `suspect` /
-`archived`).
+Memories are typed (semantic, relational, procedural, episodic), scoped per
+agent (the bot id), and carry evidence, confidence, importance, use counts, and
+status (`active` / `suspect` / `archived`).
 
-- **Writes.** The lead and project managers write explicitly with `remember`,
-  search with `recall`, and archive with `forget`. Workers cannot write memory.
-- **Injection.** Every turn retrieves a bounded, relevant slice (lead: user
-  scope; projects: their scope plus the user's; workers: the project slice
-  their brief matches) and injects it as a system note with memory ids. Used
+- **Writes.** Each agent writes its own memories explicitly with `remember`,
+  searches with `recall`, and archives with `forget`.
+- **Injection.** Every turn retrieves a bounded, relevant slice from the
+  agent's own scope and injects it as a system note with memory ids. Used
   memories get a use-count bump, which feeds ranking.
 - **Automatic upkeep.** A background reflection pass runs on a debounce after
   turns and on a timer. It extracts durable memories from the new conversation
   using the scope's model, folds near-duplicates into existing rows, decays
   unused memories toward an archive threshold, and merges near-duplicates.
   `memory.consolidate` lets the UI force a prune.
-- **Soul.** The lead's soul is a versioned constitution (`soul_versions`):
-  voice, commitments, relationship. The lead can update it with `update_soul`,
+- **Soul.** Each agent's soul is a versioned constitution (`soul_versions`):
+  voice, commitments, relationship. The agent can update it with `update_soul`,
   and the reflection pass rewrites it once enough new memories accumulate.
-  Every version is kept and the user can revert from the Memory panel; projects
-  have no soul of their own.
+  Every version is kept and the user can revert from the Memory panel.
 
-**Watching a task.** The task detail shows the brief, result, evidence ledger,
-grant, budget, usage, and child workers, and it renders the worker's transcript
-live while it runs. A Watch action opens the task's own desktop stream; task
-computers are exposed as `/tasks/:id/screen` and `/tasks/:id/vnc` alongside the
-per-bot routes, so watching never touches the role's home computer. The
-transcript plus the persisted artifacts are the replay.
-
-**The workboard.** Task state is protocol data, not messages: `tasks` in the
-`hello` snapshot and `task.upserted` events as rows change. The UI shows the
-workboard inside the lead's turn — a row of task tiles with status, role,
-elapsed time, and budget — expandable to the event trail and artifacts, with
-approve, cancel, and (later) watch actions. The lead's notifications to the
-user are ordinary assistant messages.
-
-**Roles and the sidebar.** A role is a `bots` row with `kind = 'role'`: name,
-role description, avatar, color, model, computer, and tool policy. It is a
-template, not a chat. The sidebar becomes:
-
-- **Lead** — pinned at the top; the only chat surface.
-- **Team** — roles, with live task counts; the gear opens role settings.
-- **Work** — active and recent tasks, newest first.
-- Search covers roles, tasks, and artifacts.
-
-Creating a role is hiring a specialist; there is no per-role chat. One lead
-only; a role can be promoted to lead in settings, which demotes the previous
-lead to a role.
-
-**Routines (planned).** A routine is a lead-owned scheduled spawn: a role, a
-brief template, and a schedule. The lead watches routine runs like any other
-task, summarizes the outcome, and notifies the user; the run itself stays
-watchable and replayable.
+**Routines (planned).** A routine is an agent-owned scheduled spawn: a brief
+template and a schedule. The agent watches routine runs, summarizes the
+outcome, and notifies the user; the run itself stays replayable.
 
 ### Model gateway (`packages/gateway`)
 
@@ -593,12 +504,10 @@ esbuild into a single `service.mjs`, installed into the Lima VM at
 
 Per-agent state lives in `/var/lib/fc/vms/<botId>/` (rootfs copy and version,
 newest recovery image, browser profile/log, `api.sock`, `vsock.sock`,
-`serial.log`). Task computers use the same paths keyed by the task id: they
-boot from the base image, and `destroy` stops the VM and removes its rootfs,
-browser profile, and Linux account, so per-task computers leave nothing behind.
-Each VM records the daemon that created it (`owner`, a hash of the data dir).
-On startup a daemon calls `POST /prune` with every computer it still knows
-(bots plus queued/running tasks); the host removes that owner's stopped VM
+`serial.log`). Each VM records the daemon that created it (`owner`, a hash of
+the data dir).
+On startup a daemon calls `POST /prune` with every bot it still knows; the host
+removes that owner's stopped VM
 directories that are not in the list. A delete lost to a daemon or host restart
 therefore costs disk only until the next start, and one daemon can never prune
 another's (or an eval runner's) computers. `sandbox:setup`
@@ -782,16 +691,15 @@ useful for trusted local experimentation.
 every tool call: all matching rules apply and the strictest wins (tool,
 computer scope, and an argument regex over the command, path, URL host, or
 text), then the per-tool tier, then the default tier (which can inherit the
-global switch). Deny is absolute: a task grant pre-approves ask-tier tools —
-approving the brief is the user's authorization for that work — but can never
-widen a deny, and This Mac tools ask unless a mac-scoped rule allows them.
+global switch). Deny is absolute, and This Mac tools ask unless a mac-scoped
+rule allows them.
 Built-in rules deny recursive deletes of `/` and home and raw disk writes, and
 ask for `sudo` and piping a download into a shell. A blocked call returns
 `Blocked by the approvals policy: <reason>` to the model instead of asking.
 
 Named **presets** (balanced, read-only, trusted, locked) are one-click starting
-points that always keep the built-in deny rules. Each role can carry a
-**role policy** (`bots.policy`): a preset that can only make things stricter
+points that always keep the built-in deny rules. Each agent can carry a
+**policy** (`bots.policy`): a preset that can only make things stricter
 than the global policy, since tool tiers take the stricter of the two, rules
 accumulate, and timeouts take the shorter. **Egress** adds an allowlist for
 browser traffic: with mode `ask` or `deny`, a host outside the list is asked
@@ -857,11 +765,10 @@ Client to server:
   browse, guardrail, timeout), busy-turn delivery default
 - `approval.respond`
 - `challenge.respond`
-- `task.cancel` — `{ taskId }`, aborts the task's worker run
 
 Server to client:
 
-- `hello` — snapshot: bots, threads, tasks, providers, presets, default model,
+- `hello` — snapshot: bots, threads, providers, presets, default model,
   approval setting, harness, decision-model info, Codex info, busy-turn default
 - `threads`, `thread.messages`, `thread.upserted`, `thread.cleared`
 - `chat.start`, `chat.delta`, `chat.reasoning`, `chat.done`, `chat.message`,
@@ -887,8 +794,6 @@ Server to client:
   size, truncated }`; images arrive base64 for the preview
 - `bot.created`, `bot.updated`, `bot.deleted`, `bot.reset`, `providers.updated`,
   `provider.models`
-- `task.upserted` — a task row changed (status, result, budget, error); the
-  workboard renders from these, not from chat messages
 
 Every message is defined once in `packages/protocol` with Zod and validated on
 both sides.
@@ -897,30 +802,23 @@ both sides.
 
 ```
 bots       id, name, system_prompt, provider, model, created_at,
-           role, avatar, color, computer, kind, delegates
-           (kind: lead | role | project; a project is a persistent manager)
+           role, avatar, color, computer, workspace_id, access, policy
 threads    id, bot_id, title, created_at, updated_at,
            last_compacted_at, compaction_count
 messages   id, thread_id, role, content, provider, model, created_at,
            tool_calls, input_tokens, output_tokens, compaction, folded_at
-tasks      id, lead_id, role_id, project_id, thread_id, parent_id, depth,
-           title, brief, status, display, grant, budget, usage, result,
-           evidence, error, created_at, started_at, ended_at
 providers  id, label, base_url, api_key, api_key_env, models, enabled,
            created_at, updated_at
 settings   key, value
 ```
 
-`bots.kind` is `lead` or `role` (legacy rows migrate to `role`). A task's
-`thread_id` points at a thread owned by the role bot: the worker's step
-transcript, tool calls, and artifacts live there, and the task detail view
-reads it through the existing `thread.messages` path. `grant` and `budget` are
-JSON; `evidence` is a rendered ledger reference, not a copy of the raw pages.
+A bot has a single `computer` (`firecracker` or `mac`), an optional
+`workspace_id`, an `access` mode for This Mac reach, and an optional `policy`
+that can only narrow the global approvals policy.
 
 ```
-approvals     id, request_id, run_id, thread_id, bot_id, task_id, project_id,
-              tool, arguments, tier, reason, decision, decided_by,
-              requested_at, decided_at
+approvals     id, request_id, run_id, thread_id, bot_id, tool, arguments,
+              tier, reason, decision, decided_by, requested_at, decided_at
 memories      id, scope, type, content, evidence, confidence, importance,
               status, source, embedding, embedding_model, embedding_dims,
               created_at, updated_at, last_used_at, use_count
@@ -954,14 +852,9 @@ write. Planned additions: `runs` (journal), `routines`, `approvals`, `secrets`
   sockets are owner-only, but browser processes do not have per-agent kernels;
   Lima remains the outer containment boundary for browser compromise.
 - This Mac agents run as the user. The only boundary is the workspace path
-  check for file tools plus mandatory approvals for every action.
-- Worker tasks are intended to run under a **grant** approved once at spawn
-  (role, tools, display, budget), with escalation for out-of-scope actions, so
-  a fan-out cannot flood the user with per-action approval cards. Until grants
-  land (M4 phase 2), workers inherit the global approval setting and their
-  approvals surface in the workboard.
+  check for file tools plus approvals for every action.
 - There are no per-bot egress allowlists and no snapshots before risky
-  operations yet. Both matter more once the lead fans out unattended tasks.
+  operations yet.
 
 ## Milestones
 
@@ -971,7 +864,7 @@ write. Planned additions: `runs` (journal), `routines`, `approvals`, `secrets`
 | M1 | Lima + Firecracker host, one agent VM, guest agent, shell/file tools, approvals | Done except snapshots and egress policy |
 | M2 | Browser automation, persistent sign-ins, live screen view | Browser automation, screenshots, and live noVNC desktop done; sign-in polish pending |
 | M3 | Codex provider with ChatGPT sign-in | Optional Codex harness + responses bridge implemented; bridge verified end to end with a real non-OpenAI provider; ChatGPT subscription flow not verified end to end; SDK provider planned |
-| M4 | Lead/worker runtime: one lead, ephemeral workers, workboard, task grants, memory + soul | In progress |
+| M4 | One agent per thread: independent agents, each with its own computer, memory, and soul | Done |
 | M5 | Routines: scheduled spawns, procedural memory, replay | Planned |
 | M6 | Mobile thin client over Tailscale | Planned |
 
@@ -1024,11 +917,17 @@ system type at 14px with -0.15px tracking, 280px sidebar, subtle 16px-radius
 bubbles, pill composer, black circular send, and a muted `rgba(20,20,20,*)`
 text scale. Light and dark themes both ship.
 
-**ADR-010: Local-Mac computer mode is opt-in and always approval-gated.**
+**ADR-010: Local-Mac computer mode is opt-in and approval-gated.**
 Running agents directly on the Mac is useful for work that needs the user's
 files and tools, but it is not sandboxed. It is an explicit per-agent choice
-with path confinement for file tools, mandatory approvals, and no browser
-tool.
+with path confinement for file tools, approvals on by default, and no browser
+tool. Approval is the user's global switch: with "ask before running commands"
+on, local tools ask even when a tool tier or the default says auto, unless a
+mac-scoped rule allows them; with it off, local tools follow the same tiers as
+anything else, and deny rules still win. **Always allow** on an approval card
+and per-project trusted command patterns are the middle path: deliberate,
+per-tool or per-command trust without turning the whole machine loose
+(ADR-018 amendment, ADR-022).
 
 **ADR-011: Compact instead of truncate.** Long threads keep working by folding
 old messages into a model-written summary that stays in the transcript as a
@@ -1055,18 +954,10 @@ the claim or label it unknown. The verifier is intentionally separate from the
 compact general system prompt so research-specific quality control does not grow
 that prompt into a catalog of situations.
 
-**ADR-014 amendment: Jev routes the lead's requests.** Routing — is this
-conversation, direct work, an existing project, or a new one — is a decision,
-not generation, so it belongs to Jev. Before a lead turn, the daemon sends the
-user's message plus a compact project index and asks two questions:
-`needs_work` (noul) and `route` (choice over direct, a new project, and each
-existing project). A confident conversation answer drops tools for the turn; a
-confident project answer injects a routing hint, and the lead still composes
-the request because the brief is its job. When Jev is off, unavailable, or
-unsure, the model decides exactly as before, so routing is fail-open like every
-other Jev path. Rejected: letting the model pick projects unaided (it misroutes
-and burns a tool round trip), and auto-calling `ask_project` without the lead
-(the brief is the lead's job).
+**ADR-014 amendment (superseded): Jev routing was removed.** The lead/worker
+model had Jev route each request to conversation, direct work, or a project.
+That routing was reverted with the lead/worker runtime — see ADR-026 below —
+so Jev now only audits, browses, and screens text.
 
 **ADR-014: Use Jev (TypeSafe System One) for decisions, with the configured
 model as fallback.** The audit, link selection, and injection screening are
@@ -1082,81 +973,25 @@ the only transport (no AI SDK dependency). Rejected: making Jev the primary
 model (it cannot chat or call tools), and auto-approving tool calls from a risk
 score (that changes the safety model; approvals stay human).
 
-**ADR-015: One lead, many ephemeral workers.** Grok Bot-style isolation gives
-every agent its own chat, computer, and (eventually) memory, which duplicates
-identity and makes cross-task awareness impossible. OpenBot instead has one
-durable identity that owns the conversation, the soul, and the memory, and
-spawns ephemeral workers for tasks. The lead's cognition is serialized (one run
-at a time) while workers run in parallel, so the lead never races itself;
-worker events queue in the lead's inbox and trigger a lead turn when it is idle.
-Workers are `tasks` rows with their own thread for the step transcript, not chat
-surfaces and not identities. Roles (the former agents) are reusable templates
-with a model, computer, and tool policy. Rejected: many full agents with their
-own chats and memory (duplication, no shared context); a separate orchestration
-service (needless moving part); workers sharing the lead's computer (loses the
-per-task isolation that makes fan-out safe).
+**ADR-015 (superseded): One agent per thread.** An earlier lead/worker model
+gave one lead a team of ephemeral workers and projects. That was reverted — see
+ADR-026 below — because the hierarchy did not work out; OpenBot now gives every
+agent its own chat, computer, memory, and soul.
 
-**ADR-015 amendment: one persistent manager per project, ephemeral sessions
-under it.** The hierarchy is the lead, then a project manager per topic, then
-worker sessions. A project manager is a persistent agent (`bots.kind =
-'project'`) with its own computer, its own thread with the lead, and the
-project's detailed context; the lead holds only the high-level project index
-and routes requests (`list_projects` → `ask_project`, or `create_project`
-first). A project manager is not a chat surface and has no soul of its own:
-the lead remains the only voice to the user and the only writer of user
-memory. Workers are sessions inside the project's computer — no VM of their
-own, no persistence, gone when the request ends — with a per-session workspace
-and a per-session browser so parallel work stays isolated. Requests to one
-project run one at a time; projects run in parallel. Envelopes are enforced in
-the orchestrator, not the prompt: a worker grant must be a subset of its
-request's grant, and budgets must fit inside the parent's remaining budget.
-Depth is capped at request → worker. Rejected: ephemeral managers (loses the
-project's context and forces a rebuild every time); per-task VMs for workers
-(~20s of boot per worker and no shared assets); managers as chat surfaces
-(recreates the many-agents problem); unlimited depth (cost and fidelity
-collapse).
+**ADR-016 (superseded): Task grants and display-on-demand were removed with the
+lead/worker runtime.** There are no tasks, grants, budgets, or worker displays;
+each agent runs its own computer directly.
 
-**ADR-016: Task grants and display-on-demand.** Approvals attach to the brief,
-not to each action: a task is approved once at spawn with a grant (role, tool
-capabilities, display, budget) and escalates only when it needs something
-outside it. This is what makes one-to-many workable — twenty per-action cards
-per fan-out is not a product. Display is a requested resource: workers are
-headless by default because headless Chromium still renders, screenshots, and
-returns page text; a browser view is always available for browser work; a full
-desktop stack is attached only when a task declares it, and x11vnc encodes only
-while someone is watching. Visibility is not optional for unattended runs:
-every task keeps an event trail and artifacts from day one, live watch and
-replay follow, and routine runs are watched by the lead and summarized to the
-user. Rejected: an always-on desktop per worker (idle encoding cost defeats
-cheap fan-out); invisible unattended runs (untrustworthy, undebuggable).
-
-**ADR-016 amendment: grants are the approval unit, and they attenuate.**
-Approving a spawn approves the brief and its grant together: the tool set, the
-display, and the budget. Inside the grant, a worker's tool calls run without
-per-action cards; anything outside the grant escalates as an approval request,
-and a denial returns to the model like any other denial. Budgets (wall clock,
-tool calls, tokens) are enforced by the harness, not the prompt; exceeding one
-fails the task with a clear error and the partial results preserved. A child
-grant must be a subset of its parent's grant, and the sum of a project's child
-budgets must fit inside its own remaining budget, so a manager can only
-allocate what it was given. Orchestration tools are envelope-constrained rather
-than approval-gated for a manager (its grant was approved when it was spawned)
-and approval-gated for the lead (approving the spawn is how the user authorizes
-the project). Local-Mac workers are exempt: their tools always ask, grant or
-not (ADR-010).
-
-**ADR-018: Policy is the ceiling, grants are the approval unit.** The global
-approval toggle was too coarse once agents started fanning out; users need
+**ADR-018: Policy is the ceiling.** The global
+approval toggle was too coarse; users need
 per-tool tiers and argument-level rules without re-approving every call. The
 engine evaluates rules first, then the tool tier, then the default (which can
-inherit the global switch). Deny is absolute — a grant pre-approves ask-tier
-tools but can never widen a deny — and This Mac tools ask unless a mac-scoped
-rule says otherwise. Every request and decision is persisted with its tier,
-reason, and who decided; unanswered requests auto-deny on a configurable
-timeout; an inbox shows pending plus history so a fan-out cannot strand a run
-on an unseen card. Presets are one-click starting points that keep the built-in
-deny floor, and role policies narrow the global policy the same way grants
-narrow a task: a role can only be stricter. Egress allowlists gate browser
+inherit the global switch). Deny is absolute, and This Mac tools ask unless a
+mac-scoped rule says otherwise. Every request and decision is persisted with
+its tier, reason, and who decided; unanswered requests auto-deny on a
+configurable timeout; an inbox shows pending plus history. Presets are
+one-click starting points that keep the built-in deny floor, and an agent's
+policy can only narrow the global policy. Egress allowlists gate browser
 traffic per host; a `deny` policy is enforced inside the guest for every
 request the page makes, while `ask` approves per navigation at the daemon, and
 shell egress is enforced at the network layer in `deny` mode (nftables on the
@@ -1165,23 +1000,8 @@ scope). Rejected: per-action risk scoring that auto-approves
 (approvals stay human) and policy in the prompt (the model must not be able to
 widen its own permissions).
 
-**ADR-019: The team grows on demand.** Roles began as a hand-built roster: the
-user had to anticipate every specialist before the lead could delegate, and
-work stalled the moment a task needed a skill nobody had created. Instead, the
-lead and project managers can create a persistent worker when no existing role
-fits (`create_worker`). The worker is a normal `bots.kind = 'role'` with its
-own computer and system prompt, it appears in the team list immediately, and it
-is reusable for future tasks, so the roster accumulates capability instead of
-being rebuilt per task. Creation follows the existing approval envelopes —
-approval-gated for the lead, covered by the task grant for a manager — and the
-name is the identity key: a duplicate name returns the existing role instead of
-forking the team, and a role cap (12) stops a runaway model from minting an
-unbounded roster. Workers cannot create managers; the hierarchy stays lead →
-project manager → worker, and promoting a worker to manager stays a deliberate
-user decision. Rejected: ephemeral anonymous workers (the team never
-accumulates capability, and every task pays to re-derive the role);
-auto-creating a role per task (roster sprawl and duplicate specialists);
-letting workers hire workers (unbounded fan-out and cost).
+**ADR-019 (superseded): on-demand team building was removed with the lead/worker
+runtime.** Agents are created by the user in the app, not by other agents.
 
 **ADR-020: Messages sent mid-turn steer or queue.** Sending while the agent
 works used to be dropped by the composer, and a second client's message would
@@ -1192,28 +1012,23 @@ so the model can change course without losing completed tool work — or queued,
 held in memory (never written to the transcript early, or the running turn
 would read it as already delivered) and started as a fresh run when the thread
 goes idle. The default is the `chatBusyBehavior` setting (`steer` or `queue`),
-overridable per send; runs that cannot take steering (internal task turns, the
+overridable per send; runs that cannot take steering (the
 Codex harness) fall back to queueing, and a steer that lands after the last
 step is answered by a follow-up run so it is never left hanging. Rejected:
 abort-and-resend (throws away completed tool work and re-bills the turn); a
 client-side-only queue (lost on reload, no cross-window consistency); injecting
 mid-provider-call (a stream cannot accept a new user turn).
 
-**ADR-021: An agent may have one computer, both, or neither.** A bot's
-`computers` is a capability set (`["firecracker"]`, `["mac"]`, or both), not a
-single kind. The lead gets both because it orchestrates work on either side; a
-project manager's set is chosen when the lead creates it — when the brief does
-not say, the lead asks the user instead of silently defaulting — and workers
-inherit the manager's set rather than choosing for themselves. Tools name the
-computer they act on: shared tools (`shell`, file tools) take an optional
-`computer` argument and default to the agent's primary, while `browser` and
-`desktop` stay microVM-only and `web_search` stays host-side. Policy stays
-per-call, so a local action still always asks unless a mac-scoped rule allows
-it. An empty set means a chat-only agent with no computer tools. Rejected: a
-separate tool name per computer (doubles the tool surface and descriptions);
-silently defaulting managers to the microVM (the user asked to be asked);
-workers choosing their own computer (capability should follow the manager's
-approval).
+**ADR-021: An agent has a computer set.** A bot's `computers` is a capability
+set (`["firecracker"]`, `["mac"]`, or both), not a single kind. The app's
+right-column panels switch between the agent's computers; the agent's tool
+execution uses its primary computer — the microVM when present, otherwise This
+Mac — so `browser` and `desktop` stay microVM-only and `web_search` stays
+host-side. A missing or empty set means the microVM. The lead/worker parts of
+the earlier capability-set design (the lead getting both, managers choosing a
+set, workers inheriting it) were removed with ADR-026. Rejected: a separate tool
+name per computer (doubles the tool surface and descriptions); defaulting an
+unspecified set to This Mac (the microVM is the safe default).
 
 **ADR-022: Workspaces map local projects; agents reference them by id.** The
 daemon keeps a registry of local project folders — name, root, detected markers
@@ -1225,11 +1040,8 @@ marker directories, stops at a project root, skips build directories and
 becomes reachable when it is registered, and ignoring one keeps a scan from
 re-adding it. An agent assigned a workspace roots its file tools and shell in
 the project folder (still realpath-confined) instead of a managed scratch
-folder; on the microVM the same workspace maps to `/root/projects/<slug>`, so
-one registry row describes both computers. The lead sees the registry with
-`list_workspaces` and passes a workspace to `create_project`; workers inherit
-the manager's, and removing a workspace clears it from its agents without
-touching the folder. A workspace also carries trusted shell command patterns: a
+folder; on the microVM the same workspace maps to `/root/projects/<slug>`.
+A workspace also carries trusted shell command patterns: a
 matching command runs without an approval card, while the built-in deny rules
 and any ask rule still win, and file writes keep asking. Rejected: pointing
 agents at raw paths (paths drift, no allowlist, nothing to show in the UI);
@@ -1239,17 +1051,14 @@ folder and the computer are rebuilt).
 
 **ADR-023: Local reach is a per-agent grant, and OpenBot knows itself.** A This
 Mac agent's `access` is `project` (its assigned folder, or a managed scratch
-folder), `home`, or `full`. The workspace registry remains how projects get
-context and trust, but it is no longer the only way an agent can reach files:
-the lead runs `full` on the user's own machine because it orchestrates, managers
-default to `project`, and workers inherit their manager's reach. In a packaged
+folder), `home`, or `full`. In a packaged
 app macOS TCC is the real boundary — the app requests Documents/Desktop/
 Downloads and the user grants Full Disk Access — while in a dev checkout the
 terminal's permissions apply. Approvals remain the guardrail: every local action
 still asks unless the workspace's trusted patterns or a policy rule allow it.
 Separately, the daemon collects a `SelfInfo` (run mode, source and app paths,
 version, git revision, launch command, data and database paths, check commands),
-injects a compact `[self]` note into the lead's prompt, and exposes the detail
+injects a compact `[self]` note into each agent's prompt, and exposes the detail
 through a `system_info` tool, so an agent asked to work on OpenBot can ground
 itself and explain how to restart or update it. Rejected: full access for every
 agent (reach should be a deliberate grant); confinement as the only model (too
@@ -1288,6 +1097,14 @@ endpoints. Rejected: requiring Node on the user's machine (the SEA binary is
 self-contained); launching the daemon as a detached process (TCC would credit
 whoever started it, and quitting the app would leave it running).
 
+**ADR-018 amendment: approvals can be remembered.** An ask-tier card offers
+**Always allow** next to Approve and Deny. Approving with it writes a tool-level
+policy rule (`match: "any"`, tier `auto`) and resolves the pending request, so
+the tool stops asking. The rule is ordinary policy: deny rules
+and more specific ask rules still win, and it can be edited or removed in the
+policy editor. Rejected: a session-only memory (the user's intent is "stop
+asking", not "stop asking today"); per-agent rules (the policy engine is global).
+
 **ADR-017 amendment: memory and soul adapt automatically, but stay legible.**
 The user asked for memory and soul to change over time without being told to,
 so reflection is automatic: a background pass extracts durable memories from
@@ -1295,21 +1112,29 @@ new conversations, and the soul is rewritten once enough new memories
 accumulate. The safety property is legibility rather than a manual gate —
 every soul version is kept with its reason, the Memory panel shows what the
 assistant believes with confidence and usage, and any memory or soul version
-can be deleted or reverted in one click. Project-scoped memory belongs to the
-project manager; user memory belongs to the lead.
+can be deleted or reverted in one click. Memory is per-agent: each agent owns
+its own scope.
 
-**ADR-017: One writer for memory, a versioned soul.** The lead is the only
-writer of durable memory; workers propose findings through task results and the
-lead commits them. Memory is typed (semantic, procedural, relational, episodic),
-carries provenance (task, observation, or user statement), confidence, and
+**ADR-017: One writer for memory, a versioned soul.** Each agent is the writer
+of its own durable memory. Memory is typed (semantic, procedural, relational,
+episodic), carries provenance (source), confidence, and
 decay, and is reinforced when it proves useful. The soul is a bounded, versioned
-constitution — voice, commitments, relationship — that the lead may propose
-amending but only the user approves, so identity change is reviewable instead of
-silent. Retrieval happens at brief time as a bounded, ID'd slice; workers can
-ask for more. Completion audits may mark contradicted memories suspect instead
-of leaving them stale. Rejected: per-worker memory (duplication, conflicts);
-a static soul file (a costume that never develops); silent self-rewriting (no
-audit trail, alignment risk).
+constitution — voice, commitments, relationship — that the agent may update
+with `update_soul`, so identity change is reviewable instead of
+silent. Retrieval happens at turn time as a bounded, ID'd slice. Completion
+audits may mark contradicted memories suspect instead
+of leaving them stale. Rejected: a static soul file (a costume that never
+develops); silent self-rewriting (no audit trail, alignment risk).
+
+**ADR-026: One agent per thread.** The lead/worker runtime (one lead, project
+managers, ephemeral workers, task grants, and Jev routing — ADR-014/015/016/019)
+did not work out as a one-to-many product. OpenBot reverted to the original
+Grok Bot model: every agent is an independent identity with exactly one thread,
+its own computer set, one memory scope, and one soul, and nothing hands work
+between agents. Agents can still run on This Mac via a registered workspace and a
+per-agent access mode. Rejected: keeping the hierarchy (complexity without a
+clear win); a middle-ground shared-memory model (reintroduces the identity
+problem the revert removed).
 
 ## Running it
 

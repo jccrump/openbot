@@ -39,11 +39,34 @@ export const RolePolicySchema = z.enum([
 ]);
 export type RolePolicy = z.infer<typeof RolePolicySchema>;
 
-export const BotKindSchema = z.enum(["lead", "role", "project"]);
-export type BotKind = z.infer<typeof BotKindSchema>;
-
 export const ComputerKindSchema = z.enum(["firecracker", "mac"]);
 export type ComputerKind = z.infer<typeof ComputerKindSchema>;
+
+/**
+ * The computers an agent can act on. An agent may have just the microVM, just
+ * This Mac, or both (ADR-021). The list is the source of truth for which
+ * computer panels the UI shows; the agent's tool execution uses the primary
+ * computer (the microVM when present, otherwise This Mac).
+ */
+export function botComputers(
+  bot: { computers?: ComputerKind[] | null },
+): ComputerKind[] {
+  const list = bot.computers ?? [];
+  return list.length > 0 ? list : ["firecracker"];
+}
+
+export function botHasComputer(
+  bot: { computers?: ComputerKind[] | null },
+  computer: ComputerKind,
+): boolean {
+  return botComputers(bot).includes(computer);
+}
+
+export function primaryComputer(
+  bot: { computers?: ComputerKind[] | null },
+): ComputerKind {
+  return botHasComputer(bot, "firecracker") ? "firecracker" : "mac";
+}
 
 /**
  * How far a This Mac agent's file tools and shell may reach: its assigned
@@ -112,80 +135,18 @@ export const BotSchema = z.object({
   systemPrompt: z.string(),
   model: ModelRefSchema,
   createdAt: z.string(),
-  kind: BotKindSchema.default("role"),
   role: z.string().nullable().optional(),
   avatar: z.string().nullable().optional(),
   color: z.string().nullable().optional(),
-  /** @deprecated use computers; kept so older clients and rows still parse. */
-  computer: z.string().nullable().optional(),
-  computers: z.array(ComputerKindSchema).default(["firecracker"]),
+  /** Which computers this agent can act on: the microVM, This Mac, or both. */
+  computers: z.array(ComputerKindSchema).optional(),
   /** The project folder this agent works in; unset means a managed scratch folder. */
   workspaceId: z.string().nullable().optional(),
   /** File and shell reach on This Mac; defaults to the project folder. */
   access: AccessModeSchema.default("project"),
-  delegates: z.boolean().default(false),
   policy: RolePolicySchema.default("inherit"),
 });
 export type Bot = z.infer<typeof BotSchema>;
-
-export const TaskStatusSchema = z.enum([
-  "queued",
-  "running",
-  "done",
-  "failed",
-  "cancelled",
-]);
-export type TaskStatus = z.infer<typeof TaskStatusSchema>;
-
-export const TaskDisplaySchema = z.enum(["none", "browser", "desktop"]);
-export type TaskDisplay = z.infer<typeof TaskDisplaySchema>;
-
-export const TaskBudgetSchema = z.object({
-  wallClockMs: z.number().nullable().optional(),
-  tokens: z.number().nullable().optional(),
-  toolCalls: z.number().nullable().optional(),
-});
-export type TaskBudget = z.infer<typeof TaskBudgetSchema>;
-
-export const TaskGrantSchema = z.object({
-  tools: z.array(z.string()),
-  display: TaskDisplaySchema,
-  budget: TaskBudgetSchema,
-});
-export type TaskGrant = z.infer<typeof TaskGrantSchema>;
-
-export const TaskUsageSchema = z.object({
-  toolCalls: z.number(),
-  inputTokens: z.number(),
-  outputTokens: z.number(),
-  cacheReadTokens: z.number().optional(),
-  wallClockMs: z.number(),
-});
-export type TaskUsage = z.infer<typeof TaskUsageSchema>;
-
-export const TaskSchema = z.object({
-  id: z.string(),
-  leadId: z.string(),
-  roleId: z.string(),
-  projectId: z.string().nullable().optional(),
-  threadId: z.string().nullable(),
-  parentId: z.string().nullable(),
-  depth: z.number(),
-  title: z.string(),
-  brief: z.string(),
-  status: TaskStatusSchema,
-  display: TaskDisplaySchema,
-  grant: TaskGrantSchema.nullable(),
-  budget: TaskBudgetSchema.nullable(),
-  usage: TaskUsageSchema.nullable(),
-  result: z.string().nullable(),
-  evidence: z.string().nullable(),
-  error: z.string().nullable(),
-  createdAt: z.string(),
-  startedAt: z.string().nullable(),
-  endedAt: z.string().nullable(),
-});
-export type Task = z.infer<typeof TaskSchema>;
 
 export const MessageRoleSchema = z.enum(["user", "assistant", "system"]);
 export type MessageRole = z.infer<typeof MessageRoleSchema>;
@@ -265,7 +226,6 @@ export const DecisionInfoSchema = z.object({
   apiKeyEnv: z.string().nullable(),
   audit: z.boolean(),
   browse: z.boolean(),
-  route: z.boolean().optional(),
   guardrail: DecisionGuardrailModeSchema,
   timeoutMs: z.number(),
 });
@@ -279,7 +239,6 @@ export const DecisionSettingsPatchSchema = z.object({
   apiKeyEnv: z.string().optional(),
   audit: z.boolean().optional(),
   browse: z.boolean().optional(),
-  route: z.boolean().optional(),
   guardrail: DecisionGuardrailModeSchema.optional(),
   timeoutMs: z.number().int().min(500).max(30_000).optional(),
 });
@@ -335,7 +294,8 @@ export const PolicyRuleSchema = z.object({
   id: z.string(),
   tool: z.string(),
   scope: z.enum(["*", "firecracker", "mac"]).default("*"),
-  match: z.enum(["command", "path", "domain", "text"]),
+  /** "any" matches every call of the tool, with no pattern. */
+  match: z.enum(["command", "path", "domain", "text", "any"]),
   pattern: z.string(),
   tier: ApprovalTierSchema,
   note: z.string().nullable().optional(),
@@ -376,8 +336,6 @@ export const ApprovalRecordSchema = z.object({
   runId: z.string().nullable(),
   threadId: z.string().nullable(),
   botId: z.string().nullable(),
-  taskId: z.string().nullable(),
-  projectId: z.string().nullable(),
   tool: z.string(),
   arguments: z.string(),
   tier: ApprovalTierSchema,

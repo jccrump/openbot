@@ -10,6 +10,6 @@ CDP `session`, the `console` capture, and per-topic recipes (tabs, uploads,
 dialogs, iframes, shadow DOM, network waits, downloads, screenshots, ...).
 
 The condensed version of this material lives in the tool description
-(`packages/core/src/tools.ts`). Delivery of the full docs into a worker's
+(`packages/core/src/tools.ts`). Delivery of the full docs into an agent's
 workspace is a follow-up; the files are vendored here so the text has a
 versioned home.

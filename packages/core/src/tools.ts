@@ -12,9 +12,6 @@ import type {
   PlanStep,
   PolicySettings,
   ReasoningEffort,
-  TaskDisplay,
-  TaskGrant,
-  TaskStatus,
   ToolArtifact,
 } from "@openbot/protocol";
 import type {
@@ -82,15 +79,9 @@ export interface ToolExecutionResult {
 
 export interface ToolContext {
   botId: string;
-  /** Sandbox key: a task id for task computers, otherwise the bot id. */
-  computerId?: string;
-  /** Sandbox key for browser actions when it differs from the computer. */
-  browserId?: string;
-  /** Guest workspace directory for task sessions inside a shared computer. */
+  /** Guest workspace directory for this agent's computer (a registered project). */
   guestCwd?: string;
   computer: ComputerKind;
-  /** Every computer this agent may act on; defaults to [computer]. */
-  computers?: ComputerKind[];
   /** How far the agent's local file tools may reach (ADR-023). */
   access?: AccessMode;
   /** What the daemon knows about itself, for the system_info tool. */
@@ -108,10 +99,6 @@ export interface ToolContext {
   onDecision?: (notice: DecisionNotice) => void;
   onSandboxState: (state: SandboxState) => void;
   onOutput?: (chunk: { stream: "stdout" | "stderr"; text: string }) => void;
-  orchestrator?: OrchestratorHandle | null;
-  /** Set when this run is a worker or manager task. */
-  taskId?: string;
-  projectId?: string | null;
   memory?: MemoryService | null;
   soul?: SoulService | null;
   memoryScope?: string;
@@ -121,188 +108,9 @@ export interface ToolContext {
   readCache?: Map<string, string>;
 }
 
-export function computerLabel(kind: ComputerKind): string {
-  return kind === "mac" ? "This Mac" : "the Firecracker microVM";
-}
-
-/**
- * Resolve which computer a call acts on: the explicit `computer` argument when
- * the agent has that computer, otherwise the agent's primary. An unavailable
- * computer is an error the model can correct instead of a silent fallback
- * (ADR-021).
- */
-export function resolveToolComputer(
-  context: ToolContext,
-  args: Record<string, unknown>,
-): { computer: ComputerKind; error: string | null } {
-  const allowed =
-    context.computers && context.computers.length > 0
-      ? context.computers
-      : [context.computer];
-  const requested =
-    args.computer === "mac" || args.computer === "firecracker"
-      ? args.computer
-      : null;
-  if (requested && !allowed.includes(requested)) {
-    return {
-      computer: context.computer,
-      error:
-        `This agent does not have ${computerLabel(requested)}. ` +
-        `Available: ${allowed.map(computerLabel).join(" and ")}.`,
-    };
-  }
-  return { computer: requested ?? context.computer, error: null };
-}
-
-/**
- * The computer a call targets for policy purposes: the requested one when the
- * agent has it, otherwise the primary. The execute path rejects a computer the
- * agent does not have; policy only needs the tier and scope.
- */
-export function callComputer(
-  computers: ComputerKind[],
-  primary: ComputerKind,
-  args: Record<string, unknown>,
-): ComputerKind {
-  const requested =
-    args.computer === "mac" || args.computer === "firecracker"
-      ? args.computer
-      : null;
-  if (!requested) {
-    return primary;
-  }
-  return computers.includes(requested) ? requested : primary;
-}
-
-export interface RoleSummary {
-  id: string;
-  name: string;
-  role: string | null;
-  model: ModelRef;
-  computer: string | null;
-  computers: ComputerKind[];
-  access: AccessMode;
-  workspaceId: string | null;
-  workspace: string | null;
-  delegates: boolean;
-  busyTaskId: string | null;
-  busyTaskTitle: string | null;
-}
-
-export interface WorkspaceSummary {
-  id: string;
-  name: string;
-  root: string;
-  markers: string[];
-  missing: boolean;
-  agentCount: number;
-}
-
-export interface TaskSummary {
-  id: string;
-  title: string;
-  roleName: string;
-  status: TaskStatus;
-  display: TaskDisplay;
-  parentId: string | null;
-  depth: number;
-  createdAt: string;
-  startedAt: string | null;
-  endedAt: string | null;
-  result: string | null;
-  error: string | null;
-}
-
-export interface SpawnedTask {
-  id: string;
-  title: string;
-  roleName: string;
-  status: TaskStatus;
-  parentId: string | null;
-  depth: number;
-  queued: boolean;
-}
-
-export interface TaskGrantRequest {
-  tools?: string[];
-  display?: TaskDisplay;
-  budget?: {
-    wallClockMs?: number | null;
-    tokens?: number | null;
-    toolCalls?: number | null;
-  };
-}
-
-export interface ProjectSummary {
-  id: string;
-  name: string;
-  scope: string | null;
-  model: ModelRef;
-  status: "idle" | "working";
-  activeTaskId: string | null;
-  activeTaskTitle: string | null;
-  openTasks: number;
-  updatedAt: string;
-}
-
-export interface OrchestratorHandle {
-  listRoles(): RoleSummary[];
-  listProjects(): ProjectSummary[];
-  listWorkspaces(): WorkspaceSummary[];
-  createProject(input: {
-    callerBotId: string;
-    name: string;
-    scope: string;
-    brief?: string;
-    model?: ModelRef;
-    computers?: ComputerKind[];
-    workspaceId?: string | null;
-    access?: AccessMode;
-  }): ProjectSummary;
-  createWorker(input: {
-    callerBotId: string;
-    name: string;
-    specialty: string;
-    instructions?: string;
-    model?: ModelRef;
-    computers?: ComputerKind[];
-    workspaceId?: string | null;
-    access?: AccessMode;
-  }): { role: RoleSummary; created: boolean };
-  askProject(input: {
-    callerBotId: string;
-    projectId: string;
-    request: string;
-    title?: string;
-    grant?: TaskGrantRequest;
-  }): SpawnedTask;
-  spawn(input: {
-    callerBotId: string;
-    parentTaskId?: string;
-    roleId: string;
-    brief: string;
-    title?: string;
-    display?: TaskDisplay;
-    grant?: TaskGrantRequest;
-  }): SpawnedTask;
-  status(taskId?: string): TaskSummary[];
-  cancel(taskId: string): boolean;
-}
-
-export function isOrchestrationTool(name: string): boolean {
-  return ORCHESTRATION_TOOL_NAMES.has(name);
-}
-
-export function isReadOnlyOrchestrationTool(name: string): boolean {
-  return READ_ONLY_ORCHESTRATION_TOOL_NAMES.has(name);
-}
-
 /** Memory reads and writes are low risk and never need an approval card. */
 export function isApprovalExemptTool(name: string): boolean {
-  return (
-    name === "system_info" ||
-    READ_ONLY_ORCHESTRATION_TOOL_NAMES.has(name) || MEMORY_TOOL_NAMES.has(name)
-  );
+  return name === "system_info" || MEMORY_TOOL_NAMES.has(name);
 }
 
 export interface Tool {
@@ -348,11 +156,11 @@ function localResult(
 }
 
 function sandboxId(context: ToolContext): string {
-  return context.computerId ?? context.botId;
+  return context.botId;
 }
 
 function browserSandboxId(context: ToolContext): string {
-  return context.browserId ?? sandboxId(context);
+  return context.botId;
 }
 
 async function ensureSandbox(
@@ -368,13 +176,13 @@ async function ensureSandbox(
   context.onSandboxState(status.state);
 }
 
-// Worker sessions share their project's computer, so each session gets its own
-// directory. The directory is created once per computer + path.
+// Each session gets its own directory on the computer. The directory is
+// created once per computer + path.
 const guestWorkspaces = new Map<string, Promise<void>>();
 
 /**
  * Materialize the browser playbook (docs/skills/browser-execute, vendored from
- * browser-use, MIT) into the guest so a worker can read the recipes with
+ * browser-use, MIT) into the guest so the agent can read the recipes with
  * read_file. One copy per computer, best-effort: a failure here must never
  * block a browser call.
  */
@@ -1010,16 +818,11 @@ const shellTool: Tool = {
     },
   },
   async execute(context, args) {
-    const target = resolveToolComputer(context, args);
-    if (target.error) {
-      return { ok: false, output: target.error, durationMs: 0 };
-    }
-    context = { ...context, computer: target.computer };
     const command = typeof args.command === "string" ? args.command : "";
     if (!command) {
       return { ok: false, output: "command is required", durationMs: 0 };
     }
-    const fallback = context.computer === "mac" ? context.workspaceDir : "/root";
+    const fallback = context.computer === "mac" ? macBase(context) : "/root";
     const cwd = readCwd(args, fallback);
     const timeoutSeconds = readTimeout(args);
     if (args.background === true) {
@@ -1065,11 +868,6 @@ const readFileTool: Tool = {
     },
   },
   async execute(context, args) {
-    const computerTarget = resolveToolComputer(context, args);
-    if (computerTarget.error) {
-      return { ok: false, output: computerTarget.error, durationMs: 0 };
-    }
-    context = { ...context, computer: computerTarget.computer };
     const path = typeof args.path === "string" ? args.path : "";
     if (!path) {
       return { ok: false, output: "path is required", durationMs: 0 };
@@ -1180,11 +978,6 @@ const writeFileTool: Tool = {
     },
   },
   async execute(context, args) {
-    const target = resolveToolComputer(context, args);
-    if (target.error) {
-      return { ok: false, output: target.error, durationMs: 0 };
-    }
-    context = { ...context, computer: target.computer };
     const path = typeof args.path === "string" ? args.path : "";
     const content = typeof args.content === "string" ? args.content : "";
     if (!path) {
@@ -1252,11 +1045,6 @@ const editTool: Tool = {
     },
   },
   async execute(context, args) {
-    const target = resolveToolComputer(context, args);
-    if (target.error) {
-      return { ok: false, output: target.error, durationMs: 0 };
-    }
-    context = { ...context, computer: target.computer };
     const path = typeof args.path === "string" ? args.path : "";
     const oldString = typeof args.oldString === "string" ? args.oldString : "";
     const newString = typeof args.newString === "string" ? args.newString : "";
@@ -1366,11 +1154,6 @@ const grepTool: Tool = {
     },
   },
   async execute(context, args) {
-    const target = resolveToolComputer(context, args);
-    if (target.error) {
-      return { ok: false, output: target.error, durationMs: 0 };
-    }
-    context = { ...context, computer: target.computer };
     const pattern = typeof args.pattern === "string" ? args.pattern : "";
     if (!pattern) {
       return { ok: false, output: "pattern is required", durationMs: 0 };
@@ -1449,11 +1232,6 @@ const globTool: Tool = {
     },
   },
   async execute(context, args) {
-    const target = resolveToolComputer(context, args);
-    if (target.error) {
-      return { ok: false, output: target.error, durationMs: 0 };
-    }
-    context = { ...context, computer: target.computer };
     const pattern = typeof args.pattern === "string" ? args.pattern : "";
     if (!pattern) {
       return { ok: false, output: "pattern is required", durationMs: 0 };
@@ -1596,11 +1374,6 @@ const listDirTool: Tool = {
     },
   },
   async execute(context, args) {
-    const target = resolveToolComputer(context, args);
-    if (target.error) {
-      return { ok: false, output: target.error, durationMs: 0 };
-    }
-    context = { ...context, computer: target.computer };
     const startedAt = Date.now();
     const rawPath =
       typeof args.path === "string" && args.path ? args.path : codeRoot(context);
@@ -2909,31 +2682,6 @@ const webSearchTool: Tool = {
   },
 };
 
-function orchestratorUnavailable(): ToolExecutionResult {
-  return {
-    ok: false,
-    output: "The team orchestrator is not available in this configuration.",
-    durationMs: 0,
-  };
-}
-
-function formatElapsed(from: string, to: string | null): string {
-  const ms = Math.max(
-    0,
-    new Date(to ?? new Date().toISOString()).getTime() -
-      new Date(from).getTime(),
-  );
-  const seconds = Math.round(ms / 1000);
-  if (seconds < 60) {
-    return `${seconds}s`;
-  }
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) {
-    return `${minutes}m`;
-  }
-  return `${Math.round(minutes / 60)}h`;
-}
-
 const systemInfoTool: Tool = {
   definition: {
     name: "system_info",
@@ -2967,7 +2715,7 @@ const restartDaemonTool: Tool = {
       "Restart the OpenBot daemon so code changes take effect. Call it only " +
       "when the user asked for a restart, or after changing the daemon's own " +
       "source and verifying it with the project's checks. The current turn " +
-      "finishes first and running tasks settle before the restart; the " +
+      "finishes first and running work settles before the restart; the " +
       "conversation is preserved. A broken change can leave the daemon down, " +
       "so verify before restarting.",
     parameters: {
@@ -2986,780 +2734,6 @@ const restartDaemonTool: Tool = {
     }
     const result = context.requestRestart();
     return { ok: result.ok, output: result.message, durationMs: 0 };
-  },
-};
-
-const listRolesTool: Tool = {
-  definition: {
-    name: "list_roles",
-    description:
-      "List the team roles available to delegate work to. Returns each role's " +
-      "name and id, specialty, model, computer, and whether it is busy. Use it " +
-      "before spawn_worker when you do not already know the right role id.",
-    parameters: {
-      type: "object",
-      properties: {},
-      required: [],
-    },
-  },
-  async execute(context) {
-    const orchestrator = context.orchestrator;
-    if (!orchestrator) {
-      return orchestratorUnavailable();
-    }
-    const roles = orchestrator.listRoles();
-    if (roles.length === 0) {
-      return {
-        ok: true,
-        output:
-          "No team roles yet. The user can create a role in the app's Team section.",
-        durationMs: 0,
-      };
-    }
-    const lines = roles.map((role) => {
-      const specialty = role.role?.trim() ? ` — ${role.role.trim()}` : "";
-      const busy = role.busyTaskId
-        ? `busy with "${role.busyTaskTitle ?? "a task"}"`
-        : "idle";
-      const capability = role.delegates ? "manager (can delegate)" : "worker";
-      return `- ${role.name} (id: ${role.id})${specialty} · ${capability} · model ${role.model.provider}/${role.model.model} · computer ${role.computer ?? "firecracker"} · ${busy}`;
-    });
-    return { ok: true, output: lines.join("\n"), durationMs: 0 };
-  },
-};
-
-const spawnWorkerTool: Tool = {
-  definition: {
-    name: "spawn_worker",
-    description:
-      "Delegate a task to a team role. The worker runs in its own computer and " +
-      "reports back with a result and evidence; you will be notified when it " +
-      "finishes, so keep helping the user in the meantime. Write the brief so a " +
-      "teammate with no memory of this conversation can complete it: objective, " +
-      "constraints, deliverable shape, and what counts as done. Roles marked " +
-      "manager (see list_roles) can delegate further; their final message is " +
-      "the project report. The grant is the approval unit: when the user has " +
-      "approvals on, approving this call authorizes the grant's tools and " +
-      "budget for the whole task. A manager can only allocate tools and budget " +
-      "that fit inside its own grant. Prefer delegating long, parallel, or " +
-      "risky work and do quick lookups yourself.",
-    parameters: {
-      type: "object",
-      properties: {
-        roleId: {
-          type: "string",
-          description: "The id of the role to delegate to (see list_roles).",
-        },
-        brief: {
-          type: "string",
-          description:
-            "The complete task brief: objective, constraints, deliverable " +
-            "shape, and what counts as done.",
-        },
-        title: {
-          type: "string",
-          description:
-            "Short task title for the workboard (defaults to the first line of the brief).",
-        },
-        display: {
-          type: "string",
-          enum: ["none", "browser", "desktop"],
-          description:
-            "What the worker may use to see: none (headless, default), browser " +
-            "(a browser view), or desktop (a full desktop for native GUI work).",
-        },
-        grant: {
-          type: "object",
-          description:
-            "The task grant: which tools the worker may use without asking " +
-            "again, and its budget. Omit it for the default grant — the " +
-            "default budget is generous, so only set limits when the user " +
-            "asked for them or the task is clearly small.",
-          properties: {
-            tools: {
-              type: "array",
-              items: { type: "string" },
-              description:
-                "Tool names the worker may use (shell, read_file, write_file, " +
-                "browser, browse, desktop, web_search). Defaults to all tools " +
-                "the role's computer supports.",
-            },
-            budget: {
-              type: "object",
-              properties: {
-                wallClockMs: { type: "number" },
-                tokens: { type: "number" },
-                toolCalls: { type: "number" },
-              },
-            },
-          },
-        },
-      },
-      required: ["roleId", "brief"],
-    },
-  },
-  async execute(context, args) {
-    const orchestrator = context.orchestrator;
-    if (!orchestrator) {
-      return orchestratorUnavailable();
-    }
-    const roleId = typeof args.roleId === "string" ? args.roleId.trim() : "";
-    const brief = typeof args.brief === "string" ? args.brief.trim() : "";
-    const title = typeof args.title === "string" ? args.title.trim() : undefined;
-    const display: TaskDisplay | undefined =
-      args.display === "browser" || args.display === "desktop"
-        ? (args.display as TaskDisplay)
-        : undefined;
-    const grantArg =
-      typeof args.grant === "object" && args.grant !== null
-        ? (args.grant as Record<string, unknown>)
-        : null;
-    const tools = Array.isArray(grantArg?.tools)
-      ? grantArg.tools.filter((tool): tool is string => typeof tool === "string")
-      : undefined;
-    const budgetArg =
-      typeof grantArg?.budget === "object" && grantArg.budget !== null
-        ? (grantArg.budget as Record<string, unknown>)
-        : null;
-    const numberOrNull = (value: unknown): number | null | undefined => {
-      if (value === null) {
-        return null;
-      }
-      return typeof value === "number" && Number.isFinite(value)
-        ? value
-        : undefined;
-    };
-    const grant = grantArg
-      ? {
-          tools,
-          display,
-          budget: budgetArg
-            ? {
-                wallClockMs: numberOrNull(budgetArg.wallClockMs),
-                tokens: numberOrNull(budgetArg.tokens),
-                toolCalls: numberOrNull(budgetArg.toolCalls),
-              }
-            : undefined,
-        }
-      : undefined;
-    if (!roleId || !brief) {
-      return {
-        ok: false,
-        output: "roleId and brief are required.",
-        durationMs: 0,
-      };
-    }
-    try {
-      const task = orchestrator.spawn({
-        callerBotId: context.botId,
-        parentTaskId: context.taskId,
-        roleId,
-        brief,
-        title,
-        display,
-        grant,
-      });
-      return {
-        ok: true,
-        output:
-          `Task created for ${task.roleName}: "${task.title}" (id: ${task.id}).\n` +
-          (task.queued
-            ? "The role is busy, so the task is queued and will start when it frees up."
-            : "The worker is running now.") +
-          " You will be notified when it finishes; keep going in the meantime.",
-        durationMs: 0,
-      };
-    } catch (error) {
-      return { ok: false, output: (error as Error).message, durationMs: 0 };
-    }
-  },
-};
-
-const REASONING_EFFORTS = new Set<string>([
-  "none",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "max",
-]);
-
-/**
- * Parse the optional `model` argument the team-building tools accept. The
- * effort is validated here so a model string that never reached the schema
- * cannot reach a provider request.
- */
-function parseModelArg(value: unknown): ModelRef | undefined {
-  if (typeof value !== "object" || value === null) {
-    return undefined;
-  }
-  const record = value as Record<string, unknown>;
-  if (typeof record.provider !== "string" || typeof record.model !== "string") {
-    return undefined;
-  }
-  const effort =
-    typeof record.effort === "string" && REASONING_EFFORTS.has(record.effort)
-      ? (record.effort as ReasoningEffort)
-      : undefined;
-  return {
-    provider: record.provider,
-    model: record.model,
-    ...(effort ? { effort } : {}),
-  };
-}
-
-/**
- * Parse a computers argument: valid kinds only, deduped, in the given order.
- * Returns null when the caller did not choose (missing, invalid, or empty), so
- * the tool can ask instead of guessing.
- */
-function parseComputersArg(value: unknown): ComputerKind[] | null {
-  if (!Array.isArray(value)) {
-    return null;
-  }
-  const seen = new Set<ComputerKind>();
-  for (const item of value) {
-    if (item === "firecracker" || item === "mac") {
-      seen.add(item);
-    }
-  }
-  return seen.size > 0 ? [...seen] : null;
-}
-
-const createWorkerTool: Tool = {
-  definition: {
-    name: "create_worker",
-    description:
-      "Add a persistent team worker when list_roles has no role that fits a " +
-      "task. The worker inherits your computers and stays on the team for " +
-      "future tasks, so the team grows only as the work needs it. Give it a " +
-      "short name and a one-line specialty, then delegate to it with " +
-      "spawn_worker using the returned id. Check list_roles first and reuse " +
-      "an existing role whenever one fits.",
-    parameters: {
-      type: "object",
-      properties: {
-        name: {
-          type: "string",
-          description: "Short worker name, for example \"Weather Watcher\".",
-        },
-        specialty: {
-          type: "string",
-          description:
-            "One line describing what this worker is for, for example " +
-            "\"checks National Weather Service forecasts and active alerts\".",
-        },
-        instructions: {
-          type: "string",
-          description:
-            "Optional extra instructions for the worker: sites, tools, or " +
-            "rules it should always follow.",
-        },
-        model: {
-          type: "object",
-          description:
-            "Optional model for the worker (provider, model, and reasoning effort).",
-          properties: {
-            provider: { type: "string" },
-            model: { type: "string" },
-            effort: {
-              type: "string",
-              enum: ["none", "minimal", "low", "medium", "high", "max"],
-              description: "Optional reasoning effort for the worker's model.",
-            },
-          },
-        },
-      },
-      required: ["name", "specialty"],
-    },
-  },
-  async execute(context, args) {
-    const orchestrator = context.orchestrator;
-    if (!orchestrator) {
-      return orchestratorUnavailable();
-    }
-    const name = typeof args.name === "string" ? args.name.trim() : "";
-    const specialty =
-      typeof args.specialty === "string" ? args.specialty.trim() : "";
-    const instructions =
-      typeof args.instructions === "string" ? args.instructions.trim() : undefined;
-    const model = parseModelArg(args.model);
-    if (!name || !specialty) {
-      return {
-        ok: false,
-        output: "name and specialty are required.",
-        durationMs: 0,
-      };
-    }
-    try {
-      const { role, created } = orchestrator.createWorker({
-        callerBotId: context.botId,
-        name,
-        specialty,
-        instructions,
-        model,
-      });
-      return {
-        ok: true,
-        output: created
-          ? `Worker created: ${role.name} (id: ${role.id}) — ${specialty}.\n` +
-            "It is on the team now; delegate to it with spawn_worker using " +
-            "this id."
-          : `A worker named ${role.name} already exists (id: ${role.id}); ` +
-            "reusing it. Delegate to it with spawn_worker.",
-        durationMs: 0,
-      };
-    } catch (error) {
-      return { ok: false, output: (error as Error).message, durationMs: 0 };
-    }
-  },
-};
-
-const workerStatusTool: Tool = {
-  definition: {
-    name: "worker_status",
-    description:
-      "Check on team tasks: status, elapsed time, result summary, or error. " +
-      "Omit taskId to see all active and recent tasks. Use it to answer the " +
-      "user about work in progress.",
-    parameters: {
-      type: "object",
-      properties: {
-        taskId: {
-          type: "string",
-          description: "A specific task id (optional).",
-        },
-      },
-      required: [],
-    },
-  },
-  async execute(context, args) {
-    const orchestrator = context.orchestrator;
-    if (!orchestrator) {
-      return orchestratorUnavailable();
-    }
-    const taskId = typeof args.taskId === "string" ? args.taskId.trim() : "";
-    const all = orchestrator.status(taskId || undefined);
-    // A manager's own request is "running" for as long as it works; listing it
-    // in the overview reads as a stuck sibling. Keep it only when asked for by
-    // id.
-    const tasks = taskId
-      ? all
-      : all.filter((task) => task.id !== context.taskId);
-    if (tasks.length === 0) {
-      return {
-        ok: true,
-        output:
-          taskId || all.length === 0
-            ? "No team tasks yet."
-            : "No other team tasks are active; this request is the only thing running.",
-        durationMs: 0,
-      };
-    }
-    const lines = tasks.map((task) => {
-      const elapsed = task.endedAt
-        ? `took ${formatElapsed(task.startedAt ?? task.createdAt, task.endedAt)}`
-        : task.startedAt
-          ? `running ${formatElapsed(task.startedAt, null)}`
-          : "queued";
-      const head = `- "${task.title}" (id: ${task.id}) · ${task.roleName} · ${task.status} · ${elapsed}`;
-      if (task.status === "done" && task.result) {
-        const excerpt =
-          task.result.length > 400
-            ? `${task.result.slice(0, 400)}…`
-            : task.result;
-        return `${head}\n  result: ${excerpt.replace(/\n/g, "\n  ")}`;
-      }
-      if (task.status === "failed" && task.error) {
-        return `${head}\n  error: ${task.error}`;
-      }
-      return head;
-    });
-    return { ok: true, output: lines.join("\n"), durationMs: 0 };
-  },
-};
-
-const cancelWorkerTool: Tool = {
-  definition: {
-    name: "cancel_worker",
-    description:
-      "Cancel a running team task by id. The worker stops and its partial " +
-      "results stay in the task transcript.",
-    parameters: {
-      type: "object",
-      properties: {
-        taskId: { type: "string", description: "The task id to cancel." },
-      },
-      required: ["taskId"],
-    },
-  },
-  async execute(context, args) {
-    const orchestrator = context.orchestrator;
-    if (!orchestrator) {
-      return orchestratorUnavailable();
-    }
-    const taskId = typeof args.taskId === "string" ? args.taskId.trim() : "";
-    if (!taskId) {
-      return { ok: false, output: "taskId is required.", durationMs: 0 };
-    }
-    const cancelled = orchestrator.cancel(taskId);
-    return {
-      ok: cancelled,
-      output: cancelled
-        ? `Task ${taskId} is being cancelled.`
-        : `No running task found with id ${taskId}.`,
-      durationMs: 0,
-    };
-  },
-};
-
-const listWorkspacesTool: Tool = {
-  definition: {
-    name: "list_workspaces",
-    description:
-      "List the user's project folders (workspaces) that the daemon has " +
-      "registered on this Mac. Each has an id, a name, and a root path. When " +
-      "a request is about an existing project, create its manager with " +
-      "create_project and pass that workspace id so the manager's file tools " +
-      "and shell work inside the project folder.",
-    parameters: {
-      type: "object",
-      properties: {},
-      required: [],
-    },
-  },
-  async execute(context) {
-    const orchestrator = context.orchestrator;
-    if (!orchestrator) {
-      return orchestratorUnavailable();
-    }
-    const workspaces = orchestrator.listWorkspaces();
-    if (workspaces.length === 0) {
-      return {
-        ok: true,
-        output:
-          "No project folders are registered. The user can add or scan for " +
-          "them in Settings → Workspaces.",
-        durationMs: 0,
-      };
-    }
-    const lines = workspaces.map((workspace) => {
-      const markers = workspace.markers.length
-        ? ` · ${workspace.markers.join(", ")}`
-        : "";
-      const agents =
-        workspace.agentCount > 0
-          ? ` · ${workspace.agentCount} agent${
-              workspace.agentCount === 1 ? "" : "s"
-            }`
-          : "";
-      const missing = workspace.missing ? " · MISSING on disk" : "";
-      return (
-        `- ${workspace.name} (id: ${workspace.id}) at ${workspace.root}` +
-        `${markers}${agents}${missing}`
-      );
-    });
-    return { ok: true, output: lines.join("\n"), durationMs: 0 };
-  },
-};
-
-const listProjectsTool: Tool = {
-  definition: {
-    name: "list_projects",
-    description:
-      "List the projects the user already has. A project is a persistent " +
-      "manager with its own computer that keeps that topic's context and " +
-      "assets. Check this before creating anything: when a request matches an " +
-      "existing project's scope, send it there with ask_project instead of " +
-      "creating a new project.",
-    parameters: {
-      type: "object",
-      properties: {},
-      required: [],
-    },
-  },
-  async execute(context) {
-    const orchestrator = context.orchestrator;
-    if (!orchestrator) {
-      return orchestratorUnavailable();
-    }
-    const projects = orchestrator.listProjects();
-    if (projects.length === 0) {
-      return {
-        ok: true,
-        output:
-          "No projects yet. Create one with create_project when the user asks " +
-          "for something that will need ongoing or detailed work.",
-        durationMs: 0,
-      };
-    }
-    const lines = projects.map((project) => {
-      const scope = project.scope?.trim() ? ` — ${project.scope.trim()}` : "";
-      const status =
-        project.status === "working"
-          ? `working on "${project.activeTaskTitle ?? "a request"}"`
-          : "idle";
-      const open =
-        project.openTasks > 0 ? ` · ${project.openTasks} open` : "";
-      return `- ${project.name} (id: ${project.id})${scope} · ${status}${open}`;
-    });
-    return { ok: true, output: lines.join("\n"), durationMs: 0 };
-  },
-};
-
-const createProjectTool: Tool = {
-  definition: {
-    name: "create_project",
-    description:
-      "Create a new project: a persistent manager with its own computer that " +
-      "keeps the project's context and assets across requests. Only create a " +
-      "project when list_projects has nothing that matches the user's request. " +
-      "Name it after the thing being worked on (for example \"Buddy Weather\") " +
-      "and give a one-line scope. The project owns all future work on that " +
-      "topic; you route to it with ask_project. If the user has not said " +
-      "which computers the project should have, ask before calling this tool: " +
-      "the Firecracker microVM, This Mac, or both.",
-    parameters: {
-      type: "object",
-      properties: {
-        name: {
-          type: "string",
-          description: "Short project name, for example \"Buddy Weather\".",
-        },
-        scope: {
-          type: "string",
-          description:
-            "One line describing what this project is responsible for.",
-        },
-        brief: {
-          type: "string",
-          description:
-            "Optional context for the project manager: what the user is " +
-            "building, constraints, and any assets that already exist.",
-        },
-        computers: {
-          type: "array",
-          items: { type: "string", enum: ["firecracker", "mac"] },
-          description:
-            "Which computers the manager and its workers may use: " +
-            "[\"firecracker\"] for the isolated microVM, [\"mac\"] for This " +
-            "Mac, or both. Do not guess: ask the user when the request does " +
-            "not say.",
-        },
-        workspace: {
-          type: "string",
-          description:
-            "Optional project folder for the manager: a workspace id from " +
-            "list_workspaces, or its name. Omit for a managed scratch folder.",
-        },
-        model: {
-          type: "object",
-          description:
-            "Optional model for the project manager (provider, model, and reasoning effort).",
-          properties: {
-            provider: { type: "string" },
-            model: { type: "string" },
-            effort: {
-              type: "string",
-              enum: ["none", "minimal", "low", "medium", "high", "max"],
-              description: "Optional reasoning effort for the manager's model.",
-            },
-          },
-        },
-      },
-      required: ["name", "scope"],
-    },
-  },
-  async execute(context, args) {
-    const orchestrator = context.orchestrator;
-    if (!orchestrator) {
-      return orchestratorUnavailable();
-    }
-    if (context.taskId) {
-      return {
-        ok: false,
-        output:
-          "Only the lead can create projects. Ask the lead to create it.",
-        durationMs: 0,
-      };
-    }
-    const name = typeof args.name === "string" ? args.name.trim() : "";
-    const scope = typeof args.scope === "string" ? args.scope.trim() : "";
-    const brief = typeof args.brief === "string" ? args.brief.trim() : undefined;
-    const model = parseModelArg(args.model);
-    const computers = parseComputersArg(args.computers);
-    if (!name || !scope) {
-      return {
-        ok: false,
-        output: "name and scope are required.",
-        durationMs: 0,
-      };
-    }
-    if (!computers) {
-      return {
-        ok: false,
-        output:
-          "No computers were chosen for this project. Ask the user whether " +
-          "the manager should have the Firecracker microVM, This Mac, or " +
-          "both, then call create_project again with the answer.",
-        durationMs: 0,
-      };
-    }
-    let workspaceId: string | null = null;
-    if (typeof args.workspace === "string" && args.workspace.trim()) {
-      const wanted = args.workspace.trim().toLowerCase();
-      const match = orchestrator
-        .listWorkspaces()
-        .find(
-          (workspace) =>
-            workspace.id === args.workspace ||
-            workspace.name.toLowerCase() === wanted,
-        );
-      if (!match) {
-        return {
-          ok: false,
-          output:
-            `No workspace matches "${args.workspace}". Check list_workspaces ` +
-            "and pass the id or exact name, or omit workspace for a scratch " +
-            "folder.",
-          durationMs: 0,
-        };
-      }
-      workspaceId = match.id;
-    }
-    try {
-      const project = orchestrator.createProject({
-        callerBotId: context.botId,
-        name,
-        scope,
-        brief,
-        model,
-        computers,
-        workspaceId,
-      });
-      return {
-        ok: true,
-        output:
-          `Project created: ${project.name} (id: ${project.id}).\n` +
-          "It has its own computer and keeps this topic's context. Send the " +
-          "user's request with ask_project.",
-        durationMs: 0,
-      };
-    } catch (error) {
-      return { ok: false, output: (error as Error).message, durationMs: 0 };
-    }
-  },
-};
-
-const askProjectTool: Tool = {
-  definition: {
-    name: "ask_project",
-    description:
-      "Send a request to an existing project's manager. The manager works on " +
-      "its own computer, can delegate to workers, and reports back; you will " +
-      "be notified when it finishes, so keep helping the user in the " +
-      "meantime. Write the request so the manager can act without this " +
-      "conversation: what the user wants, constraints, and the deliverable.",
-    parameters: {
-      type: "object",
-      properties: {
-        projectId: {
-          type: "string",
-          description: "The project id (see list_projects).",
-        },
-        request: {
-          type: "string",
-          description:
-            "The complete request: what the user wants, constraints, and " +
-            "what the deliverable is.",
-        },
-        title: {
-          type: "string",
-          description:
-            "Short request title for the workboard (defaults to the first line).",
-        },
-        grant: {
-          type: "object",
-          description:
-            "Optional budget for the request. The manager allocates tools and " +
-            "budget to workers inside it.",
-          properties: {
-            budget: {
-              type: "object",
-              properties: {
-                wallClockMs: { type: "number" },
-                tokens: { type: "number" },
-                toolCalls: { type: "number" },
-              },
-            },
-          },
-        },
-      },
-      required: ["projectId", "request"],
-    },
-  },
-  async execute(context, args) {
-    const orchestrator = context.orchestrator;
-    if (!orchestrator) {
-      return orchestratorUnavailable();
-    }
-    const projectId =
-      typeof args.projectId === "string" ? args.projectId.trim() : "";
-    const request = typeof args.request === "string" ? args.request.trim() : "";
-    const title = typeof args.title === "string" ? args.title.trim() : undefined;
-    const grantArg =
-      typeof args.grant === "object" && args.grant !== null
-        ? (args.grant as Record<string, unknown>)
-        : null;
-    const budgetArg =
-      typeof grantArg?.budget === "object" && grantArg.budget !== null
-        ? (grantArg.budget as Record<string, unknown>)
-        : null;
-    const numberOrNull = (value: unknown): number | null | undefined => {
-      if (value === null) {
-        return null;
-      }
-      return typeof value === "number" && Number.isFinite(value)
-        ? value
-        : undefined;
-    };
-    const grant = budgetArg
-      ? {
-          budget: {
-            wallClockMs: numberOrNull(budgetArg.wallClockMs),
-            tokens: numberOrNull(budgetArg.tokens),
-            toolCalls: numberOrNull(budgetArg.toolCalls),
-          },
-        }
-      : undefined;
-    if (!projectId || !request) {
-      return {
-        ok: false,
-        output: "projectId and request are required.",
-        durationMs: 0,
-      };
-    }
-    try {
-      const task = orchestrator.askProject({
-        callerBotId: context.botId,
-        projectId,
-        request,
-        title,
-        grant,
-      });
-      return {
-        ok: true,
-        output:
-          `Request sent to ${task.roleName}: "${task.title}" (id: ${task.id}).\n` +
-          (task.queued
-            ? "The project is busy, so the request is queued and will start when it frees up."
-            : "The project manager is working on it now.") +
-          " You will be notified when it finishes.",
-        durationMs: 0,
-      };
-    } catch (error) {
-      return { ok: false, output: (error as Error).message, durationMs: 0 };
-    }
   },
 };
 
@@ -3827,12 +2801,12 @@ const rememberTool: Tool = {
         ? Math.min(1, Math.max(0, args.confidence))
         : 0.8;
     const saved = await memory.remember({
-      scope: context.memoryScope ?? "user",
+      scope: context.memoryScope ?? context.botId,
       type,
       content,
       importance,
       confidence,
-      source: context.taskId ? "project" : "lead",
+      source: "agent",
     });
     return {
       ok: true,
@@ -3874,8 +2848,8 @@ const recallTool: Tool = {
       typeof args.limit === "number"
         ? Math.min(20, Math.max(1, Math.round(args.limit)))
         : 8;
-    const scope = context.memoryScope ?? "user";
-    const scopes = scope === "user" ? ["user"] : [scope, "user"];
+    const scope = context.memoryScope ?? context.botId;
+    const scopes = [scope];
     const hits = await memory.recall(query, { scopes, limit });
     if (hits.length === 0) {
       return { ok: true, output: "No matching memories.", durationMs: 0 };
@@ -3959,13 +2933,6 @@ const updateSoulTool: Tool = {
     if (!soul) {
       return memoryUnavailable();
     }
-    if (context.taskId) {
-      return {
-        ok: false,
-        output: "Only the lead can update the soul.",
-        durationMs: 0,
-      };
-    }
     const current = soul.current(context.botId);
     const commitments = Array.isArray(args.commitments)
       ? args.commitments.filter(
@@ -3985,8 +2952,8 @@ const updateSoulTool: Tool = {
             ? args.relationship
             : current.content.relationship,
       },
-      typeof args.reason === "string" ? args.reason : "lead update",
-      "lead",
+      typeof args.reason === "string" ? args.reason : "agent update",
+      "agent",
     );
     return {
       ok: true,
@@ -3995,26 +2962,6 @@ const updateSoulTool: Tool = {
     };
   },
 };
-
-const ORCHESTRATION_TOOL_NAMES = new Set([
-  "list_roles",
-  "spawn_worker",
-  "create_worker",
-  "worker_status",
-  "cancel_worker",
-  "list_projects",
-  "create_project",
-  "ask_project",
-  "list_workspaces",
-]);
-
-// Reads never need approval; the tools that create or change work do.
-const READ_ONLY_ORCHESTRATION_TOOL_NAMES = new Set([
-  "list_roles",
-  "worker_status",
-  "list_projects",
-  "list_workspaces",
-]);
 
 const MEMORY_TOOL_NAMES = new Set([
   "remember",
@@ -4040,15 +2987,6 @@ export const tools: Tool[] = [
   webSearchTool,
   systemInfoTool,
   restartDaemonTool,
-  listRolesTool,
-  spawnWorkerTool,
-  createWorkerTool,
-  workerStatusTool,
-  cancelWorkerTool,
-  listProjectsTool,
-  createProjectTool,
-  askProjectTool,
-  listWorkspacesTool,
   rememberTool,
   recallTool,
   forgetTool,
@@ -4298,51 +3236,13 @@ const VM_ONLY_TOOL_NAMES = new Set([
   "desktop",
 ]);
 
-/**
- * An agent with both computers gets one tool set, not two: the shared tools
- * grow an optional `computer` argument and the description says so (ADR-021).
- */
-function withComputerChoice(
-  definition: ToolDefinition,
-  computers: ComputerKind[],
-): ToolDefinition {
-  const labels = computers.map(computerLabel).join(" or ");
-  const parameters = definition.parameters as {
-    properties?: Record<string, unknown>;
-    [key: string]: unknown;
-  };
-  return {
-    ...definition,
-    description:
-      `${definition.description} This agent has more than one computer ` +
-      `(${labels}); pass computer to choose which one this call acts on.`,
-    parameters: {
-      ...parameters,
-      properties: {
-        ...(parameters.properties ?? {}),
-        computer: {
-          type: "string",
-          enum: ["firecracker", "mac"],
-          description:
-            "Which computer to act on: \"firecracker\" is the isolated " +
-            "Linux microVM (the default); \"mac\" is the user's Mac, where " +
-            "file tools are confined to the agent's workspace folder and " +
-            "every action is approval-gated.",
-        },
-      },
-    },
-  };
-}
-
 export function toolDefinitions(
-  computers: ComputerKind[] = ["firecracker"],
-  options: { browse?: boolean; delegate?: boolean } = {},
+  computer: ComputerKind = "firecracker",
+  options: { browse?: boolean } = {},
 ): ToolDefinition[] {
-  const hasVm = computers.includes("firecracker");
-  const hasMac = computers.includes("mac");
-  const hasComputer = hasVm || hasMac;
+  const hasVm = computer === "firecracker";
+  const hasMac = computer === "mac";
   const browse = Boolean(options.browse) && hasVm;
-  const delegate = Boolean(options.delegate);
   // Deterministic evaluations replace the web with fixtures; the live search
   // tool would silently bypass them, so it is disabled there.
   const webSearch = process.env.OPENBOT_WEBSEARCH_DISABLED !== "1";
@@ -4350,7 +3250,7 @@ export function toolDefinitions(
     .filter((tool) => {
       const name = tool.definition.name;
       if (COMPUTER_TOOL_NAMES.has(name)) {
-        return hasComputer;
+        return true;
       }
       if (VM_ONLY_TOOL_NAMES.has(name)) {
         return hasVm;
@@ -4361,18 +3261,13 @@ export function toolDefinitions(
       if (name === "web_search") {
         return webSearch;
       }
-      if (ORCHESTRATION_TOOL_NAMES.has(name) || MEMORY_TOOL_NAMES.has(name)) {
-        return delegate;
-      }
+      // Memory, soul, system_info, and the plan tool work on either computer.
       return true;
     })
     .map((tool) => {
       const name = tool.definition.name;
       if (!COMPUTER_TOOL_NAMES.has(name)) {
         return tool.definition;
-      }
-      if (hasVm && hasMac) {
-        return withComputerChoice(tool.definition, computers);
       }
       return hasMac
         ? (LOCAL_DEFINITIONS[name] ?? tool.definition)
