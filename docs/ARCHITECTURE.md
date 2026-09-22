@@ -1021,14 +1021,20 @@ mid-provider-call (a stream cannot accept a new user turn).
 
 **ADR-021: An agent has a computer set.** A bot's `computers` is a capability
 set (`["firecracker"]`, `["mac"]`, or both), not a single kind. The app's
-right-column panels switch between the agent's computers; the agent's tool
-execution uses its primary computer — the microVM when present, otherwise This
-Mac — so `browser` and `desktop` stay microVM-only and `web_search` stays
-host-side. A missing or empty set means the microVM. The lead/worker parts of
-the earlier capability-set design (the lead getting both, managers choosing a
-set, workers inheriting it) were removed with ADR-026. Rejected: a separate tool
-name per computer (doubles the tool surface and descriptions); defaulting an
-unspecified set to This Mac (the microVM is the safe default).
+right-column panels switch between the agent's computers; the agent's computer
+tools (`shell`, `read_file`, `write_file`, `edit`, `grep`, `glob`, `list_dir`)
+target its primary computer — the microVM when present, otherwise This Mac —
+unless the call names another computer the agent has, in which case the call
+runs there under that computer's own rules (a Mac call still honors `access`
+and the approvals policy). The `computer` argument is only offered when the
+agent has both, so single-computer agents keep the plain schema. `browser` and
+`desktop` stay microVM-only and `web_search` stays host-side. A missing or
+empty set means the microVM. The lead/worker parts of the earlier
+capability-set design (the lead getting both, managers choosing a set, workers
+inheriting it) were removed with ADR-026. Rejected: a separate tool name per
+computer (doubles the tool surface and descriptions); defaulting an unspecified
+set to This Mac (the microVM is the safe default); a silent fallback when a
+call names a computer the agent lacks (the model should learn the real set).
 
 **ADR-022: Workspaces map local projects; agents reference them by id.** The
 daemon keeps a registry of local project folders — name, root, detected markers

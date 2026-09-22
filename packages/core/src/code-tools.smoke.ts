@@ -16,7 +16,7 @@ import { join } from "node:path";
 import type { Bot } from "@openbot/protocol";
 import { lineDiff } from "./diff";
 import { listComputerFiles, readComputerFile } from "./files";
-import { findTool, type ToolContext, type ToolExecutionResult } from "./tools";
+import { findTool, resolveToolComputer, toolDefinitions, type ToolContext, type ToolExecutionResult } from "./tools";
 
 const workspace = mkdtempSync(join(tmpdir(), "openbot-code-tools-"));
 
@@ -594,6 +594,74 @@ check("restart_daemon forwards to the daemon scheduler", async () => {
   assert.equal(called, 1);
   assert.equal(result.ok, true);
   assert.match(result.output, /scheduled/);
+});
+
+// ---------------------------------------------------------------------------
+// dual-computer agents (ADR-021)
+// ---------------------------------------------------------------------------
+
+const dualContext: ToolContext = {
+  ...context,
+  computer: "firecracker",
+  computers: ["mac", "firecracker"],
+};
+
+function shellParameters(
+  definitions: ReturnType<typeof toolDefinitions>,
+): Record<string, unknown> {
+  const shell = definitions.find((definition) => definition.name === "shell");
+  assert.ok(shell, "shell should be defined");
+  const parameters = shell.parameters as {
+    properties?: Record<string, unknown>;
+  };
+  return parameters.properties ?? {};
+}
+
+check("a dual-computer agent gets a computer argument on its tools", async () => {
+  const definitions = toolDefinitions("firecracker", {
+    computers: ["mac", "firecracker"],
+  });
+  assert.ok(shellParameters(definitions).computer);
+  const shell = definitions.find((definition) => definition.name === "shell");
+  assert.match(shell?.description ?? "", /two computers/);
+  assert.ok(
+    definitions.some((definition) => definition.name === "browser"),
+    "the microVM tools stay offered",
+  );
+});
+
+check("a single-computer agent keeps the plain tool schema", async () => {
+  assert.equal(shellParameters(toolDefinitions("mac")).computer, undefined);
+  assert.equal(
+    shellParameters(toolDefinitions("firecracker")).computer,
+    undefined,
+  );
+});
+
+check("resolveToolComputer defaults to the primary computer", async () => {
+  const target = resolveToolComputer(dualContext, { command: "ls" });
+  assert.equal(target.error, null);
+  assert.equal(target.computer, "firecracker");
+});
+
+check("resolveToolComputer honors an available computer", async () => {
+  const target = resolveToolComputer(dualContext, { computer: "mac" });
+  assert.equal(target.error, null);
+  assert.equal(target.computer, "mac");
+});
+
+check("resolveToolComputer rejects an unknown computer", async () => {
+  const target = resolveToolComputer(dualContext, { computer: "windows" });
+  assert.match(target.error ?? "", /unknown computer/);
+});
+
+check("resolveToolComputer rejects a computer the agent lacks", async () => {
+  const vmOnly: ToolContext = {
+    ...dualContext,
+    computers: ["firecracker"],
+  };
+  const target = resolveToolComputer(vmOnly, { computer: "mac" });
+  assert.match(target.error ?? "", /no This Mac computer/);
 });
 
 // ---------------------------------------------------------------------------

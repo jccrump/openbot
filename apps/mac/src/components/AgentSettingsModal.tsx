@@ -231,27 +231,29 @@ export function AgentSettingsModal({
               </p>
             </label>
 
-            <label className="field">
-              <span>This Mac access</span>
-              <select
-                value={access}
-                aria-label="Agent This Mac access"
-                onChange={(event) =>
-                  setAccess(event.target.value as AccessMode)
-                }
-              >
-                <option value="project">Project folder only</option>
-                <option value="home">Home folder</option>
-                <option value="full">Full access</option>
-              </select>
-              <p className="computer-warning">
-                {access === "project"
-                  ? "File tools and shell stay inside the project folder."
-                  : access === "home"
-                    ? "File tools and shell reach anywhere under your home folder."
-                    : "File tools and shell reach the whole filesystem as you. Every local action still asks unless the project trusts it."}
-              </p>
-            </label>
+            {computers.includes("mac") && (
+              <label className="field">
+                <span>This Mac access</span>
+                <select
+                  value={access}
+                  aria-label="Agent This Mac access"
+                  onChange={(event) =>
+                    setAccess(event.target.value as AccessMode)
+                  }
+                >
+                  <option value="project">Project folder only</option>
+                  <option value="home">Home folder</option>
+                  <option value="full">Full access</option>
+                </select>
+                <p className="computer-warning">
+                  {access === "project"
+                    ? "File tools and shell stay inside the project folder."
+                    : access === "home"
+                      ? "File tools and shell reach anywhere under your home folder."
+                      : "File tools and shell reach the whole filesystem as you. Every local action still asks unless the project trusts it."}
+                </p>
+              </label>
+            )}
 
             <label className="field">
               <span>Approvals policy</span>

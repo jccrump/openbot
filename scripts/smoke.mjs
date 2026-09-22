@@ -388,6 +388,15 @@ const mockModelServer = createServer(async (request, response) => {
 
   modelRequests.push({
     hasTools: Array.isArray(parsed.tools) && parsed.tools.length > 0,
+    toolNames: Array.isArray(parsed.tools)
+      ? parsed.tools.map((tool) => tool.function?.name).filter(Boolean)
+      : [],
+    shellParams: Array.isArray(parsed.tools)
+      ? Object.keys(
+          parsed.tools.find((tool) => tool.function?.name === "shell")?.function
+            ?.parameters?.properties ?? {},
+        )
+      : [],
     system: systemContent,
     lastUser: lastUserContent,
     reasoningEffort: parsed.reasoning_effort ?? null,
@@ -448,6 +457,27 @@ const mockModelServer = createServer(async (request, response) => {
           }
         : last.content.startsWith("read-outside:")
         ? { name: "read_file", args: { path: "/etc/hosts" } }
+        : last.content.startsWith("read-outside-mac:")
+        ? {
+            name: "read_file",
+            args: { path: "/etc/hosts", computer: "mac" },
+          }
+        : last.content.startsWith("run-mac:")
+        ? {
+            name: "shell",
+            args: {
+              command: last.content.slice("run-mac:".length).trim(),
+              computer: "mac",
+            },
+          }
+        : last.content.startsWith("run-vm:")
+        ? {
+            name: "shell",
+            args: {
+              command: last.content.slice("run-vm:".length).trim(),
+              computer: "firecracker",
+            },
+          }
         : last.content.startsWith("run:")
         ? {
             name: "shell",
@@ -2145,6 +2175,123 @@ try {
   assert.match(vmRunResult.output, /Linux mockvm/);
   await waitFor("chat.done");
 
+  // A dual-computer agent (ADR-021) can aim a computer tool at either of its
+  // computers: the microVM stays the default, and computer="mac" runs on the
+  // host under the local approvals policy.
+  socket.send(
+    JSON.stringify({
+      type: "bots.create",
+      requestId: "bot-dual-1",
+      name: "Dual Tester",
+      computers: ["mac", "firecracker"],
+    }),
+  );
+  const dualCreated = await waitFor("bot.created");
+  assert.deepEqual(dualCreated.bot.computers, ["mac", "firecracker"]);
+  const dualBotId = dualCreated.bot.id;
+
+  executedCommands.length = 0;
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId: dualBotId,
+      text: "run-mac: echo dual-mac",
+    }),
+  );
+  const dualMacApproval = await waitFor("approval.request");
+  assert.equal(dualMacApproval.name, "shell");
+  const dualMacTurn = modelRequests.findLast(
+    (request) => request.lastUser === "run-mac: echo dual-mac",
+  );
+  assert.ok(
+    dualMacTurn,
+    "the dual-computer turn should reach the model",
+  );
+  assert.ok(
+    dualMacTurn.shellParams.includes("computer"),
+    "a dual-computer agent should be offered the computer argument",
+  );
+  assert.ok(
+    dualMacTurn.toolNames.includes("browser"),
+    "the microVM tools stay offered to a dual-computer agent",
+  );
+  assert.match(
+    dualMacTurn.system,
+    /\[computers\]/,
+    "the prompt should explain the two computers",
+  );
+  assert.match(
+    dualMacApproval.arguments,
+    /"computer":"mac"/,
+    "the approval card should carry the Mac target",
+  );
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: dualMacApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const dualMacResult = await waitFor("tool.result");
+  assert.equal(dualMacResult.ok, true);
+  assert.match(dualMacResult.output, /\[local Mac\]/);
+  assert.match(dualMacResult.output, /dual-mac/);
+  assert.deepEqual(
+    executedCommands,
+    [],
+    "a Mac-targeted call must not run in the sandbox",
+  );
+  await waitFor("chat.done");
+
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId: dualBotId,
+      text: "run-vm: uname -a",
+    }),
+  );
+  const dualVmApproval = await waitFor("approval.request");
+  assert.equal(dualVmApproval.name, "shell");
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: dualVmApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const dualVmResult = await waitFor("tool.result");
+  assert.equal(dualVmResult.ok, true);
+  assert.match(dualVmResult.output, /Linux mockvm/);
+  assert.deepEqual(
+    executedCommands,
+    ["uname -a"],
+    "a microVM-targeted call should run in the sandbox",
+  );
+  await waitFor("chat.done");
+
+  // The Mac side of a dual-computer agent still honors its access grant: a
+  // project-scoped call cannot read outside the workspace.
+  socket.send(
+    JSON.stringify({
+      type: "chat.send",
+      botId: dualBotId,
+      text: "read-outside-mac:",
+    }),
+  );
+  const dualReadApproval = await waitFor("approval.request");
+  assert.equal(dualReadApproval.name, "read_file");
+  socket.send(
+    JSON.stringify({
+      type: "approval.respond",
+      requestId: dualReadApproval.requestId,
+      decision: "approve",
+    }),
+  );
+  const dualReadDenied = await waitFor("tool.result");
+  assert.equal(dualReadDenied.ok, false);
+  assert.match(dualReadDenied.output, /escapes the bot workspace/);
+  await waitFor("chat.done");
+
   socket.send(
     JSON.stringify({
       type: "provider.upsert",
@@ -3357,7 +3504,7 @@ try {
   );
 
   console.log(
-    `SMOKE OK — one agent per thread, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), workspace registry (scan roots, marker detection, node_modules skipped, add/ignore/remove, shell and file tools rooted in the project, escape rejected, trusted commands with deny precedence), access modes (full reach outside home, home confinement, system_info self-report), permissions report, agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-agent policy narrowing, egress allowlist), harness robustness (list_dir, shell output spill, shell background, browser press/select/wait_for/snapshot/tabs/upload/downloads, duplicate-failure stop, raw-markup retry, changed-file metadata), context discipline (unchanged reads and identical results collapse), working plan (update_plan persists and is injected), output screening (injected instructions in shell output are annotated), busy-turn delivery (queue waits for the stop, steer redirects the running turn, persisted default), chat clear (transcript archived in place, title reset, fresh turn on the same thread)`,
+    `SMOKE OK — one agent per thread, approved shell tool (${executedCommands[0]}), host-routed browser tool, completion-driven research beyond the old round limit, denied command, persistence, RFB framebuffer through daemon proxy, local-computer bot (host exec, forced approvals, bots.update), dual-computer agent (computer argument per call, Mac calls on the host and microVM calls in the sandbox, project confinement on the Mac), workspace registry (scan roots, marker detection, node_modules skipped, add/ignore/remove, shell and file tools rooted in the project, escape rejected, trusted commands with deny precedence), access modes (full reach outside home, home confinement, system_info self-report), permissions report, agent deletion (threads, messages, workspace, VM destroy), provider CRUD, settings, error path, Jev decision audit (draft repair without the model verifier), Jev browse loop (link choice, one approval), untrusted-content guardrail, bot-check pause and in-place retry, per-step message and capsule persistence, memory and soul (explicit remember/recall, background reflection extracting memories, automatic soul versioning, soul update and revert, decay/prune archiving stale memories), approvals policy (argument rules deny without asking, per-tool auto tiers, timeout auto-deny, persisted audit trail, presets, per-agent policy narrowing, egress allowlist), harness robustness (list_dir, shell output spill, shell background, browser press/select/wait_for/snapshot/tabs/upload/downloads, duplicate-failure stop, raw-markup retry, changed-file metadata), context discipline (unchanged reads and identical results collapse), working plan (update_plan persists and is injected), output screening (injected instructions in shell output are annotated), busy-turn delivery (queue waits for the stop, steer redirects the running turn, persisted default), chat clear (transcript archived in place, title reset, fresh turn on the same thread)`,
   );
 } finally {
   socket?.close();

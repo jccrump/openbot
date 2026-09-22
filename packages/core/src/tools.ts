@@ -81,7 +81,13 @@ export interface ToolContext {
   botId: string;
   /** Guest workspace directory for this agent's computer (a registered project). */
   guestCwd?: string;
+  /** The computer a call targets by default; the agent's primary. */
   computer: ComputerKind;
+  /**
+   * Every computer this agent has (ADR-021). A call may name one of them, and
+   * the primary stays the default.
+   */
+  computers?: ComputerKind[];
   /** How far the agent's local file tools may reach (ADR-023). */
   access?: AccessMode;
   /** What the daemon knows about itself, for the system_info tool. */
@@ -3229,6 +3235,112 @@ const COMPUTER_TOOL_NAMES = new Set([
   "list_dir",
 ]);
 
+/**
+ * The computer tools when the agent has both computers (ADR-021). Rather than
+ * a second tool name per computer, each tool gains an optional `computer`
+ * argument, so the model picks the target per call and the microVM stays the
+ * default.
+ */
+const COMPUTER_CHOICE_PARAM = {
+  type: "string",
+  enum: ["firecracker", "mac"],
+  description:
+    'Which computer to use: "firecracker" for the sandboxed Linux microVM ' +
+    '(the default), or "mac" for the user\'s Mac.',
+};
+
+const DUAL_PATH_DESCRIPTION =
+  "Path on the chosen computer. On the microVM it is used as given, absolute " +
+  "or relative to the working directory; on This Mac it must resolve inside " +
+  "the agent's access root.";
+
+const DUAL_DIRECTORY_DESCRIPTION =
+  "Directory on the chosen computer. Defaults to the working directory; on " +
+  "This Mac it must resolve inside the agent's access root.";
+
+const DUAL_NOTE =
+  "This agent has two computers: the sandboxed Linux microVM and the user's " +
+  'Mac. Leave computer unset to work in the microVM, or set computer="mac" to ' +
+  "work on the user's Mac, where commands run as the user, file paths are " +
+  "limited by the agent's access mode, and the approvals policy still applies.";
+
+const DUAL_PARAM_DESCRIPTIONS: Record<string, Record<string, string>> = {
+  shell: {
+    cwd:
+      "Working directory. Defaults to /root on the microVM, or the agent's " +
+      "workspace folder on This Mac.",
+  },
+  read_file: { path: DUAL_PATH_DESCRIPTION },
+  write_file: { path: DUAL_PATH_DESCRIPTION },
+  edit: { path: DUAL_PATH_DESCRIPTION },
+  grep: {
+    path: `File or directory to search. ${DUAL_DIRECTORY_DESCRIPTION}`,
+  },
+  glob: { path: DUAL_DIRECTORY_DESCRIPTION },
+  list_dir: { path: DUAL_DIRECTORY_DESCRIPTION },
+};
+
+function dualDefinition(name: string, base: ToolDefinition): ToolDefinition {
+  const parameters = base.parameters as {
+    properties?: Record<string, Record<string, unknown>>;
+    [key: string]: unknown;
+  };
+  const properties: Record<string, unknown> = {
+    ...(parameters.properties ?? {}),
+  };
+  for (const [key, description] of Object.entries(
+    DUAL_PARAM_DESCRIPTIONS[name] ?? {},
+  )) {
+    properties[key] = { ...(properties[key] as object), description };
+  }
+  properties.computer = COMPUTER_CHOICE_PARAM;
+  return {
+    ...base,
+    description: `${base.description} ${DUAL_NOTE}`,
+    parameters: { ...parameters, properties },
+  };
+}
+
+function computerLabel(computer: ComputerKind): string {
+  return computer === "mac" ? "This Mac" : "the microVM";
+}
+
+/**
+ * The computer a call targets: the agent's primary unless the model names one
+ * of its computers (ADR-021). An unknown or unavailable name is an error
+ * rather than a silent fallback, so the model learns the real computer set.
+ */
+export function resolveToolComputer(
+  context: ToolContext,
+  args: Record<string, unknown>,
+): { computer: ComputerKind; error: string | null } {
+  const computers =
+    context.computers && context.computers.length > 0
+      ? context.computers
+      : [context.computer];
+  const requested = args.computer;
+  if (requested === undefined || requested === null || requested === "") {
+    return { computer: context.computer, error: null };
+  }
+  if (requested !== "mac" && requested !== "firecracker") {
+    return {
+      computer: context.computer,
+      error:
+        `unknown computer "${String(requested)}"; use "firecracker" for the ` +
+        `microVM or "mac" for the user's Mac`,
+    };
+  }
+  if (!computers.includes(requested)) {
+    return {
+      computer: context.computer,
+      error:
+        `this agent has no ${computerLabel(requested)} computer; it can use ` +
+        computers.map(computerLabel).join(" and "),
+    };
+  }
+  return { computer: requested, error: null };
+}
+
 const VM_ONLY_TOOL_NAMES = new Set([
   "browser",
   "browser_execute",
@@ -3238,10 +3350,15 @@ const VM_ONLY_TOOL_NAMES = new Set([
 
 export function toolDefinitions(
   computer: ComputerKind = "firecracker",
-  options: { browse?: boolean } = {},
+  options: { browse?: boolean; computers?: ComputerKind[] } = {},
 ): ToolDefinition[] {
-  const hasVm = computer === "firecracker";
-  const hasMac = computer === "mac";
+  const computers =
+    options.computers && options.computers.length > 0
+      ? options.computers
+      : [computer];
+  const hasVm = computers.includes("firecracker");
+  const hasMac = computers.includes("mac");
+  const dual = hasVm && hasMac;
   const browse = Boolean(options.browse) && hasVm;
   // Deterministic evaluations replace the web with fixtures; the live search
   // tool would silently bypass them, so it is disabled there.
@@ -3268,6 +3385,9 @@ export function toolDefinitions(
       const name = tool.definition.name;
       if (!COMPUTER_TOOL_NAMES.has(name)) {
         return tool.definition;
+      }
+      if (dual) {
+        return dualDefinition(name, tool.definition);
       }
       return hasMac
         ? (LOCAL_DEFINITIONS[name] ?? tool.definition)
