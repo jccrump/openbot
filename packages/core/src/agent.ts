@@ -25,7 +25,7 @@ import type {
   ToolArtifact,
   ToolCallRecord,
 } from "@openbot/protocol";
-import { primaryComputer } from "@openbot/protocol";
+import { botComputers, primaryComputer } from "@openbot/protocol";
 import type { SandboxBackend } from "@openbot/sandbox";
 import type { ApprovalBroker } from "./approvals";
 import type { ChallengeBroker } from "./challenges";
@@ -57,6 +57,7 @@ import type { SoulService } from "./soul";
 import {
   findTool,
   isApprovalExemptTool,
+  resolveToolComputer,
   toolDefinitions,
   type Tool,
   type ToolContext,
@@ -685,8 +686,22 @@ async function runTool(
       };
     }
   }
+  // The model may aim a computer tool at either of the agent's computers; the
+  // context carries the resolved target so every backend call follows it.
+  const target = resolveToolComputer(context, args);
+  if (target.error) {
+    return {
+      ok: false,
+      output: toolErrorText(tool.definition.name, target.error),
+      durationMs: 0,
+    };
+  }
+  const callContext: ToolContext =
+    target.computer === context.computer
+      ? context
+      : { ...context, computer: target.computer };
   try {
-    return await tool.execute(context, args);
+    return await tool.execute(callContext, args);
   } catch (error) {
     const message = (error as Error).message || String(error);
     // A sandbox that is unreachable or still booting fails before the command
@@ -695,7 +710,7 @@ async function runTool(
       await abortableDelay(SANDBOX_RETRY_DELAY_MS, context.signal);
       if (!context.signal?.aborted) {
         try {
-          return await tool.execute(context, args);
+          return await tool.execute(callContext, args);
         } catch (retryError) {
           return {
             ok: false,
@@ -832,8 +847,12 @@ export async function runAgent(
     }
   }
 
+  const computers = botComputers(bot);
   const computer: ComputerKind = primaryComputer(bot);
   const local = computer === "mac";
+  const hasVm = computers.includes("firecracker");
+  const hasMac = computers.includes("mac");
+  const dual = hasVm && hasMac;
   const decisionRuntime = deps.decision();
   const emitDecision = (notice: DecisionNotice): void => {
     emit({
@@ -866,11 +885,12 @@ export async function runAgent(
     : join(deps.dataDir, "workspaces", bot.id);
   const guestCwd = workspace && !local ? workspaceGuestRoot(workspace) : undefined;
   const toolContext: ToolContext | null =
-    local || deps.sandbox
+    hasMac || deps.sandbox
       ? {
           botId: bot.id,
           guestCwd,
           computer,
+          computers,
           access: bot.access,
           self: deps.self,
           requestRestart: deps.requestRestart,
@@ -916,7 +936,7 @@ export async function runAgent(
           : ""),
     );
   }
-  if (local && bot.access !== "project") {
+  if (hasMac && bot.access !== "project") {
     contextParts.push(
       bot.access === "home"
         ? "[access] This Mac access is Home: file tools and shell reach " +
@@ -926,6 +946,16 @@ export async function runAgent(
         : "[access] This Mac access is Full: file tools and shell reach the " +
             "whole filesystem. Every local action still asks unless the " +
             "project's trust patterns allow it.",
+    );
+  }
+  if (dual) {
+    contextParts.push(
+      "[computers] This agent has two computers: the sandboxed Linux microVM " +
+        "and the user's Mac. The shell and file tools take an optional " +
+        '`computer` argument: leave it unset for the microVM, or set ' +
+        'computer="mac" to work on the user\'s Mac. Mac commands run as the ' +
+        "user, file paths are limited by the agent's access mode, and the " +
+        "approvals policy still applies.",
     );
   }
   if (deps.self) {
@@ -974,6 +1004,7 @@ export async function runAgent(
   const turnContext = contextParts.filter(Boolean).join("\n\n");
   const definitions: ToolDefinition[] = toolContext
     ? toolDefinitions(computer, {
+        computers,
         browse: Boolean(
           decisionRuntime.client && decisionRuntime.settings.browse,
         ),
@@ -1015,7 +1046,7 @@ export async function runAgent(
   }
   // A hard shell egress policy is enforced on the VM's network interface for
   // the whole turn, so commands cannot reach hosts the browser would refuse.
-  if (toolContext && !local && deps.sandbox) {
+  if (toolContext && hasVm && deps.sandbox) {
     const egress = policySettings.egress;
     try {
       await deps.sandbox.setNetworkPolicy(
@@ -1030,7 +1061,8 @@ export async function runAgent(
   }
   // The approvals policy decides auto/ask/deny per call. Rules can scope
   // themselves to microVM or This Mac; local-Mac tools ask unless a mac-scoped
-  // rule allows them (ADR-010, ADR-018).
+  // rule allows them (ADR-010, ADR-018). The target computer is the call's own
+  // (the model may name either of the agent's computers), not the run's.
   const evaluateToolApproval = (
     call: ToolCall,
   ): { tier: ApprovalTier; reason: string } => {
@@ -1049,13 +1081,22 @@ export async function runAgent(
         args = {};
       }
     }
+    if (!toolContext) {
+      return { tier: "auto", reason: "no computer is available for this run" };
+    }
+    // A call naming a computer the agent does not have fails in the tool; it
+    // never reaches the user as an approval card.
+    const target = resolveToolComputer(toolContext, args);
+    if (target.error) {
+      return { tier: "auto", reason: target.error };
+    }
     return evaluatePolicy({
       policy: policySettings,
       requireApproval: deps.requireApproval,
       tool: call.name,
       args,
-      computer,
-      local,
+      computer: target.computer,
+      local: target.computer === "mac",
     });
   };
 

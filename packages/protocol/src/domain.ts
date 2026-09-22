@@ -45,8 +45,9 @@ export type ComputerKind = z.infer<typeof ComputerKindSchema>;
 /**
  * The computers an agent can act on. An agent may have just the microVM, just
  * This Mac, or both (ADR-021). The list is the source of truth for which
- * computer panels the UI shows; the agent's tool execution uses the primary
- * computer (the microVM when present, otherwise This Mac).
+ * computer panels the UI shows and which computers a tool call may name; the
+ * primary computer (the microVM when present, otherwise This Mac) is the
+ * default target when a call does not name one.
  */
 export function botComputers(
   bot: { computers?: ComputerKind[] | null },

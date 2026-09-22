@@ -1667,8 +1667,9 @@ body {
   color: var(--text-secondary);
 }
 
-/* The computer column: a single stack of panels on the right. Its bar holds
-   the computer switcher on the left and the panel toggles on the right. */
+/* The microVM column: a tabbed card for the agent's computer above a routines
+   section, with a bar holding the VM/Local switch and the collapse control.
+   Agents that only run on This Mac have no column. */
 
 .panel-column {
   flex: 0 0 400px;
@@ -1680,27 +1681,38 @@ body {
   z-index: 12;
 }
 
-/* With every panel collapsed the column keeps just its bar, so the computer
-   switcher and the panel toggles stay reachable. */
-.panel-column-empty {
-  flex: 0 0 auto;
-  max-width: none;
-}
-
 .panel-column-bar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 8px;
   flex: 0 0 auto;
   min-width: 0;
 }
 
-.panel-column-title {
-  padding: 0 6px;
+/* Collapsed, the column is just its bar so the VM button sits in the top
+   right corner of the window. */
+.panel-column-empty {
+  flex: 0 0 auto;
+  max-width: none;
+}
+
+/* "VM" is the control that expands the collapsed column. */
+.panel-column-open {
+  padding: 2px 8px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
   font-size: 12px;
   font-weight: 600;
-  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.panel-column-open:hover {
+  background: var(--hover);
+  color: var(--text);
 }
 
 .panel-column-actions {
@@ -1709,51 +1721,28 @@ body {
   gap: 4px;
 }
 
-.panel-stack {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  flex: 1 1 auto;
-  min-height: 0;
-}
-
-.panel-section {
-  display: flex;
-  flex-direction: column;
-  flex: 1 1 0;
-  min-height: 0;
-  overflow: hidden;
-  padding: 10px 12px;
-  background: var(--bg-chat);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-}
-
-.panel-section-screen {
-  flex: 1 1 auto;
-}
-
+/* The VM/Local switch, shown when the agent has both computers. It takes the
+   bar's free space so the collapse control stays in the top right corner. */
 .computer-tabs {
   display: flex;
-  gap: 4px;
-  flex: 0 0 auto;
-  padding: 4px;
-  background: var(--bg-chat);
+  align-items: center;
+  gap: 2px;
+  margin-right: auto;
+  padding: 2px;
   border: 1px solid var(--border);
-  border-radius: 12px;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
-  pointer-events: auto;
+  border-radius: 9px;
+  background: var(--bg-chat);
 }
 
 .computer-tab {
-  padding: 4px 12px;
-  border-radius: 8px;
+  padding: 2px 10px;
   border: none;
+  border-radius: 7px;
   background: transparent;
   color: var(--text-muted);
   font-family: inherit;
   font-size: 12px;
-  font-weight: 500;
+  font-weight: 600;
   cursor: pointer;
 }
 
@@ -1766,7 +1755,19 @@ body {
   color: var(--text);
 }
 
-.panel-section-header {
+/* The tabbed screen/terminal/files card: the top third of the column. */
+.panel-window {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 33%;
+  min-height: 0;
+  padding: 12px;
+  background: var(--bg-chat);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+}
+
+.panel-tabs {
   display: flex;
   align-items: center;
   gap: 4px;
@@ -1774,47 +1775,44 @@ body {
   min-width: 0;
 }
 
-.panel-section-toggle {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-shrink: 0;
-  padding: 4px 6px;
+.panel-tab {
+  padding: 4px 10px;
   border: none;
   border-radius: 8px;
   background: transparent;
-  color: var(--text-secondary);
-  font: inherit;
+  color: var(--text-muted);
+  font-family: inherit;
   font-size: 12px;
-  letter-spacing: -0.1px;
+  font-weight: 600;
   cursor: pointer;
 }
 
-.panel-section-toggle:hover {
+.panel-tab:hover {
+  color: var(--text);
+}
+
+.panel-tab-active {
   background: var(--hover);
   color: var(--text);
 }
 
-.panel-section-chevron {
-  display: flex;
-  color: var(--text-muted);
-  transition: transform 120ms ease;
-}
-
-.panel-section-chevron-collapsed {
-  transform: rotate(-90deg);
-}
-
-.panel-section-label {
-  font-weight: 600;
-}
-
-.panel-section-actions {
+.panel-tabs-actions {
   display: flex;
   align-items: center;
   gap: 4px;
   margin-left: auto;
   min-width: 0;
+}
+
+.panel-tab-pane {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.panel-tab-pane[hidden] {
+  display: none;
 }
 
 .panel-section-body {
@@ -1824,10 +1822,6 @@ body {
   min-height: 0;
   padding-top: 6px;
   overflow: hidden;
-}
-
-.panel-section-body[hidden] {
-  display: none;
 }
 
 /* Files */
@@ -2163,38 +2157,6 @@ body {
   overflow: hidden;
 }
 
-/* The expanded screen is the column itself: it breaks out of the layout and
-   covers the window. */
-.panel-column-expanded {
-  position: fixed;
-  inset: 10px;
-  z-index: 26;
-  width: auto;
-  max-width: none;
-  padding: 10px;
-  background: var(--bg-chat);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  overflow: hidden;
-}
-
-.panel-column-expanded .panel-section {
-  flex: 1 1 auto;
-}
-
-/* The frame lives inside .screen-view, so the whole chain has to stretch for
-   the canvas to get a real height (a 0-height frame scales the canvas to 0). */
-.panel-column-expanded .screen-view {
-  flex: 1;
-  min-height: 0;
-}
-
-.panel-column-expanded .screen-frame {
-  flex: 1;
-  aspect-ratio: auto;
-  min-height: 0;
-}
-
 .vnc-target {
   position: absolute;
   inset: 0;
@@ -2204,11 +2166,6 @@ body {
   outline: none;
 }
 
-/* The inline preview never captures the pointer; the expanded view can. */
-.screen-frame:not(.screen-frame-expanded) .vnc-target canvas {
-  cursor: default !important;
-}
-
 .screen-fallback {
   position: absolute;
   inset: 0;
@@ -2216,68 +2173,6 @@ body {
   align-items: center;
   justify-content: center;
   background: var(--screen-bg);
-}
-
-.screen-frame-actions {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  z-index: 3;
-  display: flex;
-  gap: 4px;
-}
-
-.screen-action {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  padding: 0;
-  border: none;
-  border-radius: 6px;
-  background: rgba(0, 0, 0, 0.55);
-  color: #ffffff;
-  cursor: pointer;
-}
-
-.screen-action:hover {
-  background: rgba(0, 0, 0, 0.75);
-}
-
-.screen-open {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  z-index: 3;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  height: 32px;
-  padding: 0 15px 0 11px;
-  border: none;
-  border-radius: 999px;
-  background: rgba(0, 0, 0, 0.72);
-  color: #ffffff;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  opacity: 0;
-  transition: opacity 120ms ease;
-}
-
-.screen-frame:hover .screen-open,
-.screen-open:focus-visible {
-  opacity: 1;
-}
-
-.screen-open:hover {
-  background: rgba(0, 0, 0, 0.85);
-}
-
-.screen-frame:not(.screen-frame-expanded) {
-  cursor: pointer;
 }
 
 .screen-image {
@@ -2411,8 +2306,13 @@ body {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding-top: 14px;
-  border-top: 0.5px solid var(--hairline);
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 12px;
+  background: var(--bg-chat);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow-y: auto;
 }
 
 .routines h2 {
@@ -3532,7 +3432,7 @@ body {
   justify-content: center;
   gap: 8px;
   flex-shrink: 0;
-  padding: 9px 16px 5px;
+  padding: 8px 16px;
 }
 
 .agent-badge-avatar {
@@ -3553,7 +3453,7 @@ body {
 /* The badge now clears the floating computer toggle, so the transcript only
    needs its normal breathing room. */
 .chat > .transcript {
-  padding-top: 12px;
+  padding-top: 10px;
 }
 
 .composer-note {

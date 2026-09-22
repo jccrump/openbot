@@ -17,8 +17,8 @@ import type {
   ToolCallRecord,
   Workspace,
 } from "@openbot/protocol";
-import { botComputers } from "@openbot/protocol";
 import { Settings } from "./Settings";
+import { botComputers, primaryComputer } from "@openbot/protocol";
 import { AgentSettingsModal } from "./components/AgentSettingsModal";
 import { ApprovalsModal } from "./components/ApprovalsModal";
 import { ComputerChoices } from "./components/ComputerChoices";
@@ -55,42 +55,29 @@ const STATUS_LABEL: Record<string, string> = {
   disconnected: "Daemon offline — run pnpm dev:daemon",
 };
 
-const PANEL_SECTIONS_KEY = "openbot.panelSections.v2";
+const PANEL_OPEN_KEY = "openbot.panelOpen.v3";
 const SCREEN_POLL_MS = 1500;
 const SCREEN_OFF_POLL_MS = 8_000;
 
-type PanelSection = "screen" | "files" | "terminal";
+type ScreenStatus = "loading" | "live" | "vm-off" | "error";
 
-const PANEL_SECTIONS: Array<{ id: PanelSection; label: string }> = [
+type PanelTab = "screen" | "terminal" | "files";
+
+const PANEL_TABS: Array<{ id: PanelTab; label: string }> = [
   { id: "screen", label: "Screen" },
   { id: "terminal", label: "Terminal" },
   { id: "files", label: "Files" },
 ];
 
-type PanelCollapsed = Record<PanelSection, boolean>;
+/** This Mac has no captured screen, so its panels are terminal and files only. */
+const LOCAL_PANEL_TABS = PANEL_TABS.filter((tab) => tab.id !== "screen");
 
-type ScreenStatus = "loading" | "live" | "vm-off" | "error";
-
-function storedPanelCollapsed(): PanelCollapsed {
-  const collapsed: PanelCollapsed = {
-    screen: true,
-    files: true,
-    terminal: true,
-  };
+function storedPanelOpen(): boolean {
   try {
-    const raw = localStorage.getItem(PANEL_SECTIONS_KEY);
-    if (!raw) {
-      return collapsed;
-    }
-    const parsed = JSON.parse(raw) as Partial<Record<PanelSection, unknown>>;
-    for (const section of PANEL_SECTIONS) {
-      const value = parsed[section.id];
-      if (typeof value === "boolean") {
-        collapsed[section.id] = value;
-      }
-    }
-  } catch {}
-  return collapsed;
+    return localStorage.getItem(PANEL_OPEN_KEY) !== "0";
+  } catch {
+    return true;
+  }
 }
 
 interface ToolArguments {
@@ -259,38 +246,6 @@ function ClearIcon() {
   );
 }
 
-function FolderTabIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <path
-        d="M2 4.2c0-.7.6-1.2 1.2-1.2h2.6l1.4 1.6h5.6c.7 0 1.2.6 1.2 1.2v6.5c0 .7-.6 1.2-1.2 1.2H3.2c-.7 0-1.2-.6-1.2-1.2V4.2Z"
-        stroke="currentColor"
-        strokeWidth="1.4"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
-}
-
-function TerminalTabIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <rect x="2" y="2.8" width="12" height="10.4" rx="1.8" stroke="currentColor" strokeWidth="1.4" />
-      <path d="m5 6.4 2 1.8-2 1.8M8.8 10h2.4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  );
-}
-
-function PanelSectionIcon({ section }: { section: PanelSection }) {
-  if (section === "screen") {
-    return <MonitorIcon />;
-  }
-  if (section === "files") {
-    return <FolderTabIcon />;
-  }
-  return <TerminalTabIcon />;
-}
-
 function PauseIcon() {
   return (
     <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
@@ -304,20 +259,6 @@ function PlayIcon() {
   return (
     <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
       <path d="M3.4 2.4 9.6 6l-6.2 3.6V2.4Z" fill="currentColor" />
-    </svg>
-  );
-}
-
-function ExpandIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <path
-        d="M9.5 2.8h3.7v3.7M13.2 2.8 9.1 6.9M6.5 13.2H2.8V9.5M2.8 13.2l4.1-4.1"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
     </svg>
   );
 }
@@ -351,26 +292,6 @@ function GearIcon() {
     >
       <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
       <circle cx="12" cy="12" r="3" />
-    </svg>
-  );
-}
-
-function DeleteAgentIcon() {
-  return (
-    <svg
-      width="15"
-      height="15"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-      <circle cx="9" cy="7" r="4" />
-      <path d="m17 8 5 5M22 8l-5 5" />
     </svg>
   );
 }
@@ -605,7 +526,7 @@ function ThreadChat({
   onOpenScreen,
   onOpenApprovals,
   onOpenMemory,
-  onDelete,
+  onOpenAgentSettings,
   messages,
   streaming,
   activity,
@@ -627,7 +548,7 @@ function ThreadChat({
   onOpenScreen: () => void;
   onOpenApprovals: () => void;
   onOpenMemory: () => void;
-  onDelete: () => void;
+  onOpenAgentSettings: () => void;
   messages: Message[];
   streaming: StreamingState | null;
   activity: ToolActivity[];
@@ -684,11 +605,11 @@ function ThreadChat({
           {bot && (
             <button
               className="icon-button"
-              title={`Delete ${botName}`}
-              aria-label={`Delete ${botName}`}
-              onClick={onDelete}
+              title="Agent settings"
+              aria-label="Agent settings"
+              onClick={onOpenAgentSettings}
             >
-              <DeleteAgentIcon />
+              <GearIcon />
             </button>
           )}
         </div>
@@ -968,18 +889,16 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [settingsBotId, setSettingsBotId] = useState<string | null>(null);
-  const [deleteOpen, setDeleteOpen] = useState(false);
-  const [panelCollapsed, setPanelCollapsed] =
-    useState<PanelCollapsed>(storedPanelCollapsed);
+  const [panelOpen, setPanelOpen] = useState<boolean>(storedPanelOpen);
+  const [panelTab, setPanelTab] = useState<PanelTab>("screen");
+  const [panelComputer, setPanelComputer] = useState<ComputerKind | null>(null);
   const [screenPlaying, setScreenPlaying] = useState(true);
-  const [screenExpanded, setScreenExpanded] = useState(false);
   const [screenImageUrl, setScreenImageUrl] = useState<string | null>(null);
   const [screenUpdatedAt, setScreenUpdatedAt] = useState<number | null>(null);
   const [screenStatus, setScreenStatus] = useState<ScreenStatus>("loading");
   const [screenVmState, setScreenVmState] = useState<string | null>(null);
   const [screenError, setScreenError] = useState<string | null>(null);
   const [vncState, setVncState] = useState<VncState>("idle");
-  const [panelComputer, setPanelComputer] = useState<ComputerKind | null>(null);
   const [windowActive, setWindowActive] = useState(
     () => !document.hidden && document.hasFocus(),
   );
@@ -989,32 +908,38 @@ export default function App() {
   const botName = bot?.name ?? "Assistant";
   const screenBot = bot;
   const screenBotName = screenBot?.name ?? "Assistant";
-  // The right-column panels are computer-scoped: tabs let the user switch
-  // which of the agent's computers they are browsing.
+  // The right column is one container for the agent's computers. An agent with
+  // both gets a VM/Local switch; This Mac has no captured screen, so its view
+  // offers only the terminal and files. This Mac agents get no container at
+  // all: their computer is this one, so the user already has their own screen,
+  // terminal, and Finder.
+  const agentHasVm = hasVm(screenBot);
   const availableComputers: ComputerKind[] = screenBot
     ? botComputers(screenBot)
     : ["firecracker"];
   const activeComputer: ComputerKind =
     panelComputer && availableComputers.includes(panelComputer)
       ? panelComputer
-      : (availableComputers[0] ?? "firecracker");
+      : screenBot
+        ? primaryComputer(screenBot)
+        : "firecracker";
   const showScreen = activeComputer === "firecracker";
-  // The Files section browses the computer currently selected in the panels.
-  const filesTarget: ComputerKind = activeComputer;
-  // Screen is VM-only; when the local tab is active it disappears entirely.
-  const visibleSections = PANEL_SECTIONS.filter(
-    (section) => section.id !== "screen" || showScreen,
-  );
-  const anySectionOpen = visibleSections.some(
-    (section) => !panelCollapsed[section.id],
-  );
+  const panelTabs = showScreen ? PANEL_TABS : LOCAL_PANEL_TABS;
+  // Switching to a computer without a screen tab falls back to its first tab
+  // without losing the other computer's last tab.
+  const activeTab: PanelTab = panelTabs.some((tab) => tab.id === panelTab)
+    ? panelTab
+    : (panelTabs[0]?.id ?? "terminal");
+  const panelComputerLabel = activeComputer === "firecracker" ? "VM" : "Local";
+  // The Files tab on This Mac starts at the agent's access root, so the crumb
+  // names the folder the user granted instead of a bare "Workspace".
   const filesWorkspace = screenBot?.workspaceId
     ? (daemon.workspaces.find(
         (workspace) => workspace.id === screenBot.workspaceId,
       ) ?? null)
     : null;
   const filesRootLabel =
-    filesTarget !== "mac"
+    activeComputer !== "mac"
       ? undefined
       : (screenBot?.access ?? "project") === "home"
         ? "Home"
@@ -1053,39 +978,38 @@ export default function App() {
   const vncUrl = screenBot
     ? `${DAEMON_HTTP_URL.replace(/^http/, "ws")}/bots/${encodeURIComponent(screenBot.id)}/vnc`
     : "";
-  const terminalUrl = screenBot
-    ? `${DAEMON_HTTP_URL.replace(/^http/, "ws")}/bots/${encodeURIComponent(screenBot.id)}/terminal?computer=${activeComputer}`
-    : "";
-  const canStream = Boolean(screenBot) && showScreen && hasVm(screenBot);
+  const terminalUrl = (computer: ComputerKind) =>
+    screenBot
+      ? `${DAEMON_HTTP_URL.replace(/^http/, "ws")}/bots/${encodeURIComponent(screenBot.id)}/terminal?computer=${computer}`
+      : "";
+  const canStream = Boolean(screenBot) && agentHasVm;
   const canConnectTerminal = Boolean(screenBot);
   const vncLive = vncState === "live";
   const vncActive =
     canStream &&
+    showScreen &&
     screenPlaying &&
-    !panelCollapsed.screen &&
+    panelOpen &&
+    activeTab === "screen" &&
     screenStatus !== "vm-off";
 
-  const togglePanelSection = (section: PanelSection) => {
-    setPanelCollapsed((current) => {
-      const next = { ...current, [section]: !current[section] };
+  const togglePanel = () => {
+    setPanelOpen((current) => {
+      const next = !current;
       try {
-        localStorage.setItem(PANEL_SECTIONS_KEY, JSON.stringify(next));
+        localStorage.setItem(PANEL_OPEN_KEY, next ? "1" : "0");
       } catch {}
       return next;
     });
   };
 
   const openScreenTab = () => {
-    setPanelCollapsed((current) => {
-      if (!current.screen) {
-        return current;
-      }
-      const next = { ...current, screen: false };
-      try {
-        localStorage.setItem(PANEL_SECTIONS_KEY, JSON.stringify(next));
-      } catch {}
-      return next;
-    });
+    setPanelOpen(true);
+    setPanelComputer("firecracker");
+    setPanelTab("screen");
+    try {
+      localStorage.setItem(PANEL_OPEN_KEY, "1");
+    } catch {}
   };
 
   const screenCaption = (() => {
@@ -1126,27 +1050,6 @@ export default function App() {
       window.removeEventListener("blur", syncActivity);
     };
   }, []);
-
-  useEffect(() => {
-    if (!screenExpanded) {
-      return;
-    }
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        event.stopPropagation();
-        setScreenExpanded(false);
-      }
-    };
-    window.addEventListener("keydown", onKeyDown, true);
-    return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [screenExpanded]);
-
-  useEffect(() => {
-    if ((panelCollapsed.screen || !showScreen) && screenExpanded) {
-      setScreenExpanded(false);
-    }
-  }, [panelCollapsed.screen, showScreen, screenExpanded]);
 
   const activeThreadId = daemon.activeThreadId;
   const activity = useMemo(
@@ -1217,7 +1120,6 @@ export default function App() {
     setScreenError(null);
     setScreenStatus("loading");
     setVncState("idle");
-    setPanelComputer(null);
   }, [screenBot?.id]);
 
   useEffect(() => {
@@ -1230,12 +1132,12 @@ export default function App() {
 
   useEffect(() => {
     if (
-      panelCollapsed.screen ||
-      !showScreen ||
+      !panelOpen ||
+      activeTab !== "screen" ||
+      !agentHasVm ||
       !screenPlaying ||
       !windowActive ||
       !screenBot ||
-      !hasVm(screenBot) ||
       vncLive
     ) {
       return;
@@ -1311,8 +1213,9 @@ export default function App() {
       }
     };
   }, [
-    panelCollapsed.screen,
-    showScreen,
+    panelOpen,
+    activeTab,
+    agentHasVm,
     screenPlaying,
     windowActive,
     screenBot,
@@ -1339,21 +1242,12 @@ export default function App() {
 
   const screenPane = (
     <section className="screen-view">
-      <div
-        className={`screen-frame ${
-          screenExpanded ? "screen-frame-expanded" : ""
-        }`}
-        onClick={
-          canStream && !screenExpanded
-            ? () => setScreenExpanded(true)
-            : undefined
-        }
-      >
+      <div className="screen-frame">
         {canStream && (
           <VncView
             url={vncUrl}
             active={vncActive}
-            interactive={screenExpanded}
+            interactive={panelOpen && activeTab === "screen"}
             onState={setVncState}
           />
         )}
@@ -1377,27 +1271,6 @@ export default function App() {
                 </span>
               </div>
             )}
-          </div>
-        )}
-        {canStream && !screenExpanded && (
-          <button
-            className="screen-open"
-            onClick={() => setScreenExpanded(true)}
-          >
-            <ExpandIcon />
-            <span>Open</span>
-          </button>
-        )}
-        {canStream && screenExpanded && (
-          <div className="screen-frame-actions">
-            <button
-              className="screen-action"
-              title="Collapse (Esc)"
-              aria-label="Collapse desktop view"
-              onClick={() => setScreenExpanded(false)}
-            >
-              <CollapseIcon />
-            </button>
           </div>
         )}
       </div>
@@ -1460,7 +1333,11 @@ export default function App() {
           onOpenScreen={openScreenTab}
           onOpenApprovals={() => setApprovalsOpen(true)}
           onOpenMemory={() => setMemoryOpen(true)}
-          onDelete={() => setDeleteOpen(true)}
+          onOpenAgentSettings={() => {
+            if (bot) {
+              setSettingsBotId(bot.id);
+            }
+          }}
           messages={daemon.messages}
           streaming={streaming}
           activity={activity}
@@ -1471,127 +1348,153 @@ export default function App() {
         />
       </main>
 
-      <aside
-        className={`panel-column${
-          screenExpanded ? " panel-column-expanded" : ""
-        }${anySectionOpen ? "" : " panel-column-empty"}`}
-      >
-        <header className="panel-column-bar" data-tauri-drag-region>
-          {availableComputers.length > 1 ? (
-            <div className="computer-tabs" role="tablist">
-              {availableComputers.map((computer) => (
-                <button
-                  key={computer}
-                  role="tab"
-                  aria-selected={computer === activeComputer}
-                  className={`computer-tab ${
-                    computer === activeComputer ? "computer-tab-active" : ""
-                  }`}
-                  onClick={() => setPanelComputer(computer)}
-                >
-                  {computer === "firecracker" ? "VM" : "Local"}
-                </button>
-              ))}
-            </div>
-          ) : (
-            <span className="panel-column-title">
-              {activeComputer === "firecracker" ? "VM" : "Local"}
-            </span>
-          )}
-          <div className="panel-column-actions">
-            {visibleSections.map((section) => {
-              const open = !panelCollapsed[section.id];
-              return (
-                <button
-                  key={section.id}
-                  className="icon-button"
-                  title={section.label}
-                  aria-label={section.label}
-                  aria-pressed={open}
-                  onClick={() => togglePanelSection(section.id)}
-                >
-                  <PanelSectionIcon section={section.id} />
-                </button>
-              );
-            })}
-          </div>
-        </header>
-        {anySectionOpen &&
-          (screenExpanded ? (
-            <section className="panel-section panel-section-screen">
-              <div className="panel-section-body">{screenPane}</div>
-            </section>
-          ) : (
-            <div className="panel-stack">
-              {visibleSections
-                .filter((section) => !panelCollapsed[section.id])
-                .map((section) => (
-                  <section
-                    key={section.id}
-                    className={`panel-section panel-section-${section.id}`}
+      {agentHasVm && (
+        <aside
+          className={`panel-column${panelOpen ? "" : " panel-column-empty"}`}
+        >
+          <header className="panel-column-bar" data-tauri-drag-region>
+            {panelOpen && availableComputers.length > 1 && (
+              <div className="computer-tabs" role="tablist">
+                {availableComputers.map((computer) => (
+                  <button
+                    key={computer}
+                    role="tab"
+                    aria-selected={computer === activeComputer}
+                    className={`computer-tab${
+                      computer === activeComputer ? " computer-tab-active" : ""
+                    }`}
+                    onClick={() => setPanelComputer(computer)}
                   >
-                    <header className="panel-section-header">
-                      <span className="panel-section-label">
-                        {section.label}
+                    {computer === "firecracker" ? "VM" : "Local"}
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="panel-column-actions">
+              {panelOpen ? (
+                <button
+                  className="icon-button"
+                  title={`Collapse the ${panelComputerLabel} panels`}
+                  aria-label={`Collapse the ${panelComputerLabel} panels`}
+                  onClick={togglePanel}
+                >
+                  <CollapseIcon />
+                </button>
+              ) : (
+                <button
+                  className="panel-column-open"
+                  title={`Show the ${panelComputerLabel} panels`}
+                  aria-expanded={false}
+                  onClick={togglePanel}
+                >
+                  {panelComputerLabel}
+                </button>
+              )}
+            </div>
+          </header>
+
+          {panelOpen && (
+            <>
+              <section className="panel-window">
+                <div className="panel-tabs" role="tablist">
+                  {panelTabs.map((entry) => (
+                    <button
+                      key={entry.id}
+                      role="tab"
+                      aria-selected={activeTab === entry.id}
+                      className={`panel-tab${
+                        activeTab === entry.id ? " panel-tab-active" : ""
+                      }`}
+                      onClick={() => setPanelTab(entry.id)}
+                    >
+                      {entry.label}
+                    </button>
+                  ))}
+                  {activeTab === "screen" && (
+                    <span className="panel-tabs-actions">
+                      <button
+                        className="icon-button"
+                        title={
+                          screenPlaying ? "Pause live view" : "Resume live view"
+                        }
+                        aria-label={
+                          screenPlaying ? "Pause live view" : "Resume live view"
+                        }
+                        onClick={() => setScreenPlaying((value) => !value)}
+                      >
+                        {screenPlaying ? <PauseIcon /> : <PlayIcon />}
+                      </button>
+                      <span className="screen-caption">
+                        <span className="screen-caption-status">
+                          {screenCaption}
+                        </span>
                       </span>
-                      <span className="panel-section-actions">
-                        {section.id === "screen" && hasVm(screenBot) && (
-                          <button
-                            className="icon-button"
-                            title={
-                              screenPlaying
-                                ? "Pause live view"
-                                : "Resume live view"
-                            }
-                            aria-label={
-                              screenPlaying
-                                ? "Pause live view"
-                                : "Resume live view"
-                            }
-                            onClick={() =>
-                              setScreenPlaying((value) => !value)
-                            }
-                          >
-                            {screenPlaying ? <PauseIcon /> : <PlayIcon />}
-                          </button>
-                        )}
-                        {section.id === "screen" && (
-                          <span className="screen-caption">
-                            <span className="screen-caption-status">
-                              {screenCaption}
-                            </span>
-                          </span>
-                        )}
-                      </span>
-                    </header>
-                    <div className="panel-section-body">
-                      {section.id === "screen" && screenPane}
-                      {section.id === "files" && screenBot && (
-                        <FilesPanel
-                          botId={screenBot.id}
-                          computer={filesTarget}
-                          {...(filesRootLabel
-                            ? { rootLabel: filesRootLabel }
-                            : {})}
-                          active
-                          listFiles={daemon.listFiles}
-                          readFile={daemon.readFile}
-                        />
-                      )}
-                      {section.id === "terminal" && screenBot && (
+                    </span>
+                  )}
+                </div>
+                <div className="panel-section-body">
+                  {showScreen && (
+                    <div
+                      className="panel-tab-pane"
+                      hidden={activeTab !== "screen"}
+                    >
+                      {screenPane}
+                    </div>
+                  )}
+                  {availableComputers.map((computer) => (
+                    <div
+                      key={computer}
+                      className="panel-tab-pane"
+                      hidden={
+                        activeTab !== "terminal" || activeComputer !== computer
+                      }
+                    >
+                      {screenBot && (
                         <TerminalPanel
                           botId={screenBot.id}
                           canConnect={canConnectTerminal}
-                          url={terminalUrl}
-                          active
+                          url={terminalUrl(computer)}
+                          active={
+                            activeTab === "terminal" &&
+                            activeComputer === computer
+                          }
                         />
                       )}
                     </div>
-                  </section>
-                ))}
-            </div>
-          ))}
-      </aside>
+                  ))}
+                  <div className="panel-tab-pane" hidden={activeTab !== "files"}>
+                    {screenBot && (
+                      <FilesPanel
+                        botId={screenBot.id}
+                        computer={activeComputer}
+                        {...(filesRootLabel
+                          ? { rootLabel: filesRootLabel }
+                          : {})}
+                        active={activeTab === "files"}
+                        listFiles={daemon.listFiles}
+                        readFile={daemon.readFile}
+                      />
+                    )}
+                  </div>
+                </div>
+              </section>
+
+              <section className="routines">
+                <h2>
+                  Routines
+                  <span className="badge">Soon</span>
+                </h2>
+                <div className="routines-empty">
+                  <p className="routines-title">Not implemented yet</p>
+                  <p className="routines-sub">
+                    Scheduled and replayable routines are planned, not wired up.
+                  </p>
+                </div>
+              </section>
+            </>
+          )}
+        </aside>
+      )}
 
       <ApprovalsModal
         open={approvalsOpen}
@@ -1678,24 +1581,6 @@ export default function App() {
           }
           setSettingsBotId(null);
         }}
-      />
-
-      <ConfirmDialog
-        open={deleteOpen && bot !== null}
-        title={bot ? `Delete ${bot.name}?` : "Delete agent?"}
-        description={
-          bot
-            ? `This permanently removes ${bot.name}, its history, and everything on its computer.`
-            : ""
-        }
-        confirmLabel="Delete agent"
-        onConfirm={() => {
-          if (bot) {
-            daemon.deleteBot(bot.id);
-          }
-          setDeleteOpen(false);
-        }}
-        onClose={() => setDeleteOpen(false)}
       />
 
       <Settings
