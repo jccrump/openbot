@@ -30,6 +30,8 @@ import {
   RoutineSchema,
   SoulVersionSchema,
   ThreadSchema,
+  TodoSchema,
+  TodoStatusSchema,
   ToolArtifactSchema,
   WorkspaceSchema,
 } from "./domain";
@@ -302,6 +304,28 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     requestId: z.string(),
     routineId: z.string(),
     limit: z.number().int().min(1).max(100).optional(),
+  }),
+  z.object({
+    type: z.literal("todos.list"),
+    botId: z.string(),
+  }),
+  z.object({
+    type: z.literal("todos.create"),
+    botId: z.string(),
+    title: z.string().min(1),
+    /** Add the item as a subtask of this top-level todo. */
+    parentId: z.string().optional(),
+    status: TodoStatusSchema.optional(),
+  }),
+  z.object({
+    type: z.literal("todos.update"),
+    id: z.string(),
+    title: z.string().min(1).optional(),
+    status: TodoStatusSchema.optional(),
+  }),
+  z.object({
+    type: z.literal("todos.delete"),
+    id: z.string(),
   }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessageSchema>;
@@ -608,6 +632,11 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     requestId: z.string(),
     routineId: z.string(),
     runs: z.array(RoutineRunSchema),
+  }),
+  z.object({
+    type: z.literal("todos"),
+    botId: z.string(),
+    todos: z.array(TodoSchema),
   }),
 ]);
 export type ServerMessage = z.infer<typeof ServerMessageSchema>;

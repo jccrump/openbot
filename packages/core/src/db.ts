@@ -148,6 +148,17 @@ export function openDatabase(dataDir: string): DatabaseSync {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS todos (
+      id TEXT PRIMARY KEY,
+      bot_id TEXT NOT NULL,
+      parent_id TEXT,
+      title TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'hold',
+      position INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_routines_bot
       ON routines(bot_id);
     CREATE INDEX IF NOT EXISTS idx_routines_due
@@ -166,6 +177,9 @@ export function openDatabase(dataDir: string): DatabaseSync {
 
     CREATE INDEX IF NOT EXISTS idx_routine_runs_routine
       ON routine_runs(routine_id, started_at);
+
+    CREATE INDEX IF NOT EXISTS idx_todos_bot
+      ON todos(bot_id, position);
   `);
 
   const columns = db

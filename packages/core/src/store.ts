@@ -25,6 +25,8 @@ import type {
   SoulContent,
   SoulVersion,
   Thread,
+  Todo,
+  TodoStatus,
   TokenUsage,
   ToolCallRecord,
   Workspace,
@@ -372,6 +374,30 @@ interface ApprovalRow {
   decided_by: string | null;
   requested_at: string;
   decided_at: string | null;
+}
+
+interface TodoRow {
+  id: string;
+  bot_id: string;
+  parent_id: string | null;
+  title: string;
+  status: string;
+  position: number;
+  created_at: string;
+  updated_at: string;
+}
+
+function toTodo(row: TodoRow): Todo {
+  return {
+    id: row.id,
+    botId: row.bot_id,
+    parentId: row.parent_id ?? null,
+    title: row.title,
+    status: row.status as TodoStatus,
+    position: row.position,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 function toApproval(row: ApprovalRow): ApprovalRecord {
@@ -949,6 +975,7 @@ export class Store {
       this.deleteThreadsForBot(id);
       this.deleteRoutineRunsForBot(id);
       this.db.prepare("DELETE FROM routines WHERE bot_id = ?").run(id);
+      this.deleteTodosForBot(id);
       this.db.prepare("DELETE FROM bots WHERE id = ?").run(id);
       this.db.exec("COMMIT");
     } catch (error) {
@@ -1295,11 +1322,13 @@ export class Store {
     try {
       this.deleteThreadsForBot(id);
       // Routines are agent configuration, so they survive a reset; their run
-      // journal does not, and their schedules restart from now.
+      // journal does not, and their schedules restart from now. Todos are
+      // working state, so a reset clears them with the rest of the history.
       this.deleteRoutineRunsForBot(id);
       this.db
         .prepare("UPDATE routines SET next_run_at = NULL WHERE bot_id = ?")
         .run(id);
+      this.deleteTodosForBot(id);
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -1315,6 +1344,139 @@ export class Store {
       )
       .run(id);
     this.db.prepare("DELETE FROM threads WHERE bot_id = ?").run(id);
+  }
+
+  listTodos(botId: string): Todo[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM todos WHERE bot_id = ? ORDER BY position ASC, created_at ASC",
+      )
+      .all(botId) as unknown as TodoRow[];
+    return rows.map(toTodo);
+  }
+
+  getTodo(id: string): Todo | null {
+    const row = this.db
+      .prepare("SELECT * FROM todos WHERE id = ?")
+      .get(id) as unknown as TodoRow | undefined;
+    return row ? toTodo(row) : null;
+  }
+
+  /** Todos whose id starts with the prefix, for short-id tool arguments. */
+  listTodosByPrefix(prefix: string): Todo[] {
+    const escaped = prefix.replace(/[\\%_]/g, "\\$&");
+    const rows = this.db
+      .prepare("SELECT * FROM todos WHERE id LIKE ? ESCAPE '\\'")
+      .all(`${escaped}%`) as unknown as TodoRow[];
+    return rows.map(toTodo);
+  }
+
+  createTodo(input: {
+    id?: string;
+    botId: string;
+    parentId?: string | null;
+    title: string;
+    status?: TodoStatus;
+    position?: number;
+    createdAt?: string;
+  }): Todo {
+    const now = input.createdAt ?? new Date().toISOString();
+    const position =
+      input.position ??
+      (
+        this.db
+          .prepare(
+            "SELECT COALESCE(MAX(position), -1) + 1 AS next FROM todos WHERE bot_id = ?",
+          )
+          .get(input.botId) as unknown as { next: number }
+      ).next;
+    const todo: Todo = {
+      id: input.id ?? randomUUID(),
+      botId: input.botId,
+      parentId: input.parentId ?? null,
+      title: input.title,
+      status: input.status ?? "hold",
+      position,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.db
+      .prepare(
+        "INSERT INTO todos (id, bot_id, parent_id, title, status, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        todo.id,
+        todo.botId,
+        todo.parentId,
+        todo.title,
+        todo.status,
+        todo.position,
+        todo.createdAt,
+        todo.updatedAt,
+      );
+    return todo;
+  }
+
+  updateTodo(
+    id: string,
+    patch: { title?: string; status?: TodoStatus },
+  ): Todo | null {
+    const existing = this.getTodo(id);
+    if (!existing) {
+      return null;
+    }
+    const fields: Array<[string, string]> = [];
+    if (patch.title !== undefined) {
+      fields.push(["title", patch.title]);
+    }
+    if (patch.status !== undefined) {
+      fields.push(["status", patch.status]);
+    }
+    if (fields.length === 0) {
+      return existing;
+    }
+    fields.push(["updated_at", new Date().toISOString()]);
+    for (const [column, value] of fields) {
+      this.db
+        .prepare(`UPDATE todos SET ${column} = ? WHERE id = ?`)
+        .run(value, id);
+    }
+    return this.getTodo(id);
+  }
+
+  /** Delete a todo and every subtask under it; returns the removed ids. */
+  deleteTodo(id: string): string[] {
+    if (!this.getTodo(id)) {
+      return [];
+    }
+    const removed = new Set<string>([id]);
+    let frontier = [id];
+    while (frontier.length > 0) {
+      const placeholders = frontier.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(`SELECT id FROM todos WHERE parent_id IN (${placeholders})`)
+        .all(...frontier) as unknown as Array<{ id: string }>;
+      frontier = [];
+      for (const row of rows) {
+        if (!removed.has(row.id)) {
+          removed.add(row.id);
+          frontier.push(row.id);
+        }
+      }
+    }
+    const ids = [...removed];
+    const placeholders = ids.map(() => "?").join(", ");
+    this.db
+      .prepare(`DELETE FROM todos WHERE id IN (${placeholders})`)
+      .run(...ids);
+    return ids;
+  }
+
+  deleteTodosForBot(botId: string): number {
+    const result = this.db
+      .prepare("DELETE FROM todos WHERE bot_id = ?")
+      .run(botId);
+    return Number(result.changes);
   }
 
   listBots(): Bot[] {

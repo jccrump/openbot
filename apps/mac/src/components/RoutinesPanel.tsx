@@ -20,7 +20,6 @@ function runStatusLabel(run: RoutineRun): string {
 export function RoutinesPanel({
   bot,
   routines,
-  onCreate,
   onEdit,
   onRun,
   onToggle,
@@ -29,7 +28,6 @@ export function RoutinesPanel({
 }: {
   bot: Bot | null;
   routines: Routine[];
-  onCreate: () => void;
   onEdit: (routine: Routine) => void;
   onRun: (routine: Routine) => Promise<RoutineActionResult>;
   onToggle: (routine: Routine, enabled: boolean) => Promise<void>;
@@ -105,16 +103,6 @@ export function RoutinesPanel({
 
   return (
     <div className="routines-panel">
-      <div className="routines-head">
-        <p className="routines-sub">
-          Scheduled briefs that run on {bot.name}'s computers. Each run lands in
-          the agent's thread.
-        </p>
-        <button className="ghost-button routine-new" onClick={onCreate}>
-          New routine
-        </button>
-      </div>
-
       {notice && <p className="routine-error">{notice}</p>}
 
       {routines.length === 0 ? (

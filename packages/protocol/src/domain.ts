@@ -344,6 +344,30 @@ export const PlanStepSchema = z.object({
 });
 export type PlanStep = z.infer<typeof PlanStepSchema>;
 
+/**
+ * A durable todo list item owned by one agent (ADR-028). Unlike the thread's
+ * working plan, todos survive chats and restarts, the user edits them in the
+ * app, and the agent reads and writes the same list through its tools.
+ */
+export const TODO_STATUSES = ["hold", "working", "waiting", "done"] as const;
+
+export const TodoStatusSchema = z.enum(TODO_STATUSES);
+export type TodoStatus = z.infer<typeof TodoStatusSchema>;
+
+export const TodoSchema = z.object({
+  id: z.string(),
+  botId: z.string(),
+  /** The parent task for a subtask; null for a top-level item. */
+  parentId: z.string().nullable(),
+  title: z.string(),
+  status: TodoStatusSchema,
+  /** Sort key within the agent's list; subtasks follow their parent. */
+  position: z.number(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+export type Todo = z.infer<typeof TodoSchema>;
+
 export const ThreadSchema = z.object({
   id: z.string(),
   botId: z.string(),

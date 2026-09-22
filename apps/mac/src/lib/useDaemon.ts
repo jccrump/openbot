@@ -28,6 +28,8 @@ import type {
   ServerMessage,
   SoulVersion,
   Thread,
+  Todo,
+  TodoStatus,
   ToolArtifact,
   Workspace,
 } from "@openbot/protocol";
@@ -266,6 +268,7 @@ export function useDaemon() {
     Record<string, SandboxState>
   >({});
   const [memories, setMemories] = useState<Memory[]>([]);
+  const [todos, setTodos] = useState<Todo[]>([]);
   const [soul, setSoul] = useState<SoulVersion | null>(null);
   const [soulVersions, setSoulVersions] = useState<SoulVersion[]>([]);
   const [lastConsolidation, setLastConsolidation] = useState<{
@@ -346,6 +349,8 @@ export function useDaemon() {
       const thread = threadList.find((item) => item.botId === botId) ?? null;
       setActiveThreadId(thread?.id ?? null);
       setMessages([]);
+      setTodos([]);
+      client.send({ type: "todos.list", botId });
       const bot =
         botOverride ??
         botsRef.current.find((item) => item.id === botId) ??
@@ -1037,6 +1042,13 @@ export function useDaemon() {
           setError(message.message);
           break;
         }
+        case "todos": {
+          // The list is agent-scoped; ignore snapshots for other agents.
+          if (message.botId === selectedBotIdRef.current) {
+            setTodos(message.todos);
+          }
+          break;
+        }
         case "chat.message": {
           if (message.message.role === "assistant") {
             setToolActivity((current) =>
@@ -1297,6 +1309,42 @@ export function useDaemon() {
   const consolidateMemories = useCallback(() => {
     client.send({ type: "memory.consolidate" });
   }, [client]);
+
+  const addTodo = useCallback(
+    (title: string, parentId?: string, status?: TodoStatus) => {
+      const botId = selectedBotIdRef.current;
+      if (!botId) {
+        return;
+      }
+      client.send({
+        type: "todos.create",
+        botId,
+        title,
+        ...(parentId ? { parentId } : {}),
+        ...(status ? { status } : {}),
+      });
+    },
+    [client],
+  );
+
+  const updateTodo = useCallback(
+    (id: string, patch: { title?: string; status?: TodoStatus }) => {
+      client.send({
+        type: "todos.update",
+        id,
+        ...(patch.title !== undefined ? { title: patch.title } : {}),
+        ...(patch.status !== undefined ? { status: patch.status } : {}),
+      });
+    },
+    [client],
+  );
+
+  const removeTodo = useCallback(
+    (id: string) => {
+      client.send({ type: "todos.delete", id });
+    },
+    [client],
+  );
 
   const loadSoul = useCallback(
     (botId?: string) => {
@@ -1805,6 +1853,10 @@ export function useDaemon() {
     threads,
     selectedBotId,
     memories,
+    todos,
+    addTodo,
+    updateTodo,
+    removeTodo,
     soul,
     soulVersions,
     lastConsolidation,
